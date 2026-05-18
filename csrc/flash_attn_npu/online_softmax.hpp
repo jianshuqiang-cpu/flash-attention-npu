@@ -467,44 +467,44 @@ public:
     }
 
     // softcap * tanh(x) = (2 * softcap) / (1 + exp(-2x)) - softcap
+    template <bool hasSoftcap>
     __aicore__ inline
     void ApplySoftcap(uint32_t sUbOffset, uint32_t rowNumCurLoop, uint32_t columnNumRound)
     {
-        if (softcapValue <= 0.0f) {
-            return;
+        if constexpr (hasSoftcap) {
+            uint32_t repeatTimes = CeilDiv(rowNumCurLoop * columnNumRound, FLOAT_VECTOR_SIZE);
+            AscendC::UnaryRepeatParams unaryParams(1, 1, 8, 8);
+
+            AscendC::Muls<float, false>(
+                lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
+                -2.0f, (uint64_t)0, repeatTimes, unaryParams);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Exp<float, false>(
+                lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
+                (uint64_t)0, repeatTimes, unaryParams);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Adds<float, false>(
+                lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
+                1.0f, (uint64_t)0, repeatTimes, unaryParams);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Reciprocal<float, false>(
+                lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
+                (uint64_t)0, repeatTimes, unaryParams);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Muls<float, false>(
+                lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
+                2.0f * softcapValue, (uint64_t)0, repeatTimes, unaryParams);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Adds<float, false>(
+                lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
+                -softcapValue, (uint64_t)0, repeatTimes, unaryParams);
+            AscendC::PipeBarrier<PIPE_V>();
         }
-        uint32_t repeatTimes = CeilDiv(rowNumCurLoop * columnNumRound, FLOAT_VECTOR_SIZE);
-        AscendC::UnaryRepeatParams unaryParams(1, 1, 8, 8);
-
-        AscendC::Muls<float, false>(
-            lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
-            -2.0f, (uint64_t)0, repeatTimes, unaryParams);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        AscendC::Exp<float, false>(
-            lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
-            (uint64_t)0, repeatTimes, unaryParams);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        AscendC::Adds<float, false>(
-            lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
-            1.0f, (uint64_t)0, repeatTimes, unaryParams);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        AscendC::Reciprocal<float, false>(
-            lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
-            (uint64_t)0, repeatTimes, unaryParams);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        AscendC::Muls<float, false>(
-            lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
-            2.0f * softcapValue, (uint64_t)0, repeatTimes, unaryParams);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        AscendC::Adds<float, false>(
-            lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
-            -softcapValue, (uint64_t)0, repeatTimes, unaryParams);
-        AscendC::PipeBarrier<PIPE_V>();
     }
 
     template<typename ElementMaskDst, typename ElementMaskSrc>
@@ -911,7 +911,9 @@ public:
                 auto layoutOutputCurLoop = layoutOutput.GetTileLayout(MatrixCoord(rowNumCurLoop, columnNum));
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
                 ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
-                ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                if (softcapValue > 0.0f) {
+                    ApplySoftcap<true>((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                }
                 SubCoreCompute<false>(
                     gOutputCurLoop,
                     layoutOutputCurLoop,
@@ -1037,7 +1039,9 @@ public:
                 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
                 ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
-                ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                if (softcapValue > 0.0f) {
+                    ApplySoftcap<true>((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                }
                 ApplyMask(
                     (pingpongFlag * MAX_UB_S_ELEM_NUM),
                     rowNumCurLoop, columnNumRound,
