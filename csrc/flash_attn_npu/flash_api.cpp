@@ -11,7 +11,12 @@
 #include "kernel_common.hpp"
 #include "kernel_operator.h"
 
+// flash_api.cpp 是 flash_attn_npu_2 扩展模块的 Host 侧入口。
+// 它负责接收 Python/PyTorch 张量，完成参数校验、tiling 构造、workspace 分配，最后启动 AscendC kernel。
+// 前向路径调用 SplitFuse::FAInfer，反向路径调用 FAG::FAG，真正的 NPU 计算逻辑在被 include 的 kernel 文件中实现。
 
+// 计算前向 kernel 在 head/group 维度上的 query head tile 大小。
+// groupSize = num_heads / num_heads_k，用于 GQA/MQA 场景下把多个 Q head 映射到同一个 KV head。
 uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 {
     uint32_t qRowNumCeil = Q_TILE_CEIL;
@@ -22,12 +27,16 @@ uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
     return qNBlockTile;
 }
 
+// 计算前向 kernel 在 query 序列维度上的 tile 大小。
+// 当前实现固定返回 Q_TILE_CEIL，kvSeqlen 暂未参与动态调节。
 uint32_t GetQSBlockTile(int64_t kvSeqlen)
 {
     uint32_t qSBlockTile = Q_TILE_CEIL;
     return qSBlockTile;
 }
 
+// KV-cache 前向入口：用于推理阶段已有 kcache/vcache，必要时追加 k_/v_ 新 token 的场景。
+// 支持普通连续 KV cache 和 paged KV cache；Host 侧生成 FAInferTilingData 后启动 SplitFuse::FAInfer。
 std::vector<at::Tensor>
 mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_heads x head_size
                 const at::Tensor &kcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
@@ -130,6 +139,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     TORCH_CHECK(head_size_og <= 256, "FlashAttention only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
+    // seqlens_k 需要在 Host 侧逐 batch 计算 task 数，因此先拷贝到 CPU 读取。
     at::Tensor seqlenk_cpu_tensor = seqlens_k.to(at::Device(at::kCPU));
     int32_t* seqlens_k_cpu = static_cast<int32_t *>(seqlenk_cpu_tensor.data_ptr());
     tiling_cpu_ptr->set_batch(static_cast<uint32_t>(batch_size));
@@ -149,6 +159,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         tiling_cpu_ptr->set_softcapValue(0.0f);
     }
     tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
+    // 前向 workspace 按多个流水阶段分区：mm1、softmax online、mm2、update。
+    // blockDim 使用 AIC 数量，PRELANCH_NUM 为预留的流水预取/并发批次数。
     uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;
     uint64_t PRELANCH_NUM = 3;
     uint64_t mm1OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
@@ -172,6 +184,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     tiling_cpu_ptr->set_UpdateSize(UpdateSize);
     tiling_cpu_ptr->set_workSpaceSize(workSpaceSize);
 
+    // totalTaskNum 是前向 kernel 的全局任务数：按 batch、KV head group、query 序列块累加。
+    // GQA/MQA 下 groupSize 表示每个 KV head 对应多少个 query head。
     uint32_t totalTaskNum = 0;
     uint32_t groupSize = num_heads / num_heads_k;
     for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
@@ -216,6 +230,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     auto workspaceDevice = static_cast<uint8_t *>(workspace_tensor.data_ptr());
     auto tilingDevice = static_cast<uint8_t *>(tiling_gpu_tensor.data_ptr());
     auto softmaxLseDevice = static_cast<uint8_t *>(softmaxlse.data_ptr());
+    // 根据 dtype、是否 paged KV、是否 causal 选择不同模板实例。
+    // 模板参数在编译期固定，kernel 内可以消除分支并使用对应布局/掩码路径。
     if (is_bf16) {
         if (paged_KV) {
             if (is_causal) {
@@ -264,6 +280,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     return {out, softmaxlse};
 }
 
+// 标准 BSND 前向入口：q/k/v 均为 batch_size x seqlen x heads x head_size。
+// 该路径不支持 dropout、alibi、softcap、滑窗等扩展特性，主要生成 FAInferTilingData 后调用 SplitFuse::FAInfer。
 std::vector<at::Tensor>
 mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num_heads x head_size
         const at::Tensor &k,                      // batch_size x seqlen_k x num_heads_k x head_size
@@ -311,7 +329,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     TORCH_CHECK(head_size <= 256, "FlashAttention only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
-    // init output tensors
+    // 初始化输出张量。若 Python 侧传入 out_，则复用外部分配的输出，否则按 q 的形状创建。
+    // p/rng_state 为兼容 FlashAttention Python 接口保留；当前 NPU 前向不支持 return_softmax/dropout。
     at::Tensor out = (out_.has_value()) ? out_.value() : torch::empty_like(q);
     auto opts = q.options().device(at::kPrivateUse1);
     auto p = torch::empty({0}, opts);
@@ -355,7 +374,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     int64_t workSpaceSize = mm1OutSize + smOnlineOutSize + mm2OutSize + UpdateSize;
     at::Tensor workspace_tensor = at::empty({workSpaceSize}, at::device(at::kPrivateUse1).dtype(at::kByte));
 
-    // tiling
+    // 前向 tiling 在 Host 侧填充 FAInferTilingData，再整体拷贝到 NPU。
+    // kernel 侧只读取 tiling，不再解析 PyTorch shape。
     at::Tensor tiling_cpu_tensor = at::empty({1024}, at::device(c10::kCPU).dtype(at::kByte));
     FAInferTilingData* tiling_cpu_ptr = reinterpret_cast<FAInferTilingData*>(tiling_cpu_tensor.data_ptr<uint8_t>());
     tiling_cpu_ptr->set_batch(static_cast<uint32_t>(batch_size));
@@ -437,6 +457,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     return {out, softmaxlse, p, rng_state};
 }
 
+// 变长 TND 前向入口：q/k/v 第一维是所有样本 token 拼接后的 total_q/total_k。
+// cu_seqlens_q/cu_seqlens_k 提供每个 batch 的起止位置，kernel 使用 TND 布局解释输入。
 std::vector<at::Tensor>
 mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                const at::Tensor &k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
@@ -561,6 +583,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     tiling_cpu_ptr->set_UpdateSize(UpdateSize);
     tiling_cpu_ptr->set_workSpaceSize(workSpaceSize);
 
+    // 当前变长前向路径没有在 Host 侧展开 totalTaskNum，任务划分由 kernel 侧结合 cu_seqlens 处理。
     uint32_t totalTaskNum = 0; // 核内计算
     tiling_cpu_ptr->set_totalTaskNum(totalTaskNum);
     at::Tensor tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1)); // Tiling to Device
@@ -657,6 +680,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 }
 
 
+// 变长 TND 反向入口：Python 层 varlen_bwd 最终进入这里。
+// Host 侧生成 FAG backward tiling/workspace，然后启动 FAG::FAG 完成 dq/dk/dv 计算。
 std::vector<at::Tensor>
 mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads x head_size
                const at::Tensor &q,                      // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
@@ -718,7 +743,8 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     uint32_t nheads_k = ksizes[1];
     uint32_t headdim = qsizes[2];
 
-    // tiling args set
+    // FAG 反向 tiling：使用 fag_tiling.cpp 写入 shape、scale、softmax tiling 和 workspace offset。
+    // tilingSize 按 TILING_PARA_NUM 个 int64_t 分配，部分字段会按 float/uint32_t 视角写入。
     uint32_t tilingSize = TILING_PARA_NUM * sizeof(int64_t);
     at::Tensor tiling_cpu_tensor = at::empty({tilingSize}, at::device(c10::kCPU).dtype(at::kByte));
     FAGTiling::FAGInfo fagInfo;
@@ -734,7 +760,8 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     // FAGTiling::printFAGTilingData(reinterpret_cast<int64_t *>(tiling_cpu_tensor.data_ptr<uint8_t>()));
     at::Tensor tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
 
-    // alloc workspace
+    // FAG::FAG 内部会按 tiling 中的 offset 切分 dq/dk/dv/sfmg/mm/p/ds 等 workspace。
+    // 这里分配的是整块 NPU byte buffer，具体含义由 fag_tiling.cpp 和 kernel 共同约定。
     uint64_t workspaceSize = (2 * blockDim * 16 * 128 * 128 * 8 * nheads) * sizeof(float);
     at::Tensor workspace_tensor = at::empty({static_cast<long>(workspaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
 
@@ -820,6 +847,8 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     return {dq, dk, dv, softmax_d};
 }
 
+// 标准 BSND 反向入口：把 batch 维和 seqlen 维展平成 FAG tiling 中的 total token 数。
+// kernel 模板使用 InputLayout::BSND，与变长反向的 TND 路径区分。
 std::vector<at::Tensor>
 mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multiple_of(head_size_og, 8)
         const at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_size
@@ -870,7 +899,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     uint32_t nheads_k = ksizes[2];
     uint32_t headdim = qsizes[3];
 
-    // tiling args set
+    // 标准 BSND 反向复用 FAG tiling：batch 和 seqlen 会被展平成 total token 维度。
+    // kernel 侧通过 InputLayout::BSND 按原始布局解释 q/k/v/out/dout 指针。
     uint32_t tilingSize = TILING_PARA_NUM * sizeof(int64_t);
     at::Tensor tiling_cpu_tensor = at::empty({tilingSize}, at::device(c10::kCPU).dtype(at::kByte));
     FAGTiling::FAGInfo fagInfo;
@@ -885,7 +915,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     // FAGTiling::printFAGTilingData(reinterpret_cast<int64_t *>(tiling_cpu_tensor.data_ptr<uint8_t>()));
     at::Tensor tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
 
-    // alloc workspace
+    // 标准反向同样分配整块 workspace，内部 offset 由 GetFATilingParam 写入 tiling。
     uint64_t workspaceSize = (2 * blockDim * 16 * 128 * 128 * 8 * nheads) * sizeof(float);
     at::Tensor workspace_tensor = at::empty({static_cast<long>(workspaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
 
@@ -966,6 +996,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     return {dq, dk, dv, softmax_d};
 }
 
+// 将 Host 入口注册为 Python 扩展 flash_attn_npu_2 的可调用函数。
+// Python 层 flash_attn_npu/flash_attn_interface.py 会分别调用这些名称。
 PYBIND11_MODULE(flash_attn_npu_2, m)
 {
     m.doc() = "FlashAttention";

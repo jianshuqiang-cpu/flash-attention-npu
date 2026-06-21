@@ -7,6 +7,9 @@
 #ifndef FAG_SFMG_H
 #define FAG_SFMG_H
 
+// FAG sfmg 阶段的 softmax grad front 辅助实现。
+// 这里的核心目标是对每一行计算 sum(dout * out)，即 softmax 反向公式中的前置行归约项。
+// 调用方通常已经把 dout 和 out cast 成 float，并把输出形状设置为每行 8 个 float 的 32B 对齐结果。
 constexpr AscendC::RoundMode
 FLOAT2HALF_ROUND_MODE = AscendC::RoundMode::CAST_NONE;
 using AscendC::B16_BYTE_SIZE;
@@ -45,6 +48,8 @@ using AscendC::SOFTMAX_COMPUTE_DIM;
 using AscendC::SOFTMAXGRAD_COMPUTE_DIM;
 using AscendC::WaitFlag;
 
+// 描述沿最后一维 K 做归约时的原始形状、切分形状和输出形状。
+// srcM/srcK 是当前 tile 的输入二维形状，dstK 通常是 8，表示每行输出 8 个 float 以满足 32B 对齐。
 struct ReduceLastND {
     uint32_t originalSrcM;
     uint32_t originalSrcK;
@@ -54,6 +59,7 @@ struct ReduceLastND {
     uint32_t dstK;
 };
 
+// SoftmaxGradFront 的外层形状信息入口，目前主要依赖 LocalTensor 自身的 ShapeInfo 推导真实 ND 形状。
 struct SoftMaxShapeInfo {
     uint32_t srcM{0};
     uint32_t srcK{0};
@@ -61,6 +67,8 @@ struct SoftMaxShapeInfo {
     uint32_t oriSrcK{0};
 };
 
+// 处理 K 维可以按 FLOAT_REPEAT_SIZE 完整切分的主体部分。
+// 每次先对一个 256-float 片段做 BlockReduceSum，再把多个片段的行归约结果累加起来。
 __aicore__ inline void CustomAlignedReduceSumNDImpl(const LocalTensor<float> &dst, const LocalTensor<float> &src,
                                                     const LocalTensor<float> &tmpTensor,
                                                     const struct ReduceLastND &reduceParam, const uint32_t splitCount) {
@@ -89,6 +97,8 @@ __aicore__ inline void CustomAlignedReduceSumNDImpl(const LocalTensor<float> &ds
     ResetMask();
 }
 
+// 处理 K 维尾块：当 originalSrcK 不能整除 FLOAT_REPEAT_SIZE 时，用 mask 只归约有效元素。
+// splitNum 表示尾块前已经跳过了多少个完整 256-float 片段。
 __aicore__ inline void CustomReduceSumLastNDSplitImpl(const LocalTensor<float> &dst, const LocalTensor<float> &src,
                                                       const struct ReduceLastND &reduceParam, uint64_t mask,
                                                       uint32_t dstRepStride, uint32_t splitNum) {
@@ -111,6 +121,8 @@ __aicore__ inline void CustomReduceSumLastNDSplitImpl(const LocalTensor<float> &
 }
 
 
+// 把每行的单个归约值广播成 dstK 个 float。
+// 在 FAG sfmg 中 dstK 通常为 8，因此每个 token/head 行写 8 个相同 float，刚好占 32B。
 __aicore__ inline void CustomSingleBlockBroadCastImpl(const LocalTensor<float> &dst, const LocalTensor<float> &src,
                                                       const struct ReduceLastND &reduceParam) {
     BrcbRepeatParams brcbParams;
@@ -131,6 +143,7 @@ __aicore__ inline void CustomSingleBlockBroadCastImpl(const LocalTensor<float> &
     }
 
     if (tail != 0) {
+        // Brcb 按 8 行一组广播，剩余不足 8 行的尾部用标量读出后逐行 Duplicate。
         event_t eventIdVToS = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_S));
         event_t eventIdSToV = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_V));
         SetFlag<HardEvent::V_S>(eventIdVToS);
@@ -150,6 +163,8 @@ __aicore__ inline void CustomSingleBlockBroadCastImpl(const LocalTensor<float> &
 }
 
 
+// 通用 last-dim reduce + broadcast：输入 src 形状为 (M, K)，输出 dst 形状为 (M, dstK)。
+// 计算效果是 dst[row, :] = sum(src[row, 0:K])，再把这个标量复制到该行的 dstK 个位置。
 __aicore__ inline void CustomReduceSumLastNDImpl(const LocalTensor<float> &dst, const LocalTensor<float> &src,
                                                  const LocalTensor<float> &tmpTensor,
                                                  const struct ReduceLastND &reduceParam) {
@@ -179,6 +194,9 @@ __aicore__ inline void CustomReduceSumLastNDImpl(const LocalTensor<float> &dst, 
 }
 
 
+// SoftmaxGradFront 的 ND 实现。
+// 数学含义：对每行计算 reduceK(sum(gradTensor * srcTensor))，并广播为每行 elementNumPerBlk 个输出元素。
+// 在 FAG sfmg 调用中，gradTensor 通常是 dout，srcTensor 通常是 out，T 为 float，输出每行 8 个 float。
 template<typename T, bool isBasicBlock = false>
 __aicore__ inline void CustomSoftmaxGradFrontNDImpl(const LocalTensor <T> &dstTensor, const LocalTensor <T> &gradTensor,
                                                     const LocalTensor <T> &srcTensor,
@@ -191,6 +209,7 @@ __aicore__ inline void CustomSoftmaxGradFrontNDImpl(const LocalTensor <T> &dstTe
 
     if constexpr(sizeof(T) == sizeof(half))
     {
+        // half/bfloat16 类输入先转成 float 做乘法和归约，避免低精度累加误差。
         LocalTensor<float> srcBuffer = workLocal;
         LocalTensor<float> gradBuffer = workLocal[tiling.splitSize];
         LocalTensor<float> dstBuffer = workLocal[tiling.splitSize + tiling.splitSize];
@@ -209,6 +228,7 @@ __aicore__ inline void CustomSoftmaxGradFrontNDImpl(const LocalTensor <T> &dstTe
         for (uint32_t i = 0; i < tiling.rangeM; i++) {
             if constexpr(isBasicBlock)
             {
+                // 高性能路径要求 M/K 形状对齐，手动拆成 Mul、分段 Add、BlockReduceSum、Brcb、Cast。
                 Cast<float, half, false>(srcBuffer, srcTensor[i * tiling.splitSize], RoundMode::CAST_NONE,
                                          MASK_PLACEHOLDER, repeatTimes,
                                          {1, 1, DEFAULT_REPEAT_STRIDE, HALF_REPEAT_STRIDE});
@@ -241,6 +261,7 @@ __aicore__ inline void CustomSoftmaxGradFrontNDImpl(const LocalTensor <T> &dstTe
                                          MASK_PLACEHOLDER, reduceCeilValue,
                                          {1, 1, HALF_REPEAT_STRIDE, DEFAULT_REPEAT_STRIDE});
             } else {
+                // 通用路径先 cast 到 float，再调用通用 reduce + broadcast，适配 K 维非 256 对齐或 M 尾块场景。
                 Cast(srcBuffer, srcTensor[i * tiling.splitSize], RoundMode::CAST_NONE, tiling.splitSize);
                 Cast(gradBuffer, gradTensor[i * tiling.splitSize], RoundMode::CAST_NONE, tiling.splitSize);
                 PipeBarrier<PIPE_V>();
@@ -252,6 +273,7 @@ __aicore__ inline void CustomSoftmaxGradFrontNDImpl(const LocalTensor <T> &dstTe
             }
         }
         if (tiling.tailM != 0) {
+            // 处理 M 维尾块，tailM 小于 reduceM，但 K 维仍按原始 headdim 归约。
             Cast(srcBuffer, srcTensor[tiling.rangeM * tiling.splitSize], RoundMode::CAST_NONE, tiling.tailSplitSize);
             Cast(gradBuffer, gradTensor[tiling.rangeM * tiling.splitSize], RoundMode::CAST_NONE, tiling.tailSplitSize);
             PipeBarrier<PIPE_V>();
@@ -265,6 +287,7 @@ __aicore__ inline void CustomSoftmaxGradFrontNDImpl(const LocalTensor <T> &dstTe
             Cast(dstTensor[tiling.rangeM * tiling.reduceSize], addBuffer, FLOAT2HALF_ROUND_MODE, tiling.tailReduceSize);
         }
     } else {
+        // float 输入无需额外 cast，直接在 workLocal 中保存逐元素乘积和行归约临时结果。
         LocalTensor<float> srcBuffer = workLocal;
         LocalTensor<float> reduceBuffer = workLocal[tiling.splitSize];
         uint8_t repeatTimes = (uint8_t)(tiling.splitSize / FLOAT_REPEAT_SIZE);
@@ -279,6 +302,7 @@ __aicore__ inline void CustomSoftmaxGradFrontNDImpl(const LocalTensor <T> &dstTe
         for (uint32_t i = 0; i < tiling.rangeM; i++) {
             if constexpr(isBasicBlock)
             {
+                // float 高性能路径：先逐元素乘，再按 256-float 分段折叠 K 维，最后广播行归约值。
                 offset2 = i * tiling.reduceSize;
                 offset1 = i * tiling.splitSize;
                 PipeBarrier<PIPE_V>();
@@ -301,6 +325,7 @@ __aicore__ inline void CustomSoftmaxGradFrontNDImpl(const LocalTensor <T> &dstTe
                 Brcb(dstTensor[offset2], reduceBuffer, splitCeilM, {1, DEFAULT_REPEAT_STRIDE});
 
             } else {
+                // float 通用路径：Mul 后交给 CustomReduceSumLastNDImpl 处理整块、尾块和广播。
                 Mul(srcBuffer, srcTensor[i * tiling.splitSize], gradTensor[i * tiling.splitSize], tiling.splitSize);
                 PipeBarrier<PIPE_V>();
                 CustomReduceSumLastNDImpl(dstTensor[i * tiling.reduceSize], srcBuffer, reduceBuffer, reduceSumParam);
@@ -324,6 +349,8 @@ __aicore__ inline void CustomSoftmaxGradFrontNDImpl(const LocalTensor <T> &dstTe
 }
 
 
+// 根据 UB 临时空间大小和输入 ND 形状计算一次能处理多少行 reduceM。
+// reduceM 决定 M 维分块大小，splitK 固定为 headdim，reduceK 固定为一个 32B block 内的元素数。
 __aicore__ inline bool CustomSoftMaxGradTilingFunc(const uint32_t workLocalSize, const LastAxisShapeND &ndinfo,
                                                    SoftMaxTiling &softmaxTiling, const uint32_t elementNumPerBlk,
                                                    bool isFront = false, bool isBasicBlock = false,
@@ -355,6 +382,7 @@ __aicore__ inline bool CustomSoftMaxGradTilingFunc(const uint32_t workLocalSize,
 
     if (isBasicBlock && isFront && (softmaxTiling.reduceM > SOFTMAX_BASIC_TILE_NUM) &&
         (softmaxTiling.srcM % SOFTMAX_BASIC_TILE_NUM == 0)) {
+        // 高性能路径需要 reduceM 与 8 行基本块对齐，并控制单块数据量避免超过向量指令限制。
         softmaxTiling.reduceM = softmaxTiling.reduceM / SOFTMAX_BASIC_TILE_NUM * SOFTMAX_BASIC_TILE_NUM;
         while (softmaxTiling.srcM % softmaxTiling.reduceM != 0) {
             softmaxTiling.reduceM -= SOFTMAX_BASIC_TILE_NUM;
@@ -379,6 +407,8 @@ __aicore__ inline bool CustomSoftMaxGradTilingFunc(const uint32_t workLocalSize,
     return true;
 }
 
+// SoftmaxGradFront 的主实现入口：从 srcTensor 的 ShapeInfo 推导 M/K，生成 tiling 后进入 ND 实现。
+// softmaxShapeInfo 当前保留为兼容接口参数，实际形状主要来自 LocalTensor::GetShapeInfo。
 template<typename T, bool isBasicBlock = false>
 __aicore__ inline void SoftmaxGradFrontImpl(const LocalTensor <T> &dstTensor, const LocalTensor <T> &gradTensor,
                                             const LocalTensor <T> &srcTensor, const LocalTensor<float> &workLocal,
@@ -398,6 +428,7 @@ __aicore__ inline void SoftmaxGradFrontImpl(const LocalTensor <T> &dstTensor, co
 
 }
 
+// sharedTmpBuffer 版本入口：调用方传入 uint8_t UB 临时区，这里按 float 重新解释后复用主实现。
 template<typename T, bool isBasicBlock = false>
 __aicore__ inline void SoftmaxGradFrontImpl(const LocalTensor <T> &dstTensor, const LocalTensor <T> &gradTensor,
                                             const LocalTensor <T> &srcTensor,
@@ -408,6 +439,8 @@ __aicore__ inline void SoftmaxGradFrontImpl(const LocalTensor <T> &dstTensor, co
                                           softmaxShapeInfo);
 }
 
+// 对外暴露的 SoftmaxGradFront 接口。
+// 该逻辑只在 AIV/Vector 核上执行；如果当前编译/执行目标是 AIC/Cube，则直接返回。
 template<typename T, bool isBasicBlock = false>
 __aicore__ inline void SoftmaxGradFront(const LocalTensor <T> &dstTensor, const LocalTensor <T> &gradTensor,
                                         const LocalTensor <T> &srcTensor, const LocalTensor <uint8_t> &sharedTmpBuffer,

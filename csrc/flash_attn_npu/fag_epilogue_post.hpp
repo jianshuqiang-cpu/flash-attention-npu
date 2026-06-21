@@ -30,6 +30,12 @@ using AscendC::TQue;
 
 namespace Catlass::Epilogue::Block {
 
+// FAGPost 是 FlashAttention Gradient 反向的最后一个 Vector 后处理阶段。
+// 前面的 Cube/Vector 阶段会在 fp32 workspace 中累加 dq/dk/dv；本阶段负责：
+//   1. 从 workspace 读取 fp32 梯度；
+//   2. 对 dq/dk 乘以 softmax_scale；
+//   3. cast 到输出 dtype，例如 FP16/BF16；
+//   4. 写回最终 dq/dk/dv 输出 tensor。
 template <
     typename ElementVecDtype
 >
@@ -44,17 +50,20 @@ public:
     constexpr static uint32_t POST_BUFFER_NUM = 1;
 
     AscendC::TPipe *pipe;
+    // 输入 UB 用于承接 fp32 workspace，输出 UB 用于承接 cast 后的目标 dtype 数据。
     TBuf<QuePosition::VECIN> inBuffer;
     TBuf<QuePosition::VECOUT> outBuffer;
 
-    // input
+    // 输入：前序 Cube 阶段在 fp32 workspace 中累积出的 dq/dk/dv。
     AscendC::GlobalTensor<float> dqWorkSpaceGm, dkWorkSpaceGm, dvWorkSpaceGm;
-    // output
+    // 输出：最终写回 Python/PyTorch 可见的 dq/dk/dv tensor。
     AscendC::GlobalTensor<ElementVecDtype> dqGm, dkGm, dvGm;
 
+    // 当前 AIV core 编号。
     int64_t cBlockIdx;
-    // query
+    // ubBaseSize 是单次循环最多处理的 fp32 元素数量对应的 UB 容量。
     int64_t ubBaseSize;
+    // dq 使用 qPost* 切分；dk/dv 形状一致，复用 kvPost* 切分。
     int64_t qPostBlockFactor;
     uint64_t qPostBlockTotal;
     int64_t qPostBaseNum;
@@ -63,6 +72,7 @@ public:
     uint64_t kvPostBlockTotal;
     int64_t kvPostBaseNum;
     int64_t kvPostTailNum;
+    // dq/dk 需要乘以 softmax_scale，dv 不需要缩放。
     float scaleValue;
 
     CATLASS_DEVICE
@@ -72,6 +82,7 @@ public:
         cBlockIdx = GetBlockIdx();
         pipe = pipe_in;
 
+        // 从 tiling_data 中读取 workspace 偏移、总元素数量和 scale。
         AscendC::GlobalTensor<uint64_t> tilingData;
         tilingData.SetGlobalBuffer((__gm__ uint64_t *)tiling_in);
 
@@ -90,15 +101,18 @@ public:
         tilingDataFp.SetGlobalBuffer((__gm__ float *)tiling_in);
         scaleValue = tilingDataFp.GetValue(TILING_SCALE_VALUE * CONST_2);
 
+        // 绑定最终输出 tensor。
         dqGm.SetGlobalBuffer((__gm__ ElementVecDtype *)dq);
         dkGm.SetGlobalBuffer((__gm__ ElementVecDtype *)dk);
         dvGm.SetGlobalBuffer((__gm__ ElementVecDtype *)dv);
 
+        // 绑定 fp32 累加 workspace。
         dqWorkSpaceGm.SetGlobalBuffer((__gm__ float *)workspace + dqWorkSpaceOffset / sizeof(float));
         dkWorkSpaceGm.SetGlobalBuffer((__gm__ float *)workspace + dkWorkSpaceOffset / sizeof(float));
         dvWorkSpaceGm.SetGlobalBuffer((__gm__ float *)workspace + dvWorkSpaceOffset / sizeof(float));
 
-        // compute tiling
+        // 计算 post 阶段每次循环能处理多少 fp32 元素。
+        // POST_COEX_NODE=3 表示为 dq/dk/dv 三类后处理预留共存空间，ubBaseSize 再按 256 元素对齐。
         constexpr static uint32_t POST_COEX_NODE = 3;
         constexpr static uint32_t WORKSPACE_NUM_ALIGN = 256;
         uint32_t curPostCoexNode =  POST_COEX_NODE;
@@ -106,7 +120,7 @@ public:
         ubBaseSize = ubSize / curPostCoexNode / POST_BUFFER_NUM;
         ubBaseSize = ubBaseSize / WORKSPACE_NUM_ALIGN * WORKSPACE_NUM_ALIGN; // align
 
-        //dq
+        // dq 总元素数为 qSize，每次循环处理 qPostBaseNum 个 fp32 元素。
         qPostBaseNum = ubBaseSize / sizeof(float);
         qPostBlockTotal = qSize;
 
@@ -116,7 +130,7 @@ public:
         qPostTailNum = qPostTailNumTmp == 0 ? qPostBaseNum : qPostTailNumTmp;
         qPostBlockFactor = (qPostBlockOuterTotal + coreNum - 1) / coreNum;
 
-        // dkv
+        // dk/dv 总元素数为 kvSize，二者形状相同，因此共用 kvPost* 切分参数。
         kvPostBaseNum = qPostBaseNum;
         kvPostBlockTotal = kvSize;
 
@@ -136,9 +150,11 @@ public:
     {
     }
 
+    // 主入口：每个 AIV core 负责 dq 的一段和 dk/dv 的一段，完成 scale、cast 和写回。
     CATLASS_DEVICE
     void operator()()
     {
+        // 当前 core 负责的 dq 元素范围，单位是展平后的元素下标。
         uint64_t qBegin = cBlockIdx * qPostBlockFactor * qPostBaseNum;
         uint64_t qEnd = (cBlockIdx + 1) * qPostBlockFactor * qPostBaseNum;
 
@@ -151,11 +167,13 @@ public:
             AscendC::LocalTensor<float> vecIn = inBuffer.Get<float>();
             AscendC::LocalTensor<ElementVecDtype> vecOut = outBuffer.Get<ElementVecDtype>();
             uint64_t dataSize = i + qPostBaseNum < qPostBlockTotal ? qPostBaseNum : qPostTailNum;
+            // fp32 每 8 个元素为 32B，对齐后从 dq workspace 搬入 UB。
             DataCopy(vecIn, dqWorkSpaceGm[i], (dataSize + 7) / 8 * 8); // dataSize(fp32) align 32B
 
             event_t vWaitMte2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE2_V));
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(vWaitMte2);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(vWaitMte2);
+            // dq 与 softmax score 相关，需要乘以 softmax_scale 后再输出。
             Muls(vecIn, vecIn, scaleValue, dataSize);
             AscendC::PipeBarrier<PIPE_V>();
             Cast(vecOut, vecIn, AscendC::RoundMode::CAST_ROUND, dataSize);
@@ -163,13 +181,14 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
 
+            // 输出 dtype 通常是 fp16/bf16，每 16 个元素为 32B，对齐后写回 dq。
             DataCopy(dqGm[i], vecOut, (dataSize + 15) / 16 * 16); // dataSize(fp16) align 32B
 
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(Mte2WaitMte3);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(Mte2WaitMte3);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
-        // init k
+        // 当前 core 负责的 dk/dv 元素范围。dk 和 dv 形状相同，所以共用这段范围。
         uint64_t kvBegin = cBlockIdx * kvPostBlockFactor * kvPostBaseNum;
         uint64_t kvEnd = (cBlockIdx + 1) * kvPostBlockFactor * kvPostBaseNum;
         if (((cBlockIdx + 1) * kvPostBlockFactor * kvPostBaseNum) > kvPostBlockTotal) {
@@ -185,6 +204,7 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(vWaitMte2);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(vWaitMte2);
 
+            // dk 同样来自 score 方向梯度，需要乘以 softmax_scale。
             Muls(vecIn, vecIn, scaleValue, dataSize);
             AscendC::PipeBarrier<PIPE_V>();
             Cast(vecOut, vecIn, AscendC::RoundMode::CAST_ROUND, dataSize);
@@ -193,6 +213,7 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
 
+            // 输出 dtype 通常是 fp16/bf16，每 16 个元素为 32B，对齐后写回 dk。
             DataCopy(dkGm[i], vecOut, (dataSize + 15) / 16 * 16); // dataSize(fp16) align 32B
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(Mte2WaitMte3);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(Mte2WaitMte3);
@@ -200,7 +221,7 @@ public:
         }
         AscendC::PipeBarrier<PIPE_ALL>();
 
-        // init v
+        // dv 不需要乘 softmax_scale，只需要从 fp32 workspace cast 到输出 dtype 后写回。
         for (uint64_t i = kvBegin; i < kvEnd; i = i + kvPostBaseNum) {
             AscendC::LocalTensor<float> vecIn = inBuffer.Get<float>();
             AscendC::LocalTensor<ElementVecDtype> vecOut = outBuffer.Get<ElementVecDtype>();
@@ -215,6 +236,7 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
 
+            // 输出 dtype 通常是 fp16/bf16，每 16 个元素为 32B，对齐后写回 dv。
             DataCopy(dvGm[i], vecOut, (dataSize + 15) / 16 * 16); // dataSize(fp16) align 32B
             if (i + kvPostBaseNum < kvEnd) {
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(Mte2WaitMte3);

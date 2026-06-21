@@ -107,6 +107,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
                 std::optional<at::Tensor> v_new_,  // (b, s_k_new, h_k, dv) or (total_k_new, h_k, dv) if there is cu_seqlens_k_new
                 std::optional<at::Tensor> q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
                 std::optional<at::Tensor> out_,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
+                // cu_seqlens_q_[i] 表示第 i 个样本之前所有样本的 token 总数（含 i=0 时为 0）。
                 std::optional<at::Tensor> cu_seqlens_q_,  // b+1
                 std::optional<at::Tensor> cu_seqlens_k_,  // b+1
                 std::optional<at::Tensor> cu_seqlens_k_new_,  // b+1
@@ -115,6 +116,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
                 std::optional<int64_t> max_seqlen_q_,
                 // TODO: check if we need max_seqlen_k
                 std::optional<int64_t> max_seqlen_k_,
+                // FlashAttention 的Paged KV-Cache模式入参，用于在推理场景下支持类似 vLLM 的非连续 KV 存储。
                 std::optional<at::Tensor> page_table_, // (b_k, max_num_pages_per_seq)
                 std::optional<at::Tensor> kv_batch_idx_, // b. indices to index into the KV cache
                 std::optional<at::Tensor> leftpad_k_, // b

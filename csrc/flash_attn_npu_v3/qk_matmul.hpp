@@ -158,7 +158,7 @@ public:
      *
      * 内存布局示意（L1 空间）：
      *   ┌─────────────────────────────────────────────────────────────┐
-     *   │ L1A (Q 矩阵, 单缓冲) │ L1B[0] (K) │ L1B[1] (K) │ ...        │
+     *   │ L1A (Q 矩阵, 单缓冲)   │ L1B[0] (K) │ L1B[1] (K) │ ...        │
      *   │ l1BufAddrStart       │  M*kDyn    │  nDyn*kDyn │            │
      *   └─────────────────────────────────────────────────────────────┘
      * L0 空间（Ping-Pong 双缓冲）：
@@ -396,7 +396,7 @@ public:
      *   4. 内层循环 kL0（嵌入维分块）：
      *      - L1A → L0A 搬运 Q 分块（copyL1ToL0A）
      *      - L1B → L0B 搬运 K 分块（copyL1ToL0B）
-     *      - 执行 Cube 矩阵乘法 tileMmad（L0A × L0B → L0C）
+     *      - 执行 Cube 矩阵乘法 tileMmad （L0A × L0B → L0C）
      *      - Ping-Pong 切换 l0ABPingPongFlag
      *   5. mL0 循环结束：L0C → GM 回写结果 S（copyL0CToGm），切换 l0CPingPongFlag
      *   6. nL1 循环结束：切换 l1KvPingPongFlag

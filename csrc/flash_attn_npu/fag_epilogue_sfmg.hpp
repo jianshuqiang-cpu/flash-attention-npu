@@ -31,6 +31,10 @@ using AscendC::TQue;
 
 namespace Catlass::Epilogue::Block {
 
+// FAGSfmg 是 FlashAttention Gradient 反向中的 softmax gradient 前置归约阶段。
+// 它在 FAGPre 清零 workspace 后、FAGOp 计算 dS 前执行，读取 dout 和前向输出 out，
+// 按每个 token/head 维度计算 rowsum(dout * out)，并将结果写入 sfmg workspace。
+// 后续 FAGOp 会读取该辅助项，计算 dS = P * (dP - rowsum(dP * P)) 中的逐行归约部分。
 template <
     typename ElementVecDtype,
     InputLayout inputLayout
@@ -57,14 +61,17 @@ public:
         cBlockIdx = GetBlockIdx();
         pipe = pipe_in;
 
+        // 从 tiling_data 读取形状、GQA 分组和 workspace 偏移。
         AscendC::GlobalTensor<uint64_t> tilingData;
         tilingData.SetGlobalBuffer((__gm__ uint64_t *)tiling_in);
         batch = tilingData.GetValue(TILING_B);
         total_q = tilingData.GetValue(TILING_T1);
         nheads_k = tilingData.GetValue(TILING_N2);
         if constexpr (getLayout() == InputLayout::BSND) {
+            // BSND 是定长 batch 布局，可以直接由 total_q / batch 得到每个 batch 的 Q 长度。
             seq_q = total_q / batch;
         } else {
+            // TND 是变长打平布局，每个 batch 的长度后续通过 cu_seq_qlen_addr 动态计算。
             seq_q = 0;
         }
         g = tilingData.GetValue(TILING_G);
@@ -74,9 +81,11 @@ public:
         int64_t mm1WorkspaceOffset = tilingData.GetValue(TILING_MM1_WORKSPACE_OFFSET);
         int64_t mm2WorkspaceOffset = tilingData.GetValue(TILING_MM2_WORKSPACE_OFFSET);
         nheads = nheads_k * g;
+        // head dim 按 16 对齐，便于 Vector 计算和 DataCopyPad 搬运。
         dAlign = (headdim + 15) / 16 * 16;
         cu_seq_qlen_addr = cu_seq_qlen;
 
+        // DataCopyPad 按 head 维度搬运时，相邻 burst 之间跨过其余 head 的字节数。
         n_stride = (nheads - 1) * headdim * sizeof(ElementVecDtype);
 
         AscendC::GlobalTensor<uint32_t> tilingDataU32;
@@ -89,12 +98,14 @@ public:
         uint32_t outputBufferLen = (castBufferLen + dAlign - 1) / dAlign * 8;
         uint32_t tempBufferLen = 40 * 1024 - outputBufferLen;
 
-        // 计算单核的计算量
+        // 计算单核的计算量。这里的轴是 total_q * nheads，每个元素代表一个 token/head 行。
         int64_t normalAxisSize = total_q * nheads;
         normalCoreSize = (normalAxisSize + coreNum -1) / coreNum;
+        // 实际参与计算的 core 数；当任务量小于 core 数时，部分 core 会空闲。
         usedCoreNum = (normalAxisSize + normalCoreSize -1) / normalCoreSize;
 
-        // 计算单loop的计算量及loop次数
+        // 计算单 loop 能处理多少个 token/head 行，以及普通 core 需要循环多少次。
+        // 每一行搬运 dAlign 个元素，inputBufferLen 限制了一次最多处理的行数。
         singleLoopNBurstNum = inputBufferLen / sizeof(float) / dAlign;
         normalCoreLoopTimes = (normalCoreSize + singleLoopNBurstNum -1) / singleLoopNBurstNum;
         normalCoreLastLoopNBurstNum = normalCoreSize - (normalCoreLoopTimes - 1) * singleLoopNBurstNum;
@@ -122,6 +133,8 @@ public:
     {
     }
 
+    // 根据展平后的起始元素下标，恢复当前 batch/head/seq 三维索引。
+    // startIdx 的单位是元素，包含 headdim；内部会解析到 bIdx、nIdx、sIdx。
     CATLASS_DEVICE
     void InitIndex(int64_t startIdx, int64_t& curS, GM_ADDR seqS)
     {
@@ -149,6 +162,8 @@ public:
         }
     }
 
+    // 从 GM 中把连续 curNBurst 个 token/head 行的 dout 和 out 搬入 UB。
+    // 每行真实长度是 headdim，搬入 UB 时 pad 到 dAlign。
     CATLASS_DEVICE
     void DoCopyIn(int64_t curS, int64_t curNBurst, int64_t dstOffset, GM_ADDR seqS)
     {
@@ -170,6 +185,8 @@ public:
                     {true, 0, static_cast<uint8_t>((dAlign - headdim)), 0});
     }
 
+    // 连续搬入 leftNburst 个 token/head 行。
+    // 如果当前 seq 剩余长度不够，会自动跨到下一个 head；head 用完后再跨到下一个 batch。
     CATLASS_DEVICE
     void CopyInSfmg(int64_t leftNburst, int64_t &curS, GM_ADDR seqS)
     {
@@ -206,6 +223,7 @@ public:
         }
     }
     
+    // 主入口：每个 AIV core 处理一段 token/head 行，计算每行 rowsum(dout * out)。
     CATLASS_DEVICE
     void operator()()
     {
@@ -228,6 +246,7 @@ public:
                 singleCoreLastLoopNBurstNum = tailCoreLastLoopNBurstNum;
             }
 
+            // startIdx 是当前 core 在 token/head 行维度上的起点，不包含 headdim。
             int64_t startIdx = cBlockIdx * normalCoreSize;
             int64_t nBurst = singleLoopNBurstNum;
             int64_t curS = seq_q;
@@ -248,16 +267,16 @@ public:
                 }
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(VWaitMte2);
 
-                // cast 1
+                // cast 1：dout 从 ElementVecDtype 转成 float，后续用 fp32 做乘法归约。
                 int64_t calcSize = nBurst * dAlign;
                 Cast(sfmgClc1, input1Buf, RoundMode::CAST_NONE, calcSize);
                 AscendC::PipeBarrier<PIPE_V>();
 
-                // cast 2
+                // cast 2：out 从 ElementVecDtype 转成 float。
                 Cast(sfmgClc2, input2Buf, RoundMode::CAST_NONE, calcSize);
                 AscendC::PipeBarrier<PIPE_V>();
 
-                // pre copyIn next nBurst
+                // 预取下一轮数据，与当前轮 Vector 计算形成简单流水。
                 if (i < singleCoreLoopTimes - 1) {
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(Mte2WaitV);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(Mte2WaitV);
@@ -274,7 +293,7 @@ public:
                     AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(VWaitMte3);
                 }
 
-                // sfmg
+                // sfmg：对每行做 dout * out，并沿 headdim 归约，输出每行 8 个 float 的广播辅助项。
                 outputBuf = outBuffer1.Get<float>();
                 AscendC::Duplicate<float>(outputBuf, 0.0, nBurst * 8);
                 AscendC::PipeBarrier<PIPE_V>();
@@ -286,6 +305,7 @@ public:
                 outputBuf.SetShapeInfo(AscendC::ShapeInfo(2, shapeArray1, AscendC::DataFormat::ND));
 
                 bool isBasicBlock = (nBurst % SFMG_HIGH_PERF_N_FACTOR == 0) && (dAlign % SFMG_HIGH_PERF_D_FACTOR == 0);
+                // 对齐到高性能形状时走 true 分支，否则走通用归约路径。
                 if (likely(isBasicBlock)) {
                     SoftmaxGradFront<float, true>(outputBuf, sfmgClc1, sfmgClc2, tempBuf);
                 } else {
@@ -293,7 +313,7 @@ public:
                 }
                 AscendC::PipeBarrier<PIPE_V>();
 
-                // copyOut
+                // copyOut：每个 token/head 行输出 BLOCK_SIZE=8 个 float 到 sfmg workspace。
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(Mte3WaitV);
 
@@ -308,8 +328,10 @@ public:
     }
 protected:
     /// Data members
+    // sfmg workspace 每行按 32B 存储，即 8 个 float。
     constexpr static int64_t BLOCK_BYTE_SIZE = 32;
     constexpr static int64_t BLOCK_SIZE = 8;
+    // 高性能路径要求 nBurst 和 dAlign 满足固定对齐粒度。
     constexpr static int64_t SFMG_HIGH_PERF_N_FACTOR = 8;
     constexpr static int64_t SFMG_HIGH_PERF_D_FACTOR = 64;
 
