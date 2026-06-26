@@ -16,9 +16,17 @@ else()
     set(ASCEND_HOME "/usr/local/Ascend")
 endif()
 
+# Detect system architecture (x86_64 or aarch64)
+if(NOT DEFINED ASCEND_ARCH)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        set(ASCEND_ARCH "aarch64-linux")
+    else()
+        set(ASCEND_ARCH "x86_64-linux")
+    endif()
+endif()
+
 message(STATUS "Using Ascend toolkit from: ${ASCEND_HOME}")
-message(STATUS "  - Checking kernel_operator.h in: ${ASCEND_HOME}/compiler/tikcpp/include")
-message(STATUS "  - Checking kernel_operator.h in: ${ASCEND_HOME}/aarch64-linux/tikcpp/include")
+message(STATUS "System architecture: ${ASCEND_ARCH}")
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
 
@@ -37,8 +45,11 @@ execute_process(
 )
 
 include_directories(
-    ${ASCEND_HOME}/compiler/tikcpp/include
-    ${ASCEND_HOME}/aarch64-linux/tikcpp/include
+    ${ASCEND_HOME}/${ASCEND_ARCH}/asc/include
+    ${ASCEND_HOME}/${ASCEND_ARCH}/tikcpp/tikcfw
+    ${ASCEND_HOME}/${ASCEND_ARCH}/include
+    ${ASCEND_HOME}/${ASCEND_ARCH}/include/ascendc/basic_api
+    ${ASCEND_HOME}/${ASCEND_ARCH}/ascendc/include/basic_api
     ${ASCEND_HOME}/include
     ${ASCEND_HOME}/pkg_inc
     ${ASCEND_HOME}/pkg_inc/profiling
@@ -60,8 +71,11 @@ link_directories(
 
 add_library(pch_target INTERFACE)
 target_include_directories(pch_target INTERFACE
-    ${ASCEND_HOME}/compiler/tikcpp/include
-    ${ASCEND_HOME}/aarch64-linux/tikcpp/include
+    ${ASCEND_HOME}/${ASCEND_ARCH}/asc/include
+    ${ASCEND_HOME}/${ASCEND_ARCH}/tikcpp/tikcfw
+    ${ASCEND_HOME}/${ASCEND_ARCH}/include
+    ${ASCEND_HOME}/${ASCEND_ARCH}/include/ascendc/basic_api
+    ${ASCEND_HOME}/${ASCEND_ARCH}/ascendc/include/basic_api
     ${ASCEND_HOME}/include
     ${ASCEND_HOME}/pkg_inc
     ${ASCEND_HOME}/pkg_inc/profiling

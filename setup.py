@@ -59,9 +59,16 @@ def check_cmake_ninja():
 
 def build_with_cmake_ninja(this_dir, ext_name):
     import multiprocessing
+    import platform
     
     build_dir = os.path.join(this_dir, "build", "cmake_build")
     os.makedirs(build_dir, exist_ok=True)
+    
+    system_arch = platform.machine()
+    if system_arch in ("aarch64", "arm64"):
+        ascend_arch = "aarch64-linux"
+    else:
+        ascend_arch = "x86_64-linux"
     
     cmake_cmd = [
         "cmake",
@@ -70,6 +77,7 @@ def build_with_cmake_ninja(this_dir, ext_name):
         "-G", "Ninja",
         f"-DCMAKE_CXX_COMPILER=bisheng",
         "-DCMAKE_BUILD_TYPE=Release",
+        f"-DASCEND_ARCH={ascend_arch}",
     ]
     
     print("Running CMake configure:", " ".join(cmake_cmd))
@@ -107,18 +115,28 @@ class BishengBuildExt(build_ext):
             print(f"CMake+Ninja build successful: {ext_fullpath}")
             return
 
+        # Fallback to original build method
         ascend_home = os.getenv("ASCEND_TOOLKIT_HOME", os.getenv("ASCEND_HOME_PATH", "/usr/local/Ascend"))
         if not os.path.exists(ascend_home):
             raise RuntimeError(f"ASCEND_TOOLKIT_HOME={ascend_home}")
 
+        import platform
+        system_arch = platform.machine()
+        if system_arch in ("aarch64", "arm64"):
+            ascend_arch = "aarch64-linux"
+        else:
+            ascend_arch = "x86_64-linux"
+
         asc_include_paths = [
-            os.path.join(ascend_home, "compiler/tikcpp/include"),
-            os.path.join(ascend_home, "aarch64-linux/tikcpp/include"),
+            os.path.join(ascend_home, ascend_arch, "asc/include"),
+            os.path.join(ascend_home, ascend_arch, "tikcpp/tikcfw"),
+            os.path.join(ascend_home, ascend_arch, "include"),
+            os.path.join(ascend_home, ascend_arch, "include/ascendc/basic_api"),
+            os.path.join(ascend_home, ascend_arch, "ascendc/include/basic_api"),
         ]
 
         asc_lib_paths = [
-            os.path.join(ascend_home, "compiler/lib64"),
-            os.path.join(ascend_home, "aarch64-linux/lib64"),
+            os.path.join(ascend_home, ascend_arch, "lib64"),
         ]
 
         python_include = sysconfig.get_path('include')
