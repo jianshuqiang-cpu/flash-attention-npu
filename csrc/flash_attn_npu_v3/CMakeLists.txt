@@ -10,11 +10,15 @@ if(DEFINED ENV{ASCEND_TOOLKIT_HOME})
     set(ASCEND_HOME $ENV{ASCEND_TOOLKIT_HOME})
 elseif(DEFINED ENV{ASCEND_HOME_PATH})
     set(ASCEND_HOME $ENV{ASCEND_HOME_PATH})
+elseif(DEFINED ENV{ASCEND_HOME})
+    set(ASCEND_HOME $ENV{ASCEND_HOME})
 else()
     set(ASCEND_HOME "/usr/local/Ascend")
 endif()
 
 message(STATUS "Using Ascend toolkit from: ${ASCEND_HOME}")
+message(STATUS "  - Checking kernel_operator.h in: ${ASCEND_HOME}/compiler/tikcpp/include")
+message(STATUS "  - Checking kernel_operator.h in: ${ASCEND_HOME}/aarch64-linux/tikcpp/include")
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
 
@@ -55,6 +59,20 @@ link_directories(
 )
 
 add_library(pch_target INTERFACE)
+target_include_directories(pch_target INTERFACE
+    ${ASCEND_HOME}/compiler/tikcpp/include
+    ${ASCEND_HOME}/aarch64-linux/tikcpp/include
+    ${ASCEND_HOME}/include
+    ${ASCEND_HOME}/pkg_inc
+    ${ASCEND_HOME}/pkg_inc/profiling
+    ${ASCEND_HOME}/runtime/include
+    ${ASCEND_HOME}/include/experiment/runtime
+    ${ASCEND_HOME}/include/experiment/msprof
+    ${Python3_INCLUDE_DIRS}
+    ${TORCH_INCLUDE_DIRS}
+    ${TORCH_NPU_PATH}/include
+    ${PROJECT_SOURCE_DIR}/../catlass/include
+)
 target_precompile_headers(pch_target INTERFACE ${PROJECT_SOURCE_DIR}/pch.hpp)
 
 add_library(kernel_inst_64 OBJECT kernel_inst_64.cpp)
