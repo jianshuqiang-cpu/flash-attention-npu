@@ -159,14 +159,6 @@ class BishengBuildExt(build_ext):
         torch_abi = torch._C._GLIBCXX_USE_CXX11_ABI
         abi_flag = f"-D_GLIBCXX_USE_CXX11_ABI={1 if torch_abi else 0}"
 
-        pch_path = os.path.join(this_dir, "csrc/flash_attn_npu_v3/pch.hpp")
-        pch_flags = []
-        if os.path.exists(pch_path):
-            pch_flags = [
-                f"-I{os.path.dirname(pch_path)}",
-                "-include", "pch.hpp",
-            ]
-
         compile_cmd = [
             "bisheng",
             "-O2",
@@ -177,27 +169,7 @@ class BishengBuildExt(build_ext):
             "-fPIC",
             "-std=c++17",
             "-DCATLASS_ARCH=2201",
-            "-D__CCE_KERNEL__=1",
-            "-D__ASCEND_KERNEL__=1",
-            "-D__aicore__=",
-            "-D__noinline__=",
-            "-D__global__=",
-            "-D__local__=",
-            "-D__ccu_core__=",
-            "-D__vector__=",
-            "-D__gm__=",
-            "-D__gdram__=",
-            "-D__l1__=",
-            "-D__l0__=",
-            "-D__ub__=",
-            "-D__sm__=",
-            "-D__stream__=",
-            "-D__noc__=",
-            "-D__dv__=",
-            "-D__aic__=",
-            "-D__attr__=",
             abi_flag,
-            *pch_flags,
             *[f"-I{p}" for p in asc_include_paths],
             f"-I{python_include}",
             f"-I{torch_npu_include}",
