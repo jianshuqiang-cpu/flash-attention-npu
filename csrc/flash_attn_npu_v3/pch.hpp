@@ -5,23 +5,6 @@
 #ifndef PCH_HPP
 #define PCH_HPP
 
-// Host build macros - disable NPU kernel specific attributes
-#ifndef __aicore__
-#define __aicore__
-#endif
-
-#ifndef __noinline__
-#define __noinline__
-#endif
-
-#ifndef __global__
-#define __global__
-#endif
-
-#ifndef __local__
-#define __local__
-#endif
-
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
