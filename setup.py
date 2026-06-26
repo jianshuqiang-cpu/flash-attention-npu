@@ -131,6 +131,8 @@ class BishengBuildExt(build_ext):
             os.path.join(ascend_home, ascend_arch, "asc/include"),
             os.path.join(ascend_home, ascend_arch, "asc/include/basic_api"),
             os.path.join(ascend_home, ascend_arch, "asc/include/interface"),
+            os.path.join(ascend_home, ascend_arch, "asc/impl/basic_api"),
+            os.path.join(ascend_home, ascend_arch, "ascendc/include/basic_api/impl"),
             os.path.join(ascend_home, ascend_arch, "tikcpp/tikcfw"),
             os.path.join(ascend_home, ascend_arch, "include"),
             os.path.join(ascend_home, ascend_arch, "include/ascendc/basic_api"),

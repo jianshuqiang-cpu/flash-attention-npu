@@ -48,6 +48,8 @@ include_directories(
     ${ASCEND_HOME}/${ASCEND_ARCH}/asc/include
     ${ASCEND_HOME}/${ASCEND_ARCH}/asc/include/basic_api
     ${ASCEND_HOME}/${ASCEND_ARCH}/asc/include/interface
+    ${ASCEND_HOME}/${ASCEND_ARCH}/asc/impl/basic_api
+    ${ASCEND_HOME}/${ASCEND_ARCH}/ascendc/include/basic_api/impl
     ${ASCEND_HOME}/${ASCEND_ARCH}/tikcpp/tikcfw
     ${ASCEND_HOME}/${ASCEND_ARCH}/include
     ${ASCEND_HOME}/${ASCEND_ARCH}/include/ascendc/basic_api
@@ -76,6 +78,8 @@ target_include_directories(pch_target INTERFACE
     ${ASCEND_HOME}/${ASCEND_ARCH}/asc/include
     ${ASCEND_HOME}/${ASCEND_ARCH}/asc/include/basic_api
     ${ASCEND_HOME}/${ASCEND_ARCH}/asc/include/interface
+    ${ASCEND_HOME}/${ASCEND_ARCH}/asc/impl/basic_api
+    ${ASCEND_HOME}/${ASCEND_ARCH}/ascendc/include/basic_api/impl
     ${ASCEND_HOME}/${ASCEND_ARCH}/tikcpp/tikcfw
     ${ASCEND_HOME}/${ASCEND_ARCH}/include
     ${ASCEND_HOME}/${ASCEND_ARCH}/include/ascendc/basic_api
