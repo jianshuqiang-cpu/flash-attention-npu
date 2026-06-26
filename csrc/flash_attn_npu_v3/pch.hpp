@@ -16,6 +16,9 @@
 #include <memory>
 #include <string>
 #include <sstream>
+
+// AscendC core headers - must be included before other catlass headers
+#include "kernel_operator.h"
 #include "acl/acl.h"
 #include "runtime/rt_ffts.h"
 
