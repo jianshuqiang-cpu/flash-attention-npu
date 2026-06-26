@@ -49,8 +49,64 @@ def get_platform():
     else:
         raise ValueError("Unsupported platform: {}".format(sys.platform))
 
+def check_cmake_ninja():
+    try:
+        subprocess.run(["cmake", "--version"], check=True, capture_output=True)
+        subprocess.run(["ninja", "--version"], check=True, capture_output=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+def build_with_cmake_ninja(this_dir, ext_name):
+    import multiprocessing
+    
+    build_dir = os.path.join(this_dir, "build", "cmake_build")
+    os.makedirs(build_dir, exist_ok=True)
+    
+    cmake_cmd = [
+        "cmake",
+        "-B", build_dir,
+        "-S", this_dir,
+        "-G", "Ninja",
+        f"-DCMAKE_CXX_COMPILER=bisheng",
+        "-DCMAKE_BUILD_TYPE=Release",
+    ]
+    
+    print("Running CMake configure:", " ".join(cmake_cmd))
+    try:
+        subprocess.run(cmake_cmd, check=True, cwd=this_dir)
+    except subprocess.CalledProcessError as e:
+        print(f"CMake configure failed! Error: {e.stderr}")
+        raise
+    
+    num_jobs = multiprocessing.cpu_count()
+    ninja_cmd = ["ninja", "-C", build_dir, f"-j{num_jobs}"]
+    
+    print("Running Ninja build:", " ".join(ninja_cmd))
+    try:
+        result = subprocess.run(ninja_cmd, capture_output=True, text=True, cwd=this_dir)
+        print(f"Ninja build output: {result.stdout}")
+        if result.returncode != 0:
+            print(f"Ninja build error: {result.stderr}")
+            raise subprocess.CalledProcessError(result.returncode, ninja_cmd)
+    except subprocess.CalledProcessError as e:
+        print(f"Ninja build failed!")
+        raise
+    
+    return os.path.join(build_dir, "csrc/flash_attn_npu_v3", f"{ext_name}.so")
+
 class BishengBuildExt(build_ext):
     def build_extension(self, ext):
+        use_cmake = os.getenv("FLASH_ATTN_USE_CMAKE", "FALSE").upper() == "TRUE"
+        if use_cmake and check_cmake_ninja():
+            built_so = build_with_cmake_ninja(this_dir, ext.name)
+            ext_fullpath = self.get_ext_fullpath(ext.name)
+            os.makedirs(os.path.dirname(ext_fullpath), exist_ok=True)
+            import shutil
+            shutil.copy2(built_so, ext_fullpath)
+            print(f"CMake+Ninja build successful: {ext_fullpath}")
+            return
+
         ascend_home = os.getenv("ASCEND_TOOLKIT_HOME", os.getenv("ASCEND_HOME_PATH", "/usr/local/Ascend"))
         if not os.path.exists(ascend_home):
             raise RuntimeError(f"ASCEND_TOOLKIT_HOME={ascend_home}")
@@ -81,6 +137,14 @@ class BishengBuildExt(build_ext):
         torch_abi = torch._C._GLIBCXX_USE_CXX11_ABI
         abi_flag = f"-D_GLIBCXX_USE_CXX11_ABI={1 if torch_abi else 0}"
 
+        pch_path = os.path.join(this_dir, "csrc/flash_attn_npu_v3/pch.hpp")
+        pch_flags = []
+        if os.path.exists(pch_path):
+            pch_flags = [
+                f"-I{os.path.dirname(pch_path)}",
+                "-include", "pch.hpp",
+            ]
+
         compile_cmd = [
             "bisheng",
             "-O2",
@@ -92,6 +156,7 @@ class BishengBuildExt(build_ext):
             "-std=c++17",
             "-DCATLASS_ARCH=2201",
             abi_flag,
+            *pch_flags,
             *[f"-I{p}" for p in asc_include_paths],
             f"-I{python_include}",
             f"-I{torch_npu_include}",

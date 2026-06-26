@@ -1,8 +1,5 @@
+#include "pch.hpp"
 #include <torch/extension.h>
-#include <algorithm>
-#include <chrono>
-#include <cstring>
-#include <limits>
 
 #include "mha_fwd_kvcache.cpp"
 // #include "mha_fwd_kvcache_2.cpp"
