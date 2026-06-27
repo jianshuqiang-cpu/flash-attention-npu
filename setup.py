@@ -14,6 +14,7 @@ import platform
 from setuptools import setup, find_packages, Extension
 from setuptools.command.build_ext import build_ext
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import urllib.request
 import urllib.error
@@ -50,7 +51,14 @@ def get_platform():
         raise ValueError("Unsupported platform: {}".format(sys.platform))
 
 class BishengBuildExt(build_ext):
-    def build_extension(self, ext):
+    # The compiler flags / include / lib paths are identical for every
+    # extension (v2, v3), so compute them once and reuse across the whole build.
+    _toolchain = None
+
+    def _get_toolchain(self):
+        if self._toolchain is not None:
+            return self._toolchain
+
         ascend_home = os.getenv("ASCEND_TOOLKIT_HOME", os.getenv("ASCEND_HOME_PATH", "/usr/local/Ascend"))
         if not os.path.exists(ascend_home):
             raise RuntimeError(f"ASCEND_TOOLKIT_HOME={ascend_home}")
@@ -75,23 +83,22 @@ class BishengBuildExt(build_ext):
         torch_npu_path = os.path.dirname(torch_npu.__file__)
         torch_npu_include = os.path.join(torch_npu_path, "include")
         torch_npu_lib = os.path.join(torch_npu_path, "lib")
-        ext_fullpath = self.get_ext_fullpath(ext.name)
-        os.makedirs(os.path.dirname(ext_fullpath), exist_ok=True)
 
         torch_abi = torch._C._GLIBCXX_USE_CXX11_ABI
         abi_flag = f"-D_GLIBCXX_USE_CXX11_ABI={1 if torch_abi else 0}"
 
-        compile_cmd = [
-            "bisheng",
-            "-O2",
+        # The NPU arch / CANN-version flags apply to the per-TU compile step.
+        # `-x asc` tells bisheng the inputs are ASC source; it must NOT be passed
+        # at link time, or bisheng treats the .o object files as source.
+        compile_arch_flags = [
             "-x", "asc",
             "--npu-arch=dav-2201",
             *(["--cce-auto-infer-kernel-type=false"] if parse(torch_npu.utils.get_cann_version()) >= parse("9.0.0") else []),
-            "-shared",
-            "-fPIC",
-            "-std=c++17",
-            "-DCATLASS_ARCH=2201",
-            abi_flag,
+        ]
+        # At link time only the target arch is needed (for device-code linking).
+        link_arch_flags = ["--npu-arch=dav-2201"]
+
+        include_flags = [
             *[f"-I{p}" for p in asc_include_paths],
             f"-I{python_include}",
             f"-I{torch_npu_include}",
@@ -105,6 +112,9 @@ class BishengBuildExt(build_ext):
             f"-I{torch_package_path}/include",
             f"-I{torch_package_path}/include/torch/csrc/api/include",
             f"-I{this_dir}/csrc/catlass/include",
+        ]
+
+        link_flags = [
             *[f"-L{p}" for p in asc_lib_paths],
             f"-L{torch_lib}",
             f"-L{torch_npu_lib}",
@@ -114,23 +124,94 @@ class BishengBuildExt(build_ext):
             "-ltorch_npu",
             "-ltiling_api",
             "-lplatform",
-            *ext.sources,
-            "-o", ext_fullpath,
         ]
 
-        print(" ".join(compile_cmd))
+        # NOTE: ccache is intentionally NOT supported. bisheng requires `-x asc`
+        # to enter ASC/device-compile mode (without it, kernel_operator.h and the
+        # ASC headers are unresolvable). ccache hard-rejects any `-x <lang>` it
+        # does not recognize, treating `-x asc` as "Unsupported language: asc" and
+        # falling back to running the real compiler with zero caching — so wrapping
+        # bisheng in ccache provides no benefit. If ccache ever adds ASC language
+        # support, reintroduce an opt-in wrapper here.
+        compiler = ["bisheng"]
 
+        compile_common = [*compiler, "-O2", *compile_arch_flags, "-fPIC", "-std=c++17",
+                          "-DCATLASS_ARCH=2201", abi_flag, *include_flags]
+
+        self._toolchain = (compiler, compile_common, link_arch_flags, link_flags)
+        return self._toolchain
+
+    def build_extensions(self):
+        # Override setuptools' default _build_extensions_serial (which builds one
+        # extension fully, then the next) so that ALL translation units across ALL
+        # extensions are compiled in a single shared thread pool. The heaviest TU
+        # (single-threaded bisheng -c, ~30s+ for 32-kernel dispatch files) used to
+        # serialize across v2-then-v3; now the two heaviest TUs (v2's
+        # fag_general_dispatch_bf16 and v3's bwd_dispatch_bf16) compile
+        # concurrently. Linking stays per-extension (fast, and each ext needs only
+        # its own .o files).
+        compiler, compile_common, link_arch_flags, link_flags = self._get_toolchain()
+
+        # Map every TU source -> (ext_name, obj_path). obj dir is per-extension so
+        # v2/v3 .o files (same basenames, e.g. flash_api.o) never collide.
+        tasks = []  # (ext_name, src, obj)
+        for ext in self.extensions:
+            ext_fullpath = self.get_ext_fullpath(ext.name)
+            os.makedirs(os.path.dirname(ext_fullpath), exist_ok=True)
+            obj_dir = os.path.join(os.path.dirname(ext_fullpath), ext.name + ".objs")
+            os.makedirs(obj_dir, exist_ok=True)
+            for src in ext.sources:
+                obj = os.path.join(obj_dir, os.path.splitext(os.path.basename(src))[0] + ".o")
+                tasks.append((ext.name, src, obj))
+
+        def compile_one(task):
+            ext_name, src, obj = task
+            cmd = [*compile_common, "-c", src, "-o", obj]
+            print("[compile]", ext_name, os.path.basename(src))
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                if result.stdout:
+                    print(result.stdout)
+                return (ext_name, obj)
+            except subprocess.CalledProcessError as e:
+                print(f"Compilation failed for {src}! Error output:\n{e.stderr}")
+                raise
+
+        # One shared pool across both extensions: total TUs == 12 (v2:8, v3:4).
+        max_workers = min(len(tasks), os.cpu_count() or 1)
+        objs_by_ext = {ext.name: [] for ext in self.extensions}
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(compile_one, t): t for t in tasks}
+            for fut in as_completed(futures):
+                ext_name, obj = fut.result()
+                objs_by_ext[ext_name].append(obj)
+
+        # Link each extension from its own object files (serial; link is cheap
+        # relative to compile and each ext needs only its own .o set).
+        for ext in self.extensions:
+            ext_fullpath = self.get_ext_fullpath(ext.name)
+            objs = objs_by_ext[ext.name]
+            link_cmd = [*compiler, *link_arch_flags, "-shared", "-fPIC", *objs, *link_flags, "-o", ext_fullpath]
+            print("[link]", ext_fullpath)
+            try:
+                result = subprocess.run(link_cmd, capture_output=True, text=True, check=True)
+                if result.stdout:
+                    print(result.stdout)
+                print(f"Link successful! output: {ext_fullpath}")
+            except subprocess.CalledProcessError as e:
+                print(f"Link failed! Error output:\n{e.stderr}")
+                raise e
+
+    def build_extension(self, ext):
+        # Kept for single-ext builds (e.g. FLASH_ATTN_BUILD_VERSION=v2) and any
+        # code path that calls build_extension directly. Delegates to the shared
+        # pool logic with a one-element extension list.
+        saved = self.extensions
+        self.extensions = [ext]
         try:
-            result = subprocess.run(
-                compile_cmd,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            print(f"Compilation successful! output: {result.stdout}")
-        except subprocess.CalledProcessError as e:
-            print(f"Compilation failed! Error output: {e.stderr}")
-            raise e
+            self.build_extensions()
+        finally:
+            self.extensions = saved
 
 ext_modules = []
 
@@ -143,7 +224,18 @@ else:
 
 source_files = glob.glob(os.path.join(this_dir, "csrc/flash_attn_npu", "flash_api.cpp"), recursive=True)
 source_files += glob.glob(os.path.join(this_dir, "csrc/flash_attn_npu", "fag_general_host.cpp"), recursive=True)
+source_files += glob.glob(os.path.join(this_dir, "csrc/flash_attn_npu", "fwd_dispatch_bf16.cpp"), recursive=True)
+source_files += glob.glob(os.path.join(this_dir, "csrc/flash_attn_npu", "fwd_dispatch_fp16.cpp"), recursive=True)
+source_files += glob.glob(os.path.join(this_dir, "csrc/flash_attn_npu", "varlen_bwd_dispatch_bf16.cpp"), recursive=True)
+source_files += glob.glob(os.path.join(this_dir, "csrc/flash_attn_npu", "varlen_bwd_dispatch_fp16.cpp"), recursive=True)
+# v2's FAGGeneral backward (BSND/TND) is split into v2-own per-dtype dispatch
+# TUs, compiled in parallel. v2 stays independent of v3's dispatch files.
+source_files += glob.glob(os.path.join(this_dir, "csrc/flash_attn_npu", "fag_general_dispatch_bf16.cpp"), recursive=True)
+source_files += glob.glob(os.path.join(this_dir, "csrc/flash_attn_npu", "fag_general_dispatch_fp16.cpp"), recursive=True)
 source_files_v3 = glob.glob(os.path.join(this_dir, "csrc/flash_attn_npu_v3", "flash_api.cpp"), recursive=True)
+source_files_v3 += glob.glob(os.path.join(this_dir, "csrc/flash_attn_npu_v3", "fwd_dispatch.cpp"), recursive=True)
+source_files_v3 += glob.glob(os.path.join(this_dir, "csrc/flash_attn_npu_v3", "bwd_dispatch_bf16.cpp"), recursive=True)
+source_files_v3 += glob.glob(os.path.join(this_dir, "csrc/flash_attn_npu_v3", "bwd_dispatch_fp16.cpp"), recursive=True)
 
 if not SKIP_NPU_BUILD:
     if BUILD_VERSION in ("v2", "all"):
@@ -252,6 +344,5 @@ setup(
     install_requires=[
         "torch",
         "torch_npu",
-        "einops",
     ],
 )
