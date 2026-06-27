@@ -102,6 +102,7 @@ class BishengBuildExt(build_ext):
             *[f"-I{p}" for p in asc_include_paths],
             f"-I{python_include}",
             f"-I{torch_npu_include}",
+            "-DASCENDC_DUMP=1",
             f"-I{torch_include}",
             f"-I{ascend_home}/include",
             f"-I{ascend_home}/pkg_inc",
