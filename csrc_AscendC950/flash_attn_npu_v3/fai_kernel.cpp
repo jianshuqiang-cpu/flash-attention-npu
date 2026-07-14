@@ -19,6 +19,14 @@
 
 #include "catlass/arch/cross_core_sync.hpp"
 #include "catlass/arch/resource.hpp"
+// AnyMask: prefer project-local epilogue copies over the vendored catlass ones.
+// online_softmax.hpp / rescale_o.hpp are byte-identical baselines of
+// block_epilogue_flash_attention_online_softmax_high_prec.hpp /
+// block_epilogue_flash_attention_rescale_o.hpp; their include guards match, so
+// including them first makes the catlass copies no-ops. AnyMask edits land in
+// the local copies, keeping csrc_AscendC950/catlass/ pristine.
+#include "online_softmax.hpp"
+#include "rescale_o.hpp"
 #include "catlass/epilogue/block/block_epilogue.hpp"
 #include "catlass/epilogue/dispatch_policy.hpp"
 
@@ -126,6 +134,25 @@ public:
         kL1BufNum_ = faiTilingData->kL1BufNum;
         vL1BufNum_ = faiTilingData->vL1BufNum;
         pL1BufNum_ = faiTilingData->pL1BufNum;
+        // AnyMask (v1): runtime flag + Hn + 7 device addresses packed in tiling (D1/D7).
+        anyMaskEnabled_ = faiTilingData->anyMaskEnabled;
+        holeMaxNum_ = faiTilingData->holeMaxNum;
+        AscendC::GlobalTensor<int16_t> gHoleNum;
+        AscendC::GlobalTensor<int32_t> gTileRange;
+        AscendC::GlobalTensor<int32_t> gSparseCompute;
+        AscendC::GlobalTensor<int32_t> gSparseMask;
+        AscendC::GlobalTensor<int32_t> gMaskr;
+        AscendC::GlobalTensor<int32_t> gHolel;
+        AscendC::GlobalTensor<int32_t> gHoles;
+        if (anyMaskEnabled_ != 0) {
+            gHoleNum.SetGlobalBuffer(reinterpret_cast<__gm__ int16_t*>(faiTilingData->holeNumAddr));
+            gTileRange.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(faiTilingData->tileRangeAddr));
+            gSparseCompute.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(faiTilingData->sparseComputeAddr));
+            gSparseMask.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(faiTilingData->sparseMaskAddr));
+            gMaskr.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(faiTilingData->maskrAddr));
+            gHolel.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(faiTilingData->holelAddr));
+            gHoles.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(faiTilingData->holesAddr));
+        }
 
         AscendC::LocalTensor<ElementP> l1PTensor[MAX_CROSS_CORE_BUF_STAGES];
         AscendC::LocalTensor<ElementS> ubSTensor[UB_S_BUF_STAGES];
@@ -281,7 +308,18 @@ public:
                 uint32_t diffS = kvSeqlen - qSeqlen;
                 noSkipKvS = (qSTileIdx + 1U) * qBaseTile_ + diffS;
                 noSkipKvS = AscendC::Std::min((uint32_t)kvSeqlen, noSkipKvS);
-            } 
+            }
+            // AnyMask (v1): tile_range[b, tq] right boundary shrinks the KV loop.
+            // Per AnyMask.md pseudocode, k > tile_range is masked => valid k in
+            // [0, tile_range], so the exclusive count is tile_range + 1. (Open
+            // Question 1: if the table wording "from tile_range onward masked"
+            // is intended instead, drop the +1.)
+            if (anyMaskEnabled_ != 0 && faiTilingData->tileRangeAddr != 0) {
+                uint32_t trIdx = curBatch * qsBlockNum + qSTileIdx;
+                uint32_t tileRangeVal = static_cast<uint32_t>(gTileRange.GetValue(trIdx));
+                uint32_t tileRangeCount = tileRangeVal + 1u;
+                noSkipKvS = AscendC::Std::min(noSkipKvS, tileRangeCount);
+            }
 
             uint32_t kvSLoopNum = static_cast<uint32_t>(CeilDiv(noSkipKvS, static_cast<int64_t>(kvBaseTile_)));
 #ifdef __DAV_CUBE__
@@ -374,7 +412,73 @@ public:
                     auto l1PTensorTla = tla::MakeTensor(l1PTensor[l1PBufId],
                     l1PLayoutTla, Arch::PositionL1{});
 #ifdef __DAV_VEC__
-                    if constexpr (maskCategory == MaskCategory::MASK_CAUSAL) {
+                    if (anyMaskEnabled_ != 0) {
+                        // AnyMask (v1, D4 kernel-side vectorized): branch on
+                        // sparse_compute / sparse_mask bits for (curBatch, qSTileIdx,
+                        // kvSTileIdx). maskr/holel/holes GM base from tiling addrs.
+                        uint32_t kvSStartIdx = kvSTileIdx * kvBaseTile_;
+                        uint32_t kvSEndIdx = kvSStartIdx + kvSTileSizeAct;
+                        uint32_t maskRowBase = curBatch * faiTilingData->maxQSeqlen + static_cast<uint32_t>(qSOffset);
+                        __gm__ int32_t *maskrGm = reinterpret_cast<__gm__ int32_t*>(faiTilingData->maskrAddr);
+                        __gm__ int32_t *holelGm = reinterpret_cast<__gm__ int32_t*>(faiTilingData->holelAddr);
+                        __gm__ int32_t *holesGm = reinterpret_cast<__gm__ int32_t*>(faiTilingData->holesAddr);
+                        // bitmap word index for (curBatch, qSTileIdx, kvSTileIdx)
+                        uint32_t Tk = (static_cast<uint32_t>(faiTilingData->maxKvSeqlen) + kvBaseTile_ - 1) / kvBaseTile_;
+                        uint32_t Wk = (Tk + 31u) / 32u;
+                        uint32_t wordIdx = (curBatch * qsBlockNum + qSTileIdx) * Wk + (kvSTileIdx / 32u);
+                        uint32_t bitPos = kvSTileIdx % 32u;
+                        uint32_t scBit = 0u, smBit = 0u;
+                        if (faiTilingData->sparseComputeAddr != 0) {
+                            scBit = (static_cast<uint32_t>(gSparseCompute.GetValue(wordIdx)) >> bitPos) & 1u;
+                        }
+                        if (faiTilingData->sparseMaskAddr != 0) {
+                            smBit = (static_cast<uint32_t>(gSparseMask.GetValue(wordIdx)) >> bitPos) & 1u;
+                        }
+                        if (scBit != 0u) {
+                            // whole block masked (sparse_compute) -> blockFullyMasked=1
+                            if constexpr (AscendC::IsSameType<ElementS, float>::value) {
+                                epilogueOnlineSoftmax(l1PTensorTla, maskrGm, holelGm, holesGm,
+                                    actualBlockShapeQK, (kvSTileIdx == 0), ubSBufId, l1PBufId,
+                                    qkReadyFlag, softmaxReadyFlag,
+                                    maskRowBase, kvSStartIdx, kvSEndIdx, holeMaxNum_, 1u);
+                            } else {
+                                if constexpr (enableDN) {
+                                    epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK,
+                                        (kvSTileIdx == 0), ubSBufId, l1PBufId, qkReadyFlag, softmaxReadyFlag, 1);
+                                } else {
+                                    epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK,
+                                        (kvSTileIdx == 0), ubSBufId, l1PBufId, qkReadyFlag, softmaxReadyFlag);
+                                }
+                            }
+                        } else if (smBit != 0u) {
+                            // fine mask via maskr/holel/holes
+                            if constexpr (AscendC::IsSameType<ElementS, float>::value) {
+                                epilogueOnlineSoftmax(l1PTensorTla, maskrGm, holelGm, holesGm,
+                                    actualBlockShapeQK, (kvSTileIdx == 0), ubSBufId, l1PBufId,
+                                    qkReadyFlag, softmaxReadyFlag,
+                                    maskRowBase, kvSStartIdx, kvSEndIdx, holeMaxNum_, 0u);
+                            } else {
+                                if constexpr (enableDN) {
+                                    epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK,
+                                        (kvSTileIdx == 0), ubSBufId, l1PBufId, qkReadyFlag, softmaxReadyFlag, 1);
+                                } else {
+                                    epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK,
+                                        (kvSTileIdx == 0), ubSBufId, l1PBufId, qkReadyFlag, softmaxReadyFlag);
+                                }
+                            }
+                        } else {
+                            // dense block (no fine mask)
+                            if constexpr (enableDN) {
+                                epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK,
+                                    (kvSTileIdx == 0), ubSBufId, l1PBufId,
+                                    qkReadyFlag, softmaxReadyFlag, 1);
+                            } else {
+                                epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK,
+                                    (kvSTileIdx == 0), ubSBufId, l1PBufId,
+                                    qkReadyFlag, softmaxReadyFlag);
+                            }
+                        }
+                    } else if constexpr (maskCategory == MaskCategory::MASK_CAUSAL) {
                         auto gmMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(2048, 2048);
                         auto gmMaskTensorTla = tla::MakeTensor(gMask, gmMaskLayoutTla, Arch::PositionGM{});
                         uint32_t triUp = noSkipKvS - rowNum;
@@ -660,6 +764,10 @@ private:
     uint32_t kL1BufNum_;
     uint32_t vL1BufNum_;
     uint32_t pL1BufNum_;
+
+    // AnyMask (v1)
+    uint32_t anyMaskEnabled_ = 0;
+    uint32_t holeMaxNum_ = 0;
 
     uint32_t qkL0ATotalStages_;
     uint32_t qkL0BTotalStages_;

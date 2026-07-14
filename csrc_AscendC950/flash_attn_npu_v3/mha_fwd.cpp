@@ -34,6 +34,99 @@
 using flash_attn_npu_950_v3::SeqlenScratch;
 using flash_attn_npu_950_v3::fill_inference_context;
 
+// AnyMask (v1): validate device/dtype/contiguity of a provided mask tensor and
+// return its device address. Caller MUST guard with has_value(). Addresses are
+// stamped into FAInferTilingData and ride the `tiling` GM_ADDR (design D1).
+static uint64_t anymask_addr(const std::optional<at::Tensor>& t, const char* name,
+                             c10::ScalarType dtype) {
+    const at::Tensor& tt = *t;
+    TORCH_CHECK(tt.device().type() == at::kPrivateUse1, name, " must be on NPU");
+    TORCH_CHECK(tt.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(tt.dtype() == dtype, name, " dtype mismatch");
+    return reinterpret_cast<uint64_t>(tt.data_ptr());
+}
+
+// AnyMask (v1, design D4 host-materialization): build a dense
+// [B, maxQSeqlen, maxKvSeqlen] uint8 mask (1 = masked, 0 = kept -- same
+// convention as the causal triu matrix consumed by ComputeScaleAndMaxMask) from
+// the 7 AnyMask tensors, per AnyMask.md pseudocode. The kernel then loads this
+// dense mask tile-by-tile via the existing epilogue path (no kernel-side vector
+// mask generation). v1 trades mask memory/host-time for blind-write safety.
+// NOTE: O(B*Sq*Skv*Hn) host loop; acceptable for v1, optimize later.
+[[maybe_unused]] static at::Tensor materialize_anymask_dense_mask(
+    const std::optional<at::Tensor>& hole_num_,
+    const std::optional<at::Tensor>& tile_range_,
+    const std::optional<at::Tensor>& sparse_compute_,
+    const std::optional<at::Tensor>& sparse_mask_,
+    const std::optional<at::Tensor>& maskr_,
+    const std::optional<at::Tensor>& holel_,
+    const std::optional<at::Tensor>& holes_,
+    int batch_size, int max_q_seqlen, int max_kv_seqlen, int Hn)
+{
+    constexpr int TILE_M = 128;
+    constexpr int TILE_N = 128;
+    const int Tq = (max_q_seqlen + TILE_M - 1) / TILE_M;
+    const int Tk = (max_kv_seqlen + TILE_N - 1) / TILE_N;
+    const int Wk = (Tk + 31) / 32;
+
+    auto to_cpu = [](const std::optional<at::Tensor>& t) -> at::Tensor {
+        return t.has_value() ? t->to(at::Device(at::kCPU)) : at::Tensor();
+    };
+    at::Tensor tile_range_cpu = to_cpu(tile_range_);
+    at::Tensor sparse_compute_cpu = to_cpu(sparse_compute_);
+    at::Tensor sparse_mask_cpu = to_cpu(sparse_mask_);
+    at::Tensor maskr_cpu = to_cpu(maskr_);
+    at::Tensor holel_cpu = to_cpu(holel_);
+    at::Tensor holes_cpu = to_cpu(holes_);
+    const int32_t* p_tr  = tile_range_.has_value()    ? tile_range_cpu.data_ptr<int32_t>()    : nullptr;
+    const int32_t* p_sc  = sparse_compute_.has_value()? sparse_compute_cpu.data_ptr<int32_t>(): nullptr;
+    const int32_t* p_sm  = sparse_mask_.has_value()   ? sparse_mask_cpu.data_ptr<int32_t>()   : nullptr;
+    const int32_t* p_mr  = maskr_.has_value()         ? maskr_cpu.data_ptr<int32_t>()         : nullptr;
+    const int32_t* p_hl  = holel_.has_value()         ? holel_cpu.data_ptr<int32_t>()         : nullptr;
+    const int32_t* p_hs  = holes_.has_value()         ? holes_cpu.data_ptr<int32_t>()         : nullptr;
+
+    at::Tensor dense = at::zeros({batch_size, max_q_seqlen, (max_kv_seqlen + 127) / 128 * 128},
+                                 at::device(c10::kCPU).dtype(at::kByte));
+    const int padded_kv = (max_kv_seqlen + 127) / 128 * 128;
+    uint8_t* p_dense = dense.data_ptr<uint8_t>();
+
+    for (int b = 0; b < batch_size; ++b) {
+        for (int q = 0; q < max_q_seqlen; ++q) {
+            const int tq = q / TILE_M;
+            for (int k = 0; k < max_kv_seqlen; ++k) {
+                const int tk = k / TILE_N;
+                bool masked = false;
+                // 1) tile_range: k > tile_range[b, tq] -> masked (pseudocode)
+                if (!masked && p_tr) {
+                    if (k > p_tr[b * Tq + tq]) { masked = true; }
+                }
+                // 2) sparse_compute: bit=1 -> whole block masked
+                if (!masked && p_sc) {
+                    int32_t word = p_sc[(b * Tq + tq) * Wk + (tk / 32)];
+                    if (word & (1 << (tk % 32))) { masked = true; }
+                }
+                // 3) sparse_mask: bit=1 -> fine mask via maskr/holel/holes
+                if (!masked && p_sm) {
+                    int32_t word = p_sm[(b * Tq + tq) * Wk + (tk / 32)];
+                    if (word & (1 << (tk % 32))) {
+                        if (p_mr && k >= p_mr[b * max_q_seqlen + q]) { masked = true; }
+                        if (!masked && p_hl && p_hs) {
+                            const int rowBase = (b * max_q_seqlen + q) * Hn;
+                            for (int i = 0; i < Hn; ++i) {
+                                int32_t hl = p_hl[rowBase + i];
+                                int32_t hs = p_hs[rowBase + i];
+                                if (hs > 0 && hl <= k && k < hl + hs) { masked = true; break; }
+                            }
+                        }
+                    }
+                }
+                p_dense[(b * max_q_seqlen + q) * padded_kv + k] = masked ? 1 : 0;
+            }
+        }
+    }
+    return dense.to(at::Device(at::kPrivateUse1));
+}
+
 std::vector<at::Tensor>
 mha_fwd(at::Tensor q,
         at::Tensor k,
@@ -68,7 +161,15 @@ mha_fwd(at::Tensor q,
         std::optional<at::Tensor> scheduler_metadata_,
         int64_t                   num_splits,
         std::optional<bool>       pack_gqa_,
-        int64_t                   sm_margin)
+        int64_t                   sm_margin,
+        // AnyMask (v1, 950 forward only). All optional; any non-null enables AnyMask.
+        std::optional<at::Tensor> hole_num_,
+        std::optional<at::Tensor> tile_range_,
+        std::optional<at::Tensor> sparse_compute_,
+        std::optional<at::Tensor> sparse_mask_,
+        std::optional<at::Tensor> maskr_,
+        std::optional<at::Tensor> holel_,
+        std::optional<at::Tensor> holes_)
 {
     // ============================================================
     // 0. Device guard + stream + AIC core count
@@ -121,6 +222,21 @@ mha_fwd(at::Tensor q,
     const bool paged_KV    = page_table_.has_value();
     const bool is_varlen_q = cu_seqlens_q_.has_value();
     const bool is_varlen_kv = cu_seqlens_k_.has_value();
+
+    // ---- AnyMask (v1): presence + mutual-exclusion / scope rejects ----
+    const bool anyMaskPresent = hole_num_.has_value() || tile_range_.has_value() ||
+        sparse_compute_.has_value() || sparse_mask_.has_value() || maskr_.has_value() ||
+        holel_.has_value() || holes_.has_value();
+    if (anyMaskPresent) {
+        TORCH_CHECK(!is_causal,
+                    "AnyMask is mutually exclusive with is_causal on 950 (v3) v1");
+        TORCH_CHECK(!is_varlen_q,
+                    "AnyMask v1 only supports BSND (non-varlen) on 950 (v3)");
+        TORCH_CHECK(!paged_KV,
+                    "AnyMask v1 only supports non-paged KV on 950 (v3)");
+        TORCH_CHECK(!is_bf16,
+                    "AnyMask v1 only supports fp16 high_prec on 950 (v3)");
+    }
 
     at::Tensor cu_seqlens_q, cu_seqlens_k, page_table, seqlens_k;
 
@@ -247,6 +363,86 @@ mha_fwd(at::Tensor q,
         tilingData.workSpaceSize = WS_FLOOR;
     }
 
+    // ---- AnyMask (v1): validate provided tensors + stamp tiling fields ----
+    // Addresses ride the `tiling` GM_ADDR (design D1); anyMaskEnabled selects
+    // the AnyMask path at runtime (design D7). Each feature is gated on its own
+    // address != 0, so partial provision (e.g. tile_range only) is supported.
+    tilingData.anyMaskEnabled = anyMaskPresent ? 1u : 0u;
+    tilingData.holeMaxNum = 0u;
+    tilingData.holeNumAddr = 0;
+    tilingData.tileRangeAddr = 0;
+    tilingData.sparseComputeAddr = 0;
+    tilingData.sparseMaskAddr = 0;
+    tilingData.maskrAddr = 0;
+    tilingData.holelAddr = 0;
+    tilingData.holesAddr = 0;
+    if (anyMaskPresent) {
+        constexpr int TILE_M = 128;  // qBaseTile
+        constexpr int TILE_N = 128;  // kvBaseTile
+        const int Tq = (seqlen_q + TILE_M - 1) / TILE_M;
+        const int maxKv = static_cast<int>(tilingData.maxKvSeqlen);
+        const int Tk = (maxKv + TILE_N - 1) / TILE_N;
+        const int Wk = (Tk + 31) / 32;
+        // Hn: from hole_num (preferred) else holel last dim
+        int Hn = 0;
+        if (hole_num_.has_value()) Hn = static_cast<int>(hole_num_->size(0));
+        else if (holel_.has_value()) Hn = static_cast<int>(holel_->size(2));
+        constexpr int HN_MAX = 16;  // UB budget (design Open Question 2)
+        TORCH_CHECK(Hn <= HN_MAX, "AnyMask v1 requires holeMaxNum (Hn) <= ", HN_MAX,
+                    " (UB budget), got ", Hn);
+        tilingData.holeMaxNum = static_cast<uint32_t>(Hn);
+
+        if (hole_num_.has_value()) {
+            TORCH_CHECK(hole_num_->sizes().size() == 1 && hole_num_->size(0) == Hn,
+                        "hole_num must be [Hn] int16");
+            tilingData.holeNumAddr = anymask_addr(hole_num_, "hole_num", torch::kInt16);
+        }
+        if (tile_range_.has_value()) {
+            TORCH_CHECK(tile_range_->sizes().size() == 2 &&
+                        tile_range_->size(0) == batch_size && tile_range_->size(1) == Tq,
+                        "tile_range must be [BatchSize, Tq] int32");
+            tilingData.tileRangeAddr = anymask_addr(tile_range_, "tile_range", torch::kInt32);
+        }
+        if (sparse_compute_.has_value()) {
+            TORCH_CHECK(sparse_compute_->sizes().size() == 3 &&
+                        sparse_compute_->size(0) == batch_size &&
+                        sparse_compute_->size(1) == Tq &&
+                        sparse_compute_->size(2) == Wk,
+                        "sparse_compute must be [BatchSize, Tq, Wk] int32");
+            tilingData.sparseComputeAddr = anymask_addr(sparse_compute_, "sparse_compute", torch::kInt32);
+        }
+        if (sparse_mask_.has_value()) {
+            TORCH_CHECK(sparse_mask_->sizes().size() == 3 &&
+                        sparse_mask_->size(0) == batch_size &&
+                        sparse_mask_->size(1) == Tq &&
+                        sparse_mask_->size(2) == Wk,
+                        "sparse_mask must be [BatchSize, Tq, Wk] int32");
+            tilingData.sparseMaskAddr = anymask_addr(sparse_mask_, "sparse_mask", torch::kInt32);
+        }
+        if (maskr_.has_value()) {
+            TORCH_CHECK(maskr_->sizes().size() == 2 &&
+                        maskr_->size(0) == batch_size && maskr_->size(1) == seqlen_q,
+                        "maskr must be [BatchSize, Sq] int32");
+            tilingData.maskrAddr = anymask_addr(maskr_, "maskr", torch::kInt32);
+        }
+        if (holel_.has_value()) {
+            TORCH_CHECK(holel_->sizes().size() == 3 &&
+                        holel_->size(0) == batch_size &&
+                        holel_->size(1) == seqlen_q &&
+                        holel_->size(2) == Hn,
+                        "holel must be [BatchSize, Sq, Hn] int32");
+            tilingData.holelAddr = anymask_addr(holel_, "holel", torch::kInt32);
+        }
+        if (holes_.has_value()) {
+            TORCH_CHECK(holes_->sizes().size() == 3 &&
+                        holes_->size(0) == batch_size &&
+                        holes_->size(1) == seqlen_q &&
+                        holes_->size(2) == Hn,
+                        "holes must be [BatchSize, Sq, Hn] int32");
+            tilingData.holesAddr = anymask_addr(holes_, "holes", torch::kInt32);
+        }
+    }
+
     // ============================================================
     // 8. Allocate output-side buffers on NPU
     // ============================================================
@@ -317,7 +513,12 @@ mha_fwd(at::Tensor q,
     uint8_t* maskDev = nullptr;
     at::Tensor mask_npu_tensor;
     at::Tensor mask_cpu_tensor;
-    if (is_causal) {
+    if (anyMaskPresent) {
+        // AnyMask (design D4 kernel-side vectorized): kernel reads maskr/holel/
+        // holes + sparse_compute/sparse_mask bitmaps directly from tiling addrs;
+        // no host dense mask. maskDev unused for AnyMask (nullptr).
+        maskDev = nullptr;
+    } else if (is_causal) {
         mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
         mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
         mask_npu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));

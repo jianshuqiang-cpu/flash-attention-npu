@@ -93,6 +93,22 @@ struct FAInferTilingData {
     uint32_t vL1BufNum;
     uint32_t pL1BufNum;
 
+    // ---- AnyMask (v1: 950 forward only) ----
+    // These ride the existing `tiling` GM_ADDR (D1: pack into tiling to avoid
+    // rippling 7 new positional args through LaunchFAI/dispatch/autogen).
+    // anyMaskEnabled=1 selects the AnyMask path at runtime (D7: no new
+    // MaskCategory instantiation). Addresses are device pointers stored as
+    // uint64_t; 0 when the corresponding tensor is not provided.
+    uint32_t anyMaskEnabled = 0;     // 1 when AnyMask tensors are provided
+    uint32_t holeMaxNum = 0;         // Hn: max holes per Q row
+    uint64_t holeNumAddr = 0;        // [Hn]            int16
+    uint64_t tileRangeAddr = 0;      // [batch, Tq]     int32
+    uint64_t sparseComputeAddr = 0;  // [batch, Tq, Wk] int32 (bit=1 -> block fully masked)
+    uint64_t sparseMaskAddr = 0;     // [batch, Tq, Wk] int32 (bit=1 -> block needs fine mask)
+    uint64_t maskrAddr = 0;          // [batch, Sq]     int32
+    uint64_t holelAddr = 0;          // [batch, Sq, Hn] int32
+    uint64_t holesAddr = 0;          // [batch, Sq, Hn] int32
+
     // Getter functions
     uint32_t get_numHeads() const { return numHeads; }
     uint32_t get_embeddingSize() const { return embeddingSize; }
@@ -191,6 +207,26 @@ struct FAInferTilingData {
     void set_kL1BufNum(uint32_t value) { kL1BufNum = value;}
     void set_vL1BufNum(uint32_t value) { vL1BufNum = value;}
     void set_pL1BufNum(uint32_t value) { pL1BufNum = value;}
+
+    // AnyMask getters / setters
+    uint32_t get_anyMaskEnabled() const { return anyMaskEnabled; }
+    void set_anyMaskEnabled(uint32_t value) { anyMaskEnabled = value; }
+    uint32_t get_holeMaxNum() const { return holeMaxNum; }
+    void set_holeMaxNum(uint32_t value) { holeMaxNum = value; }
+    uint64_t get_holeNumAddr() const { return holeNumAddr; }
+    void set_holeNumAddr(uint64_t value) { holeNumAddr = value; }
+    uint64_t get_tileRangeAddr() const { return tileRangeAddr; }
+    void set_tileRangeAddr(uint64_t value) { tileRangeAddr = value; }
+    uint64_t get_sparseComputeAddr() const { return sparseComputeAddr; }
+    void set_sparseComputeAddr(uint64_t value) { sparseComputeAddr = value; }
+    uint64_t get_sparseMaskAddr() const { return sparseMaskAddr; }
+    void set_sparseMaskAddr(uint64_t value) { sparseMaskAddr = value; }
+    uint64_t get_maskrAddr() const { return maskrAddr; }
+    void set_maskrAddr(uint64_t value) { maskrAddr = value; }
+    uint64_t get_holelAddr() const { return holelAddr; }
+    void set_holelAddr(uint64_t value) { holelAddr = value; }
+    uint64_t get_holesAddr() const { return holesAddr; }
+    void set_holesAddr(uint64_t value) { holesAddr = value; }
 };
 
 #endif

@@ -76,6 +76,14 @@ def _flash_attn_forward(
     num_splits: int,
     pack_gqa: Optional[bool],
     sm_margin: int,
+    # AnyMask (v1, 950 forward only). All optional; any non-None enables AnyMask.
+    hole_num: Optional[torch.Tensor] = None,
+    tile_range: Optional[torch.Tensor] = None,
+    sparse_compute: Optional[torch.Tensor] = None,
+    sparse_mask: Optional[torch.Tensor] = None,
+    maskr: Optional[torch.Tensor] = None,
+    holel: Optional[torch.Tensor] = None,
+    holes: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, k_new, v_new = (_maybe_contiguous(x) for x in (q, k, k_new, v_new))
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
@@ -109,6 +117,7 @@ def _flash_attn_forward(
         num_splits,
         pack_gqa,
         sm_margin,
+        hole_num, tile_range, sparse_compute, sparse_mask, maskr, holel, holes,
     )
 
     if out_accum is None:
@@ -132,6 +141,8 @@ def _flash_attn_forward_fake(
     window_size_left, window_size_right,
     attention_chunk, softcap, rotary_interleaved,
     scheduler_metadata, num_splits, pack_gqa, sm_margin,
+    hole_num=None, tile_range=None, sparse_compute=None, sparse_mask=None,
+    maskr=None, holel=None, holes=None,
 ):
     is_varlen_q = cu_seqlens_q is not None
     out_dtype = q.dtype
@@ -181,6 +192,14 @@ def flash_attn_with_kvcache(
     num_splits=0,
     pack_gqa=None,
     sm_margin=0,
+    # AnyMask (v1, 950 forward only). All optional; any non-None enables AnyMask.
+    hole_num: Optional[torch.Tensor] = None,
+    tile_range: Optional[torch.Tensor] = None,
+    sparse_compute: Optional[torch.Tensor] = None,
+    sparse_mask: Optional[torch.Tensor] = None,
+    maskr: Optional[torch.Tensor] = None,
+    holel: Optional[torch.Tensor] = None,
+    holes: Optional[torch.Tensor] = None,
     return_softmax_lse=False,
 ):
     """
@@ -313,5 +332,12 @@ def flash_attn_with_kvcache(
         num_splits=num_splits,
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
+        hole_num=hole_num,
+        tile_range=tile_range,
+        sparse_compute=sparse_compute,
+        sparse_mask=sparse_mask,
+        maskr=maskr,
+        holel=holel,
+        holes=holes,
     )
     return (out, softmax_lse, *rest) if return_softmax_lse else out
