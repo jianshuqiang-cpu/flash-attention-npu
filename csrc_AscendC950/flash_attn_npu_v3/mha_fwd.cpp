@@ -441,6 +441,13 @@ mha_fwd(at::Tensor q,
                         "holes must be [BatchSize, Sq, Hn] int32");
             tilingData.holesAddr = anymask_addr(holes_, "holes", torch::kInt32);
         }
+        fprintf(stderr, "[AnyMask][host] anyMaskPresent Hn=%d Tq=%d Tk=%d Wk=%d batch=%d seqlen_q=%d maxKv=%d\n",
+                Hn, Tq, Tk, Wk, batch_size, seqlen_q, maxKv);
+        fprintf(stderr, "[AnyMask][host] addrs holeNum=%p tileRange=%p sparseCompute=%p sparseMask=%p maskr=%p holel=%p holes=%p\n",
+                (void*)tilingData.holeNumAddr, (void*)tilingData.tileRangeAddr,
+                (void*)tilingData.sparseComputeAddr, (void*)tilingData.sparseMaskAddr,
+                (void*)tilingData.maskrAddr, (void*)tilingData.holelAddr,
+                (void*)tilingData.holesAddr);
     }
 
     // ============================================================

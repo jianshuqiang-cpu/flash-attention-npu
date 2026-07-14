@@ -567,6 +567,15 @@ public:
         AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(4);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
+        if (AscendC::GetBlockIdx() == 0 && subBlockIdx_ == 0 && qRowBase == 0) {
+            AscendC::printf("[AnyMask][epi blk=0] maskRowBase=%u qRowBase=%u m=%u n=%u kvSStart=%u kvSEnd=%u Hn=%u blockFullyMasked=%u isFirst=%u\n",
+                maskRowBase, qRowBase, m, n, kvSStartIdx, kvSEndIdx, Hn, blockFullyMasked, isFirstKvSTile);
+            if (blockFullyMasked == 0) {
+                AscendC::printf("[AnyMask][epi blk=0] GM maskr[0]=%d holel[0]=%d holes[0]=%d | UB maskr[0]=%d holel[0]=%d holes[0]=%d\n",
+                    maskrGm[qRowBase], holelGm[qRowBase * Hn], holesGm[qRowBase * Hn],
+                    maskrUbPtr[0], holelUbPtr[0], holesUbPtr[0]);
+            }
+        }
         if (isFirstKvSTile) {
             if (n > 64) {
                 ComputeScaleAndAnyMask<ElementInput, ElementOutput, false>(
