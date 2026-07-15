@@ -606,6 +606,30 @@ public:
                     maskrUbPtr, holelUbPtr, holesUbPtr, kvSStartIdx, Hn, blockFullyMasked);
             }
         }
+        // [AnyMask][diag] q0(maskr=128 -> out 0) vs q32(maskr=33 -> out ±10):
+        // dump masked-score / row-max / expSum right after the softmax pass. Logic
+        // verified correct vs working ComputeScaleAndMaxMask + C++ ref (mha_fwd.cpp
+        // :98-122), so a wrong value here pins the bug to an unverified 950 MicroAPI
+        // call in ComputeScaleAndAnyMask (Arange / Compare<CMPMODE> / Select / And /
+        // Or / Reduce / DIST_BRC_B32). Interpretation hints sit next to the printfs.
+        if (AscendC::GetBlockIdx() == 0 && subBlockIdx_ == 0 && qRowBase == 0 &&
+            isFirstKvSTile && blockFullyMasked == 0) {
+            using namespace AscendC::MicroAPI;
+            LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
+            __ubuf__ float *sUb = reinterpret_cast<__ubuf__ float*>(sAddr);
+            __ubuf__ float *mxUb = lastMaxAddr;
+            __ubuf__ float *smUb = lastSumAddr;
+            // q0 maskr=128: hole=[0,32) -> s[0]=MIN; valid=[32,128) -> s[32]/s[40]=real; expect max>0, l>0.
+            //   s[0]=real & s[32]=MIN  -> Select polarity inverted (un-swap :919-920 / :1007).
+            //   s[0]=s[32]=s[40]=MIN    -> Compare<CMPMODE::GE> inverted (maskr>=pos); see :901/:996.
+            //   max<=0 or l==0          -> Reduce<MAX/SUM>/ExpSub misbehave; see :926-947.
+            AscendC::printf("[AnyMask][diag] q0 m128: s0=%f s32=%f s40=%f max=%f l=%f\n",
+                sUb[0], sUb[32], sUb[40], mxUb[0], smUb[0]);
+            // q32 maskr=33: hole=[0,32) -> s[0]=MIN; k>=33 masked -> s[32]=real, s[50]=MIN.
+            //   s[50]=real -> maskr predicate not applied at all.
+            AscendC::printf("[AnyMask][diag] q32 m33: s0=%f s32=%f s50=%f max=%f l=%f\n",
+                sUb[32*128+0], sUb[32*128+32], sUb[32*128+50], mxUb[32], smUb[32]);
+        }
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ubSBufId);
         // Replenish the V_MTE2(4) token consumed by the preload WaitFlag above
         // (mirrors non-AnyMask line ~466). V is done reading maskr/holel/holes UB,
