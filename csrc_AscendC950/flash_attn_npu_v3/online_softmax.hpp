@@ -552,18 +552,46 @@ public:
         __ubuf__ int32_t *maskrUbPtr = reinterpret_cast<__ubuf__ int32_t*>(maskUbTensor.GetPhyAddr());
         __ubuf__ int32_t *holelUbPtr = maskrUbPtr + m;
         __ubuf__ int32_t *holesUbPtr = maskrUbPtr + m + m * Hn;
-        // AnyMask flag balance: mirror the non-AnyMask overload (lines ~439/441/446/466).
-        // V_MTE2(4)/MTE2_V(4) must be produced AND consumed exactly once per tile
-        // regardless of blockFullyMasked, else the token count drifts and the kernel
-        // deadlocks (V_MTE2(4) is pre-set once in InitSyncFlags but never replenished
-        // here; MTE2_V(4) is not pre-set). Keep only the scalar preload conditional.
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(4);
         if (blockFullyMasked == 0) {
-            for (uint32_t i = 0; i < m; ++i) { maskrUbPtr[i] = maskrGm[qRowBase + i]; }
-            for (uint32_t i = 0; i < m * Hn; ++i) {
-                holelUbPtr[i] = holelGm[qRowBase * Hn + i];
-                holesUbPtr[i] = holesGm[qRowBase * Hn + i];
-            }
+            // GM->UB via MTE2 DataCopy (mirrors the dense-mask path at :420-440). Scalar
+            // GM dereference does NOT go through the MTE2 pipe, so the V_MTE2/MTE2_V flag
+            // pair below does not gate it and the V-pipe LoadAlign in ComputeScaleAndAnyMask
+            // reads unsynchronized/stale UB -> wrong maskr/holel/holes -> wrong predicate.
+            // Copy the int32 tensors as ElementMask (uint8) bytes via the proven
+            // CopyGmToUbMask functor (Tile::CopyGm2UbTla only specializes for ElementMask
+            // layouts; m int32 = 4m bytes). 32B alignment holds under seqlen_q%16==0 (host
+            // guard): m and qRowBase are 8-aligned -> byte offsets/lengths are 32B.
+            AscendC::GlobalTensor<ElementMask> gMaskrAny, gHolelAny, gHolesAny;
+            gMaskrAny.SetGlobalBuffer(reinterpret_cast<__gm__ ElementMask*>(maskrGm));
+            gHolelAny.SetGlobalBuffer(reinterpret_cast<__gm__ ElementMask*>(holelGm));
+            gHolesAny.SetGlobalBuffer(reinterpret_cast<__gm__ ElementMask*>(holesGm));
+            auto gmMaskrTla = tla::MakeTensor(gMaskrAny,
+                tla::MakeLayout<ElementMask, LayoutMask>(1, (qRowBase + m) * sizeof(int32_t)), Arch::PositionGM{});
+            auto gmHolelTla = tla::MakeTensor(gHolelAny,
+                tla::MakeLayout<ElementMask, LayoutMask>(1, (qRowBase * Hn + m * Hn) * sizeof(int32_t)), Arch::PositionGM{});
+            auto gmHolesTla = tla::MakeTensor(gHolesAny,
+                tla::MakeLayout<ElementMask, LayoutMask>(1, (qRowBase * Hn + m * Hn) * sizeof(int32_t)), Arch::PositionGM{});
+            auto gmMaskrTile = GetTile(gmMaskrTla, tla::MakeCoord(0, qRowBase * sizeof(int32_t)),
+                                       tla::MakeShape(1, m * sizeof(int32_t)));
+            auto gmHolelTile = GetTile(gmHolelTla, tla::MakeCoord(0, qRowBase * Hn * sizeof(int32_t)),
+                                       tla::MakeShape(1, m * Hn * sizeof(int32_t)));
+            auto gmHolesTile = GetTile(gmHolesTla, tla::MakeCoord(0, qRowBase * Hn * sizeof(int32_t)),
+                                       tla::MakeShape(1, m * Hn * sizeof(int32_t)));
+
+            auto ubAnyTla = tla::MakeTensor(maskUbTensor,
+                tla::MakeLayout<ElementMask, LayoutMask>(1, (m + 2 * m * Hn) * sizeof(int32_t)), Arch::PositionUB{});
+            auto ubMaskrTile = GetTile(ubAnyTla, tla::MakeCoord(0, 0),
+                                       tla::MakeShape(1, m * sizeof(int32_t)));
+            auto ubHolelTile = GetTile(ubAnyTla, tla::MakeCoord(0, m * sizeof(int32_t)),
+                                       tla::MakeShape(1, m * Hn * sizeof(int32_t)));
+            auto ubHolesTile = GetTile(ubAnyTla, tla::MakeCoord(0, (m + m * Hn) * sizeof(int32_t)),
+                                       tla::MakeShape(1, m * Hn * sizeof(int32_t)));
+
+            CopyGmToUbMask copyAny;  // existing uint8 RowMajor functor (same as :422 dense path)
+            copyAny(ubMaskrTile, gmMaskrTile);
+            copyAny(ubHolelTile, gmHolelTile);
+            copyAny(ubHolesTile, gmHolesTile);
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(4);
 
@@ -572,15 +600,6 @@ public:
         AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(4);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
-        if (AscendC::GetBlockIdx() == 0 && subBlockIdx_ == 0 && qRowBase == 0) {
-            AscendC::printf("[AnyMask][epi blk=0] maskRowBase=%u qRowBase=%u m=%u n=%u kvSStart=%u kvSEnd=%u Hn=%u blockFullyMasked=%u isFirst=%u\n",
-                maskRowBase, qRowBase, m, n, kvSStartIdx, kvSEndIdx, Hn, blockFullyMasked, isFirstKvSTile);
-            if (blockFullyMasked == 0) {
-                AscendC::printf("[AnyMask][epi blk=0] GM maskr[0]=%d holel[0]=%d holes[0]=%d | UB maskr[0]=%d holel[0]=%d holes[0]=%d\n",
-                    maskrGm[qRowBase], holelGm[qRowBase * Hn], holesGm[qRowBase * Hn],
-                    maskrUbPtr[0], holelUbPtr[0], holesUbPtr[0]);
-            }
-        }
         if (isFirstKvSTile) {
             if (n > 64) {
                 ComputeScaleAndAnyMask<ElementInput, ElementOutput, false>(
@@ -605,30 +624,6 @@ public:
                     m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound,
                     maskrUbPtr, holelUbPtr, holesUbPtr, kvSStartIdx, Hn, blockFullyMasked);
             }
-        }
-        // [AnyMask][diag] q0(maskr=128 -> out 0) vs q32(maskr=33 -> out ±10):
-        // dump masked-score / row-max / expSum right after the softmax pass. Logic
-        // verified correct vs working ComputeScaleAndMaxMask + C++ ref (mha_fwd.cpp
-        // :98-122), so a wrong value here pins the bug to an unverified 950 MicroAPI
-        // call in ComputeScaleAndAnyMask (Arange / Compare<CMPMODE> / Select / And /
-        // Or / Reduce / DIST_BRC_B32). Interpretation hints sit next to the printfs.
-        if (AscendC::GetBlockIdx() == 0 && subBlockIdx_ == 0 && qRowBase == 0 &&
-            isFirstKvSTile && blockFullyMasked == 0) {
-            using namespace AscendC::MicroAPI;
-            LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
-            __ubuf__ float *sUb = reinterpret_cast<__ubuf__ float*>(sAddr);
-            __ubuf__ float *mxUb = lastMaxAddr;
-            __ubuf__ float *smUb = lastSumAddr;
-            // q0 maskr=128: hole=[0,32) -> s[0]=MIN; valid=[32,128) -> s[32]/s[40]=real; expect max>0, l>0.
-            //   s[0]=real & s[32]=MIN  -> Select polarity inverted (un-swap :919-920 / :1007).
-            //   s[0]=s[32]=s[40]=MIN    -> Compare<CMPMODE::GE> inverted (maskr>=pos); see :901/:996.
-            //   max<=0 or l==0          -> Reduce<MAX/SUM>/ExpSub misbehave; see :926-947.
-            AscendC::printf("[AnyMask][diag] q0 m128: s0=%f s32=%f s40=%f max=%f l=%f\n",
-                sUb[0], sUb[32], sUb[40], mxUb[0], smUb[0]);
-            // q32 maskr=33: hole=[0,32) -> s[0]=MIN; k>=33 masked -> s[32]=real, s[50]=MIN.
-            //   s[50]=real -> maskr predicate not applied at all.
-            AscendC::printf("[AnyMask][diag] q32 m33: s0=%f s32=%f s50=%f max=%f l=%f\n",
-                sUb[32*128+0], sUb[32*128+32], sUb[32*128+50], mxUb[32], smUb[32]);
         }
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ubSBufId);
         // Replenish the V_MTE2(4) token consumed by the preload WaitFlag above

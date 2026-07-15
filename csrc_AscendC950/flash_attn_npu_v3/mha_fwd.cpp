@@ -392,6 +392,16 @@ mha_fwd(at::Tensor q,
                     " (UB budget), got ", Hn);
         tilingData.holeMaxNum = static_cast<uint32_t>(Hn);
 
+        // AnyMask maskr/holel/holes GM->UB preload uses DataCopyPad(isPad=false) (via
+        // Tile::CopyGm2UbTla), which requires 32B alignment of the GM source address, the
+        // UB destination, and blockLen. With qBaseTile=128 and subBlock m=RoundUp(tileM,8)/2,
+        // all three hold iff seqlen_q is 16-aligned: then every q-tile's m is 8-aligned and
+        // every qRowBase (=batch*Sq + subBlock*m) is 8-aligned, so qRowBase*4 / m*4 / m*Hn*4
+        // and the UB offsets (0, m, m+m*Hn) are all 32B. Enforce it for v1.
+        TORCH_CHECK(seqlen_q % 16 == 0,
+                    "AnyMask v1 requires q_seqlen to be a multiple of 16 (32B-aligned "
+                    "maskr/holel/holes DataCopy), got ", seqlen_q);
+
         if (hole_num_.has_value()) {
             TORCH_CHECK(hole_num_->sizes().size() == 1 && hole_num_->size(0) == Hn,
                         "hole_num must be [Hn] int16");
