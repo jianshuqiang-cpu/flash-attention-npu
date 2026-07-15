@@ -535,12 +535,15 @@ mha_fwd(at::Tensor q,
     const bool enableDN =
         (!is_causal) && (head_size_q <= 128) && (head_size_v <= 128) && (innerPrec == 0u);
 
+    fprintf(stderr, "[AnyMask][host] launch kernelKey=%u enableDN=%d blockDim=%u anyMaskEnabled=%u holeMaxNum=%u\n",
+            kernelKey, (int)enableDN, blockDim, tilingData.anyMaskEnabled, tilingData.holeMaxNum);
     const aclError err = fai_host::LaunchFAI(
         kernelKey, enableDN,
         blockDim, aclStream,
         qDev, kDev, vDev, maskDev, blockTableDev,
         oDev, lseDev, qSeqDev, kvSeqDev,
         wsDev, tilDev);
+    fprintf(stderr, "[AnyMask][host] LaunchFAI returned err=%d (0=SUCCESS)\n", (int)err);
     TORCH_CHECK(err == ACL_SUCCESS,
                 "950 backend (v3): unsupported kernelKey=", kernelKey,
                 " (no launcher registered for "
@@ -550,6 +553,7 @@ mha_fwd(at::Tensor q,
                 " cacheMode=", (paged_KV ? "paged" : "normal"),
                 ")");
     const aclError sync_err = aclrtSynchronizeStream(aclStream);
+    fprintf(stderr, "[AnyMask][host] aclrtSynchronizeStream sync_err=%d (0=SUCCESS; nonzero=kernel CRASHED; if this line never appears the kernel HUNG=deadlock)\n", (int)sync_err);
     TORCH_CHECK(sync_err == ACL_SUCCESS,
                 "950 backend (v3): aclrtSynchronizeStream failed after LaunchFAI, err=",
                 sync_err);

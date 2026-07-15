@@ -552,15 +552,20 @@ public:
         __ubuf__ int32_t *maskrUbPtr = reinterpret_cast<__ubuf__ int32_t*>(maskUbTensor.GetPhyAddr());
         __ubuf__ int32_t *holelUbPtr = maskrUbPtr + m;
         __ubuf__ int32_t *holesUbPtr = maskrUbPtr + m + m * Hn;
+        // AnyMask flag balance: mirror the non-AnyMask overload (lines ~439/441/446/466).
+        // V_MTE2(4)/MTE2_V(4) must be produced AND consumed exactly once per tile
+        // regardless of blockFullyMasked, else the token count drifts and the kernel
+        // deadlocks (V_MTE2(4) is pre-set once in InitSyncFlags but never replenished
+        // here; MTE2_V(4) is not pre-set). Keep only the scalar preload conditional.
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(4);
         if (blockFullyMasked == 0) {
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(4);
             for (uint32_t i = 0; i < m; ++i) { maskrUbPtr[i] = maskrGm[qRowBase + i]; }
             for (uint32_t i = 0; i < m * Hn; ++i) {
                 holelUbPtr[i] = holelGm[qRowBase * Hn + i];
                 holesUbPtr[i] = holesGm[qRowBase * Hn + i];
             }
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(4);
         }
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(4);
 
         // wait QK Fixpipe finsh
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
@@ -602,6 +607,10 @@ public:
             }
         }
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ubSBufId);
+        // Replenish the V_MTE2(4) token consumed by the preload WaitFlag above
+        // (mirrors non-AnyMask line ~466). V is done reading maskr/holel/holes UB,
+        // so the next tile's preload may overwrite maskUbTensor.
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(4);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(ubSBufId);
         SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
 
