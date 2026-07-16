@@ -153,16 +153,6 @@ public:
             gHolel.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(faiTilingData->holelAddr));
             gHoles.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(faiTilingData->holesAddr));
         }
-        if (anyMaskEnabled_ != 0 && AscendC::GetBlockIdx() == 0) {
-            AscendC::printf("[AnyMask][Init blk=0] anyMaskEnabled=%u holeMaxNum=%u qBaseTile=%u kvBaseTile=%u maxQSeqlen=%u maxKvSeqlen=%u\n",
-                anyMaskEnabled_, holeMaxNum_, qBaseTile_, kvBaseTile_,
-                faiTilingData->maxQSeqlen, faiTilingData->maxKvSeqlen);
-            AscendC::printf("[AnyMask][Init blk=0] addrs holeNum=%p tileRange=%p sparseCompute=%p sparseMask=%p maskr=%p holel=%p holes=%p\n",
-                (void*)faiTilingData->holeNumAddr, (void*)faiTilingData->tileRangeAddr,
-                (void*)faiTilingData->sparseComputeAddr, (void*)faiTilingData->sparseMaskAddr,
-                (void*)faiTilingData->maskrAddr, (void*)faiTilingData->holelAddr,
-                (void*)faiTilingData->holesAddr);
-        }
 
         AscendC::LocalTensor<ElementP> l1PTensor[MAX_CROSS_CORE_BUF_STAGES];
         AscendC::LocalTensor<ElementS> ubSTensor[UB_S_BUF_STAGES];
@@ -330,11 +320,6 @@ public:
                 uint32_t tileRangeCount = tileRangeVal + 1u;
                 uint32_t noSkipKvSBefore = noSkipKvS;
                 noSkipKvS = AscendC::Std::min(noSkipKvS, tileRangeCount);
-                if (curBatch == 0 && qSTileIdx == 0) {
-                    AscendC::printf("[AnyMask][tile_range] b=%u tq=%u trIdx=%u val=%u count=%u noSkipKvS %u->%u kvSeqlen=%u\n",
-                        curBatch, qSTileIdx, trIdx, tileRangeVal, tileRangeCount,
-                        noSkipKvSBefore, noSkipKvS, (uint32_t)kvSeqlen);
-                }
             }
 
             uint32_t kvSLoopNum = static_cast<uint32_t>(CeilDiv(noSkipKvS, static_cast<int64_t>(kvBaseTile_)));
@@ -449,11 +434,6 @@ public:
                         }
                         if (faiTilingData->sparseMaskAddr != 0) {
                             smBit = (static_cast<uint32_t>(gSparseMask.GetValue(wordIdx)) >> bitPos) & 1u;
-                        }
-                        if (curBatch == 0 && qSTileIdx == 0 && kvSTileIdx < 4) {
-                            AscendC::printf("[AnyMask][disp] b=%u tq=%u tk=%u kvSStart=%u kvSEnd=%u maskRowBase=%u wordIdx=%u bitPos=%u scBit=%u smBit=%u\n",
-                                curBatch, qSTileIdx, kvSTileIdx, kvSStartIdx, kvSEndIdx,
-                                maskRowBase, wordIdx, bitPos, scBit, smBit);
                         }
                         if (scBit != 0u) {
                             // whole block masked (sparse_compute) -> blockFullyMasked=1
