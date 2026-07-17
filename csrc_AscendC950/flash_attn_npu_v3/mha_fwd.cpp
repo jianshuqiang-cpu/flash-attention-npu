@@ -529,8 +529,8 @@ mha_fwd(at::Tensor q,
     if (is_varlen_kv) {
         kv_seq_i64 = cu_seqlens_k;
     } else if (is_varlen_q && !paged_KV) {
-        at::Tensor cum_kv = seqlens_k.to(at::kLong).cumsum(0).to(torch::kInt32);  // (B,) cumulative suffix
-        kv_seq_i64 = at::cat({at::zeros({1}, seqlens_k.options()), cum_kv}, 0);    // (B+1,) [0, kv0, kv0+kv1, ...]
+        kv_seq_i64 =
+        at::from_blob(const_cast<int32_t*>(ctx.kvSeqlenList), {batch_size + 1}, at::dtype(torch::kInt32).device(torch::kCPU)).to(at::Device(at::kPrivateUse1));
     } else {
         kv_seq_i64 = seqlens_k;
     }
