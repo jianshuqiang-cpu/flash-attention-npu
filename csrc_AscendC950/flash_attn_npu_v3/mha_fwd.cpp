@@ -228,10 +228,13 @@ mha_fwd(at::Tensor q,
         sparse_compute_.has_value() || sparse_mask_.has_value() || maskr_.has_value() ||
         holel_.has_value() || holes_.has_value();
     if (anyMaskPresent) {
+        // AnyMask v1 now supports TND (varlen_q) on 950 (v3): AnyMask params use
+        // the padded [B, max_Sq] / [B, max_Tq, Wk] layout; the device indexes
+        // [b, local_q] and skips padding (maskRowBase uses maxQSeqlen; tile_range
+        // / sparse_compute / sparse_mask batch-stride by maxQsBlockNum). KV is
+        // packed (total_kv,Hkv,D) with cumulative cache_seqlens, as in non-AnyMask TND.
         TORCH_CHECK(!is_causal,
                     "AnyMask is mutually exclusive with is_causal on 950 (v3) v1");
-        TORCH_CHECK(!is_varlen_q,
-                    "AnyMask v1 only supports BSND (non-varlen) on 950 (v3)");
         TORCH_CHECK(!paged_KV,
                     "AnyMask v1 only supports non-paged KV on 950 (v3)");
         TORCH_CHECK(!is_bf16,
@@ -309,7 +312,10 @@ mha_fwd(at::Tensor q,
     const int max_num_blocks_per_seq = !paged_KV ? 0 : static_cast<int>(page_table.size(1));
     const int num_blocks = !paged_KV ? 0 : static_cast<int>(k.size(0));
     const int page_block_size = !paged_KV ? 128 : static_cast<int>(k.size(1));
-    const int num_heads_k = static_cast<int>(k.size(2));
+    // K layout: BSND and paged are 4D (.., Hkv, D) -> size(2)=Hkv; non-paged TND
+    // is packed 3D (total_kv, Hkv, D) -> size(1)=Hkv (size(2)=D). Pick Hkv so the
+    // GQA divisibility check and num_heads_k are correct for the 3D packed case too.
+    const int num_heads_k = static_cast<int>((is_varlen_q && !paged_KV) ? k.size(1) : k.size(2));
     const int head_size_v = static_cast<int>(v.size(-1));
 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
@@ -324,7 +330,8 @@ mha_fwd(at::Tensor q,
 
     // ============================================================
     // 6. Pull cu_seqlens_q / seqused_k to host as int32 — the 950
-    //    FAInferContext consumes int64 lists, so we widen on host.
+    //    FAInferContext consumes int32 seqlen lists, so we copy on host
+    //    (no int32->int64 widening is needed).
     // ============================================================
     at::Tensor cu_seqlen_q_cpu;
     if (is_varlen_q) {
@@ -512,9 +519,21 @@ mha_fwd(at::Tensor q,
     at::Tensor q_seq_i64 = is_varlen_q
         ? cu_seqlens_q
         : at::empty({batch_size}, i64_npu);
-    at::Tensor kv_seq_i64 = is_varlen_kv
-        ? cu_seqlens_k
-        : seqlens_k;
+    // Device kvFormat=TND (i.e. is_varlen_q) + non-paged does a cumulative diff
+    // GetValue(b+1)-GetValue(b) on the KV seqlen list (fai_kernel.cpp), so it needs a
+    // CUMULATIVE (B+1) list. cu_seqlens_k (varlen_kv) is already cumulative; the per-batch
+    // seqused_k (cache_seqlens) is not. Build a cumulative (B+1) int32 NPU tensor for the
+    // device in that case. Tiling consumes the per-batch seqlens_k_cpu separately and
+    // cumulates internally (fill_inference_context), so this device-side tensor is independent.
+    at::Tensor kv_seq_i64;
+    if (is_varlen_kv) {
+        kv_seq_i64 = cu_seqlens_k;
+    } else if (is_varlen_q && !paged_KV) {
+        at::Tensor cum_kv = seqlens_k.to(at::kLong).cumsum(0).to(torch::kInt32);  // (B,) cumulative suffix
+        kv_seq_i64 = at::cat({at::zeros({1}, seqlens_k.options()), cum_kv}, 0);    // (B+1,) [0, kv0, kv0+kv1, ...]
+    } else {
+        kv_seq_i64 = seqlens_k;
+    }
     auto qSeqDev  = static_cast<uint8_t*>(q_seq_i64.data_ptr());
     auto kvSeqDev = static_cast<uint8_t*>(kv_seq_i64.data_ptr());
     auto blockTableDev = paged_KV
