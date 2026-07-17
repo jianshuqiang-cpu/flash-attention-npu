@@ -317,7 +317,7 @@ public:
             if (anyMaskEnabled_ != 0 && faiTilingData->tileRangeAddr != 0) {
                 uint32_t trIdx = curBatch * qsBlockNum + qSTileIdx;
                 uint32_t tileRangeVal = static_cast<uint32_t>(gTileRange.GetValue(trIdx));
-                uint32_t tileRangeCount = tileRangeVal + 1u;
+                uint32_t tileRangeCount = tileRangeVal * kvBaseTile_;
                 uint32_t noSkipKvSBefore = noSkipKvS;
                 noSkipKvS = AscendC::Std::min(noSkipKvS, tileRangeCount);
             }
