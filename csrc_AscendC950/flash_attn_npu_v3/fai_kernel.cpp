@@ -252,6 +252,11 @@ public:
         if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
             kvSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
         }
+        // AnyMask (v1) tile-level batch stride for the padded [B, max_Tq] layout:
+        // must be max_Tq = ceil(maxQSeqlen / qBaseTile), NOT the per-batch qsBlockNum
+        // (qsBlockNum == max_Tq only in uniform/BSND; diverges under TND varlen_q).
+        [[maybe_unused]] uint32_t maxQsBlockNum =
+            (faiTilingData->maxQSeqlen + qBaseTile_ - 1) / qBaseTile_;
         for (uint32_t taskIdx = coreIdx; taskIdx < totalTaskNum_; taskIdx += coreNum) {
             while (taskIdx >= curTotalTaskNum) {
                 ++curBatch;
@@ -321,7 +326,7 @@ public:
             // Question 1: if the table wording "from tile_range onward masked"
             // is intended instead, drop the +1.)
             if (anyMaskEnabled_ != 0 && faiTilingData->tileRangeAddr != 0) {
-                uint32_t trIdx = curBatch * qsBlockNum + qSTileIdx;
+                uint32_t trIdx = curBatch * maxQsBlockNum + qSTileIdx;
                 uint32_t tileRangeVal = static_cast<uint32_t>(gTileRange.GetValue(trIdx));
                 uint32_t tileRangeCount = tileRangeVal * kvBaseTile_;
                 uint32_t noSkipKvSBefore = noSkipKvS;
@@ -432,7 +437,7 @@ public:
                         // bitmap word index for (curBatch, qSTileIdx, kvSTileIdx)
                         uint32_t Tk = (static_cast<uint32_t>(faiTilingData->maxKvSeqlen) + kvBaseTile_ - 1) / kvBaseTile_;
                         uint32_t Wk = (Tk + 31u) / 32u;
-                        uint32_t wordIdx = (curBatch * qsBlockNum + qSTileIdx) * Wk + (kvSTileIdx / 32u);
+                        uint32_t wordIdx = (curBatch * maxQsBlockNum + qSTileIdx) * Wk + (kvSTileIdx / 32u);
                         uint32_t bitPos = kvSTileIdx % 32u;
                         uint32_t scBit = 0u, smBit = 0u;
                         if (faiTilingData->sparseComputeAddr != 0) {
