@@ -54,25 +54,23 @@ parse_npu_smi() {
   "$NPU_SMI_BIN" info 2>/dev/null | awk '
     function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s; }
     BEGIN { next_id=""; next_name=""; next_health=""; }
-    # 匹配 NPU 行: | <id>  <name> ... | <health> | ...
-    # id 是数字, name 紧跟其后 (如 910B3), health 是第二个 "|" 字段 (OK/Alarm/Warning)
-    /^\| [0-9]+[ \t]+/ {
+    # NPU 行: 第二个 "|" 字段含 health (OK/Alarm/Warning), 不是 Bus-Id
+    # 用 health 关键词区分 NPU 行和 chip 行
+    /\| (OK|Alarm|Warning|Critical)[ \t]*\|/ {
       line=$0;
       n=split(line, f, /[|]/);
       if (n >= 3) {
         idname=trim(f[2]);
-        # 拆 id 和 name (id 是第一个 token, name 是第二个)
         split(idname, idname_parts, /[ \t]+/);
         next_id=idname_parts[1];
         next_name=idname_parts[2];
         health_field=trim(f[3]);
-        # health 字段可能含 Power 等后续, 只取第一个 token
         split(health_field, hp, /[ \t]+/);
         next_health=hp[1];
       }
       next;
     }
-    # 匹配 chip 行: 含 Bus-Id (形如 0000:XX:00.0) 和 "used / total" 段
+    # chip 行: 含 Bus-Id (形如 0000:XX:00.0) 和 "used / total" 段
     # chip 行有多个 "数字 / 数字": Memory-Usage (0/0) 和 HBM-Usage (3454/65536)
     # 我们要最后一个 = HBM-Usage
     /0000:[0-9A-Fa-f]+:[0-9A-Fa-f]+\.[0-9]/ {
