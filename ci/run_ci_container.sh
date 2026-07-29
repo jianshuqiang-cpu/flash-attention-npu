@@ -19,8 +19,6 @@
 #   CI_DOCKER_IMAGE          (默认 fla-npu-ci:8.5.0-910b)
 #   CI_SKIP_BUILD            (默认 false)  true=跳过阶段1 (已有 build/ 产物)
 #   CI_NPU_LOCK_DIR          (默认 /tmp)
-#   CI_NPU_LOCK_WAIT_SECONDS (默认 14400)  0 表示一直等
-#   CI_NPU_LOCK_RETRY_SECONDS(默认 10)
 #   ASCEND_RT_VISIBLE_DEVICES               手动指定宿主机物理卡时跳过自动选卡
 
 set -euo pipefail
@@ -36,8 +34,6 @@ CI_DOCKER_PRIVILEGED="${CI_DOCKER_PRIVILEGED:-true}"
 CI_DOCKER_IMAGE="${CI_DOCKER_IMAGE:-fla-npu-ci:8.5.0-910b}"
 CI_SKIP_BUILD="${CI_SKIP_BUILD:-false}"
 CI_NPU_LOCK_DIR="${CI_NPU_LOCK_DIR:-/tmp}"
-CI_NPU_LOCK_WAIT_SECONDS="${CI_NPU_LOCK_WAIT_SECONDS:-14400}"
-CI_NPU_LOCK_RETRY_SECONDS="${CI_NPU_LOCK_RETRY_SECONDS:-10}"
 
 log() { printf '[CI] %s\n' "$*"; }
 die() { printf '[CI][ERROR] %s\n' "$*" >&2; exit 1; }
@@ -118,12 +114,14 @@ acquire_lock_and_run_test() {
   mkdir -p "$CI_NPU_LOCK_DIR"
   exec 9>"$lockfile"
   if ! flock -n 9; then
-    return 1
+    return 1   # 没拿到锁, 调用方可试下一张卡
   fi
   log "acquired NPU lock: $lockfile (physical device=$device_id)"
   trap 'flock -u 9' EXIT
-  run_docker_test "$device_id"
-  return $?
+  if ! run_docker_test "$device_id"; then
+    die "test failed on physical device=$device_id (see logs above); aborting CI (no retry)"
+  fi
+  return 0
 }
 
 # ---------- 主流程 ----------
@@ -140,39 +138,30 @@ main() {
     log "=== Phase 1 done ==="
   fi
 
-  # 阶段2: 选卡 + 加锁 + 测试
+  # 阶段2: 选卡 + 加锁 + 测试 (失败立即退出, 不换卡重试)
   log "=== Phase 2: test (with NPU lock) ==="
-  local start_ts waited
-  start_ts="$(date +%s)"
-  waited=0
 
-  while true; do
-    local cands
-    cands="$(get_candidates)"
-    if [ -z "$cands" ]; then
-      die "no candidate NPU detected; run 'bash ci/detect_npu.sh --summary' to check"
+  cands="$(get_candidates)"
+  if [ -z "$cands" ]; then
+    die "no candidate NPU detected; run 'bash ci/detect_npu.sh --summary' to check"
+  fi
+
+  ran_test=false
+  while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    if acquire_lock_and_run_test "$id"; then
+      ran_test=true
+      break
     fi
+    log "NPU $id locked, trying next candidate..."
+  done <<< "$cands"
 
-    while IFS= read -r id; do
-      [ -z "$id" ] && continue
-      if acquire_lock_and_run_test "$id"; then
-        local total_end
-        total_end="$(date +%s)"
-        log "CI end: $(date '+%Y-%m-%d %H:%M:%S') (total=$((total_end - total_start))s)"
-        exit 0
-      fi
-      log "NPU $id locked, trying next candidate..."
-    done <<< "$cands"
+  if [ "$ran_test" != "true" ]; then
+    die "all detected NPU devices are locked; no test was executed"
+  fi
 
-    if [ "$CI_NPU_LOCK_WAIT_SECONDS" != "0" ]; then
-      waited=$(( $(date +%s) - start_ts ))
-      if [ "$waited" -ge "$CI_NPU_LOCK_WAIT_SECONDS" ]; then
-        die "All detected NPU devices are locked; waited ${waited}s >= CI_NPU_LOCK_WAIT_SECONDS=${CI_NPU_LOCK_WAIT_SECONDS}. Giving up."
-      fi
-    fi
-    log "All detected NPU devices are locked; retrying in ${CI_NPU_LOCK_RETRY_SECONDS}s."
-    sleep "$CI_NPU_LOCK_RETRY_SECONDS"
-  done
+  total_end="$(date +%s)"
+  log "CI end: $(date '+%Y-%m-%d %H:%M:%S') (total=$((total_end - total_start))s)"
 }
 
 main "$@"
