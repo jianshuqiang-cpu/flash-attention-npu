@@ -27,6 +27,7 @@ die() { printf '[CI-test][ERROR] %s\n' "$*" >&2; exit 1; }
 
 log "repo=$REPO_ROOT device=$DEVICE mode=${CI_MODE:-quick}"
 log "ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-<unset>}"
+log "test phase start: $(date '+%Y-%m-%d %H:%M:%S')"
 
 # ---------- 1. NPU 自检 (需要卡) ----------
 command -v python3 >/dev/null 2>&1 || die "python3 not found in container"
@@ -111,3 +112,4 @@ while IFS=$'\t' read -r name file kfilter args; do
 done <<< "$selected"
 
 log "all Example ST cases passed"
+log "test phase end: $(date '+%Y-%m-%d %H:%M:%S')"

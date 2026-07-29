@@ -15,6 +15,7 @@ log() { printf '[CI-build] %s\n' "$*"; }
 die() { printf '[CI-build][ERROR] %s\n' "$*" >&2; exit 1; }
 
 log "repo=$REPO_ROOT (build phase, no NPU needed)"
+log "build phase start: $(date '+%Y-%m-%d %H:%M:%S')"
 
 command -v python3 >/dev/null 2>&1 || die "python3 not found in container"
 
@@ -29,3 +30,4 @@ log "python setup.py build (FLASH_ATTN_BUILD_VERSION=${FLASH_ATTN_BUILD_VERSION:
 python3 setup.py build
 
 log "build phase done (artifacts in build/)"
+log "build phase end: $(date '+%Y-%m-%d %H:%M:%S')"

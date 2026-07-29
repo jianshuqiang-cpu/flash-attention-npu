@@ -128,6 +128,10 @@ acquire_lock_and_run_test() {
 
 # ---------- 主流程 ----------
 main() {
+  local total_start
+  total_start="$(date +%s)"
+  log "CI start: $(date '+%Y-%m-%d %H:%M:%S')"
+
   # 阶段1: 编译
   if [ "$CI_SKIP_BUILD" = "true" ]; then
     log "CI_SKIP_BUILD=true, skip phase 1 (assume build/ exists)"
@@ -152,6 +156,9 @@ main() {
     while IFS= read -r id; do
       [ -z "$id" ] && continue
       if acquire_lock_and_run_test "$id"; then
+        local total_end
+        total_end="$(date +%s)"
+        log "CI end: $(date '+%Y-%m-%d %H:%M:%S') (total=$((total_end - total_start))s)"
         exit 0
       fi
       log "NPU $id locked, trying next candidate..."
