@@ -78,7 +78,7 @@ run_case() {
 }
 
 select_cases() {
-  jq -r '.cases[] | select(.enabled==true) | "\(.name)\t\(.test_file)\t\(.test_filter // "")\t\(.pytest_args // "")"' "$CASES_JSON"
+  jq -r '.cases[] | select(.enabled==true) | "\(.name)|\(.test_file)|\(.test_filter // "")|\(.pytest_args // "")"' "$CASES_JSON"
 }
 
 filter_cases() {
@@ -89,9 +89,16 @@ filter_cases() {
     IFS=','
     local -a want=($FILTER)
     IFS="$IFS_save"
-    local pattern
-    pattern="$(IFS='|'; echo "${want[*]}")"
-    grep -E "^($pattern)"$'\t'
+    local line name w
+    while IFS= read -r line; do
+      name="${line%%|*}"
+      for w in "${want[@]}"; do
+        if [ "$name" = "$w" ]; then
+          printf '%s\n' "$line"
+          break
+        fi
+      done
+    done
   fi
 }
 
@@ -107,7 +114,7 @@ if [ -z "$selected" ]; then
   die "no Example ST case selected (check ci/example_st_cases.json or CI_EXAMPLE_CASE_FILTER)"
 fi
 
-while IFS=$'\t' read -r name file kfilter args; do
+while IFS='|' read -r name file kfilter args; do
   [ -z "$name" ] && continue
   run_case "$name" "$file" "$kfilter" "$args"
 done <<< "$selected"
