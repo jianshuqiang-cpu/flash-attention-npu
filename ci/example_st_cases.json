@@ -12,7 +12,7 @@
     {
       "name": "case1_current_default",
       "enabled": true,
-      "test_file": "tests/test_flash_attn_npu.py",
+      "test_file": "tests/test_flash_attn_npu_v2.py",
       "test_filter": "",
       "pytest_args": "-q",
       "description": "V2 前向 / kvcache / varlen 默认 shape 全量参数化"
@@ -36,7 +36,7 @@
     {
       "name": "case4_bwd",
       "enabled": false,
-      "test_file": "tests/test_flash_attn_npu_bwd.py",
+      "test_file": "tests/test_flash_attn_npu_v2_bwd.py",
       "test_filter": "",
       "pytest_args": "-q",
       "description": "V2 反向（默认关闭，按需启用）"
@@ -44,7 +44,7 @@
     {
       "name": "case5_v3_bwd_only",
       "enabled": false,
-      "test_file": "tests/test_flash_attn_npu_v3_bwd_only.py",
+      "test_file": "tests/test_flash_attn_npu_v3_bwd.py",
       "test_filter": "",
       "pytest_args": "-q",
       "description": "V3 仅反向（默认关闭，按需启用）"
