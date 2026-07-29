@@ -37,21 +37,56 @@ command -v "$NPU_SMI_BIN" >/dev/null 2>&1 || die "npu-smi not found in PATH; is 
 #   | 0     910B3               | OK              | 67.5        42                0    / 0           |
 #   | 0                         | 0000:C1:00.0    | 0           0    / 0           |
 #   +===========================+=================+=================================================+
+# 解析 npu-smi info 输出, 输出 "id|name|health|free|soc" 行。
+# npu-smi 25.5.0 实际输出格式:
+#   +---------------------------+---------------+----------------------------------------------------+
+#   | NPU   Name                | Health        | Power(W)    Temp(C)           Hugepages-Usage(page)|
+#   | Chip                      | Bus-Id        | AICore(%)   Memory-Usage(MB)  HBM-Usage(MB)        |
+#   +===========================+===============+====================================================+
+#   | 0     910B3               | OK            | 91.3        35                0    / 0             |
+#   | 0                         | 0000:C1:00.0  | 0           0    / 0          3454 / 65536         |
+#   +===========================+===============+====================================================+
+# 每张卡有两行:
+#   第一行 (NPU 行): 含 id / name / health / power / temp / hugepages
+#   第二行 (Chip 行): 含 chip / bus-id / AICore% / Memory-Usage / HBM-Usage
+# 我们要的 "free" = HBM-Usage 的 total - used, 即 chip 行最后一段 "数字 / 数字"。
 parse_npu_smi() {
   "$NPU_SMI_BIN" info 2>/dev/null | awk '
-    /^\| [0-9]+ +/ {
-      id=$2; name=$3; health=$4;
-      # 该行不含 free 信息，free 信息在下一行 Memory-Usage
-      next_id=id; next_name=name; next_health=health;
-    }
-    /Memory-Usage/ {
-      # 形如 | 0  | 0000:C1:00.0 | 0  | 0    / 0  |
-      # 解析 used / total
+    function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s; }
+    BEGIN { next_id=""; next_name=""; next_health=""; }
+    # 匹配 NPU 行: | <id>  <name> ... | <health> | ...
+    # id 是数字, name 紧跟其后 (如 910B3), health 是第二个 "|" 字段 (OK/Alarm/Warning)
+    /^\| [0-9]+[ \t]+/ {
       line=$0;
-      match(line, /[0-9]+ *\/ *[0-9]+/);
-      if (RSTART > 0) {
-        sub=/.*\//; 
-        split(substr(line, RSTART, RLENGTH), parts, "/");
+      n=split(line, f, /[|]/);
+      if (n >= 3) {
+        idname=trim(f[2]);
+        # 拆 id 和 name (id 是第一个 token, name 是第二个)
+        split(idname, idname_parts, /[ \t]+/);
+        next_id=idname_parts[1];
+        next_name=idname_parts[2];
+        health_field=trim(f[3]);
+        # health 字段可能含 Power 等后续, 只取第一个 token
+        split(health_field, hp, /[ \t]+/);
+        next_health=hp[1];
+      }
+      next;
+    }
+    # 匹配 chip 行: 含 Bus-Id (形如 0000:XX:00.0) 和 "used / total" 段
+    # chip 行有多个 "数字 / 数字": Memory-Usage (0/0) 和 HBM-Usage (3454/65536)
+    # 我们要最后一个 = HBM-Usage
+    /0000:[0-9A-Fa-f]+:[0-9A-Fa-f]+\.[0-9]/ {
+      line=$0;
+      # 反复匹配 "数字 / 数字", 保留最后一个 (HBM-Usage 在行尾)
+      seg="";
+      s=line;
+      while (match(s, /[0-9]+[ \t]*\/[ \t]*[0-9]+/)) {
+        seg=substr(s, RSTART, RLENGTH);
+        s=substr(s, RSTART+RLENGTH);
+      }
+      if (seg != "") {
+        gsub(/[ \t]/, "", seg);
+        split(seg, parts, "/");
         used=parts[1]+0; total=parts[2]+0;
         free=total-used;
         if (next_id != "") {
@@ -59,6 +94,7 @@ parse_npu_smi() {
           next_id="";
         }
       }
+      next;
     }
   '
 }
