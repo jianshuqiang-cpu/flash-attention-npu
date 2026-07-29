@@ -47,8 +47,8 @@ python3 setup.py install --skip-build
 
 log "import check"
 python3 - <<'PY'
-import flash_attn_npu
-print("flash_attn_npu", flash_attn_npu.__version__)
+import flash_attn_npu_v2
+print("flash_attn_npu_v2", flash_attn_npu_v2.__version__)
 PY
 
 # ---------- 3. Example ST ----------
