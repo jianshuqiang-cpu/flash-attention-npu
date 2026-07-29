@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026, flash-attention-npu CI maintainers.
+#
+# 注册 GitHub Actions self-hosted runner。
+#
+# 用法:
+#   bash ci/setup_self_hosted_runner.sh \
+#     --url https://github.com/<org>/<repo> \
+#     --token <registration_token>
+#
+# 环境变量:
+#   RUNNER_ROOT        (默认 /workspace/actions-runner/flash-linear-attention-npu)
+#   RUNNER_NAME        (默认 <hostname>-flash-linear-attention-npu)
+#   RUNNER_LABELS      (默认 linux,arm64,npu,flash-linear-attention-npu)
+#   RUNNER_VERSION     (默认 2.319.0)  runner 版本
+#
+# 注册 token 由 GitHub 仓库管理员在
+#   Settings -> Actions -> Runners -> New self-hosted runner
+# 生成, 时效短, 过期后重新生成即可。
+
+set -euo pipefail
+
+RUNNER_ROOT="${RUNNER_ROOT:-/workspace/actions-runner/flash-linear-attention-npu}"
+RUNNER_NAME="${RUNNER_NAME:-$(hostname)-flash-linear-attention-npu}"
+RUNNER_LABELS="${RUNNER_LABELS:-linux,arm64,npu,flash-linear-attention-npu}"
+RUNNER_VERSION="${RUNNER_VERSION:-2.319.0}"
+
+REPO_URL=""
+TOKEN=""
+
+log() { printf '[runner-setup] %s\n' "$*"; }
+die() { printf '[runner-setup][ERROR] %s\n' "$*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --url) REPO_URL="$2"; shift 2 ;;
+    --token) TOKEN="$2"; shift 2 ;;
+    --name) RUNNER_NAME="$2"; shift 2 ;;
+    --labels) RUNNER_LABELS="$2"; shift 2 ;;
+    --root) RUNNER_ROOT="$2"; shift 2 ;;
+    *) die "unknown arg: $1" ;;
+  esac
+done
+
+[ -n "$REPO_URL" ] || die "--url is required"
+[ -n "$TOKEN" ] || die "--token is required"
+
+arch="$(uname -m)"
+case "$arch" in
+  aarch64|arm64) runner_arch="arm64" ;;
+  x86_64)        runner_arch="x64" ;;
+  *) die "unsupported arch: $arch" ;;
+esac
+
+log "repo=$REPO_URL"
+log "runner root=$RUNNER_ROOT"
+log "runner name=$RUNNER_NAME"
+log "runner labels=$RUNNER_LABELS"
+
+mkdir -p "$RUNNER_ROOT"
+cd "$RUNNER_ROOT"
+
+# 1. 下载并解压 runner (若已存在则跳过)
+if [ ! -x "./run.sh" ]; then
+  pkg="actions-runner-linux-${runner_arch}-${RUNNER_VERSION}.tar.gz"
+  url="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${pkg}"
+  log "downloading $url"
+  if ! curl -fL -o "$pkg" "$url"; then
+    die "download failed; check network/proxy to github.com"
+  fi
+  tar xzf "$pkg"
+  rm -f "$pkg"
+  log "extracted runner to $RUNNER_ROOT"
+else
+  log "runner already present at $RUNNER_ROOT, skip download"
+fi
+
+# 2. 配置 (带 --replace 替换同名 runner)
+log "configuring runner"
+./config.sh --url "$REPO_URL" \
+  --token "$TOKEN" \
+  --name "$RUNNER_NAME" \
+  --labels "$RUNNER_LABELS" \
+  --replace \
+  --unattended \
+  --work "_work"
+
+log "runner configured"
+
+# 3. 安装系统服务 (仅 root)
+if [ "$(id -u)" -eq 0 ]; then
+  log "running as root, installing svc"
+  ./svc.sh install
+  ./svc.sh start
+  ./svc.sh status || true
+  log "svc installed and started; check GitHub Settings -> Actions -> Runners for green Idle"
+else
+  log "not root, skip svc install; run './run.sh' in foreground to verify, or rerun as root"
+  log "  cd $RUNNER_ROOT && sudo ./svc.sh install && sudo ./svc.sh start"
+fi
+
+log "done"
