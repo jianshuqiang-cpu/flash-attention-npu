@@ -18,7 +18,7 @@
 #   2.7.1.post4-910b-ubuntu22.04-py3.11   (默认)
 #   2.7.1.post4-910b-openeuler24.03-py3.11
 #   2.7.1.post4-a3-ubuntu22.04-py3.11
-ARG BASE_IMAGE=swr.cn-south-1.myhuaweicloud.com/ascendhub/torch-npu:2.7.1.post4-910b-ubuntu22.04-py3.11
+ARG BASE_IMAGE=swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-beta.1-910b-ubuntu22.04-py3.12-devel
 FROM ${BASE_IMAGE}
 
 # CANN toolkit home (镜像内路径, 官方镜像已设置, 这里显式声明以防缺失)
