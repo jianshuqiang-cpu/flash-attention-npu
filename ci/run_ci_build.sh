@@ -20,8 +20,8 @@ log "build phase start: $(date '+%Y-%m-%d %H:%M:%S')"
 command -v python3 >/dev/null 2>&1 || die "python3 not found in container"
 
 # ---------- 1. 子模块 ----------
-log "init submodules: csrc/catlass csrc_AscendC950/catlass"
-git submodule update --init --recursive csrc/catlass csrc_AscendC950/catlass
+log "init submodules: csrc/catlass"
+git submodule update --init --recursive csrc/catlass
 
 # ---------- 2. 编译 (python setup.py build) ----------
 export FLASH_ATTN_FORCE_BUILD=TRUE
