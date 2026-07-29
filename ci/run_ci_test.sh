@@ -40,11 +40,10 @@ print("torch_npu device_count:", torch_npu.npu.device_count())
 assert torch_npu.npu.device_count() >= 1, "device_count==0; --privileged or driver mount missing?"
 PY
 
-# ---------- 2. 安装 (复用 build/ 产物) ----------
-export FLASH_ATTN_FORCE_BUILD=TRUE
+# ---------- 2. 安装 (复用 build/ 产物, 不重新编译) ----------
 export ASCEND_TOOLKIT_HOME="${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}"
-log "python setup.py install (reuse build/ artifacts)"
-python3 setup.py install
+log "python setup.py install --skip-build (reuse build/ artifacts)"
+python3 setup.py install --skip-build
 
 log "import check"
 python3 - <<'PY'
@@ -79,7 +78,7 @@ run_case() {
 }
 
 select_cases() {
-  jq -r '.cases[] | select(.enabled==true) | "\(.name)\t\(.test_file)\t\(.test_filter // "")\t\(.pytest_args // "")"'
+  jq -r '.cases[] | select(.enabled==true) | "\(.name)\t\(.test_file)\t\(.test_filter // "")\t\(.pytest_args // "")"' "$CASES_JSON"
 }
 
 filter_cases() {
