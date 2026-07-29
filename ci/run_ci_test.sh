@@ -91,7 +91,7 @@ filter_cases() {
     IFS="$IFS_save"
     local pattern
     pattern="$(IFS='|'; echo "${want[*]}")"
-    grep -E "^($pattern)"'\t'
+    grep -E "^($pattern)"$'\t'
   fi
 }
 
@@ -100,6 +100,8 @@ selected="$(select_cases | filter_cases)"
 if [ "$MODE" = "quick" ]; then
   selected="$(printf '%s\n' "$selected" | grep -v -iE '^[a-z0-9_]*bwd' || true)"
 fi
+log "selected cases:"
+printf '%s\n' "$selected" | sed 's/^/  /'
 
 if [ -z "$selected" ]; then
   die "no Example ST case selected (check ci/example_st_cases.json or CI_EXAMPLE_CASE_FILTER)"
