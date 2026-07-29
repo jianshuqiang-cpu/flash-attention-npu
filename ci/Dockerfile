@@ -1,11 +1,11 @@
 # Copyright (c) 2026, flash-attention-npu CI maintainers.
 #
 # CI 镜像: 基于官方 torch_npu 镜像 (torch 2.7.1 + torch_npu 2.7.1.post4 + CANN 9.0.0)
-#          叠加本仓 CI 所需: triton-ascend 3.2.0 + 编译/测试工具
+#          叠加本仓 CI 所需的编译/测试工具。
 #
 # 方案 B: 直接用 Ascend 官方 torch-npu 镜像, torch/torch_npu/CANN 均已预装,
 #         无需 TORCH_NPU_WHEEL_URL, 无需 Python 版本匹配。
-#         本仓测试为 FlashAttention (非 GDN), 不需要 post5 的 GDN stream 修复。
+#         本仓 setup.py 用 bisheng 编译 C++ 扩展, 不依赖 triton, 无需 triton-ascend。
 #
 # 构建:
 #   docker build -t fla-npu-ci:8.5.0-910b -f ci/Dockerfile .
@@ -18,7 +18,7 @@
 #   2.7.1.post4-910b-ubuntu22.04-py3.11   (默认)
 #   2.7.1.post4-910b-openeuler24.03-py3.11
 #   2.7.1.post4-a3-ubuntu22.04-py3.11
-ARG BASE_IMAGE=swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-beta.1-910b-ubuntu22.04-py3.12-devel
+ARG BASE_IMAGE=swr.cn-south-1.myhuaweicloud.com/ascendhub/torch-npu:2.7.1.post4-910b-ubuntu22.04-py3.11
 FROM ${BASE_IMAGE}
 
 # CANN toolkit home (镜像内路径, 官方镜像已设置, 这里显式声明以防缺失)
@@ -41,11 +41,8 @@ RUN set -eux; \
 # 2. Python 包管理工具
 RUN python3 -m pip install --upgrade pip wheel setuptools
 
-# 3. triton-ascend (与社区版 triton 互斥, 只保留 triton-ascend 提供的 triton 模块)
-RUN python3 -m pip install --no-cache-dir triton-ascend==3.2.0
-RUN python3 -m pip uninstall -y triton || true
-
-# 4. 编译/测试所需 Python 包 (torch/torch_npu 已由基础镜像提供, 不重装)
+# 3. 编译/测试所需 Python 包 (torch/torch_npu 已由基础镜像提供, 不重装)
+#    本仓不依赖 triton, 不装 triton-ascend
 RUN python3 -m pip install --no-cache-dir \
       pybind11 \
       einops \
@@ -54,7 +51,7 @@ RUN python3 -m pip install --no-cache-dir \
       pytest \
       numpy
 
-# 5. 校验 torch / torch_npu 可 import (不触卡, 仅模块可用性)
+# 4. 校验 torch / torch_npu 可 import (不触卡, 仅模块可用性)
 RUN python3 - <<'PY'
 import torch, torch_npu
 print("torch:", torch.__version__)
