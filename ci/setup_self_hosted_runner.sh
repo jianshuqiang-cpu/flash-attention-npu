@@ -57,6 +57,11 @@ log "runner root=$RUNNER_ROOT"
 log "runner name=$RUNNER_NAME"
 log "runner labels=$RUNNER_LABELS"
 
+# GitHub Actions Runner 拒绝以 root 身份运行 config.sh
+if [ "$(id -u)" -eq 0 ]; then
+  die "must not run with sudo/root. GitHub runner refuses root. Re-run as a normal user (with sudo available for svc install)."
+fi
+
 mkdir -p "$RUNNER_ROOT"
 cd "$RUNNER_ROOT"
 
@@ -87,15 +92,15 @@ log "configuring runner"
 
 log "runner configured"
 
-# 3. 安装系统服务 (仅 root)
-if [ "$(id -u)" -eq 0 ]; then
-  log "running as root, installing svc"
-  ./svc.sh install
-  ./svc.sh start
-  ./svc.sh status || true
+# 3. 安装 systemd 服务 (用 sudo, 但 config.sh 已经用普通用户跑完了)
+if sudo -n true 2>/dev/null; then
+  log "installing systemd service (sudo)"
+  sudo ./svc.sh install
+  sudo ./svc.sh start
+  sudo ./svc.sh status || true
   log "svc installed and started; check GitHub Settings -> Actions -> Runners for green Idle"
 else
-  log "not root, skip svc install; run './run.sh' in foreground to verify, or rerun as root"
+  log "sudo not available non-interactively; install svc manually:"
   log "  cd $RUNNER_ROOT && sudo ./svc.sh install && sudo ./svc.sh start"
 fi
 
