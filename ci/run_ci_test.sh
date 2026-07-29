@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026, flash-attention-npu CI maintainers.
 #
-# 容器内执行脚本, 由 ci/run_ci_container.sh 通过 docker run 调用。
-# 步骤:
-#   1. 清理历史日志
-#   2. git submodule update --init
-#   3. FLASH_ATTN_FORCE_BUILD=TRUE pip install -e .
+# 阶段2: NPU 自检 + 安装 + 测试 (容器内执行, 需要 NPU, 已加锁)
+#   1. NPU 可用性自检
+#   2. python setup.py install (复用阶段1 build/ 产物, 快速安装)
+#   3. import 校验
 #   4. 按 ci/example_st_cases.json 跑 Example ST (pytest)
 #
+# 由 ci/run_ci_container.sh 阶段2通过 docker run 调用 (绑卡 + 加锁)。
+#
 # 环境变量 (由 run_ci_container.sh 注入):
-#   ASCEND_RT_VISIBLE_DEVICES   宿主机物理卡号 (容器内映射成逻辑 0)
+#   ASCEND_RT_VISIBLE_DEVICES   宿主机物理卡号
 #   CI_MODE                     quick|full
 #   CI_RUN_EXAMPLE_ST           true|false
 #   CI_EXAMPLE_CASE_FILTER      只跑指定 case name (逗号分隔)
@@ -21,13 +22,13 @@ REPO_ROOT="$(pwd)"
 CASES_JSON="$REPO_ROOT/ci/example_st_cases.json"
 DEVICE="${CI_CONTAINER_DEVICE:-0}"
 
-log() { printf '[CI-inside] %s\n' "$*"; }
-die() { printf '[CI-inside][ERROR] %s\n' "$*" >&2; exit 1; }
+log() { printf '[CI-test] %s\n' "$*"; }
+die() { printf '[CI-test][ERROR] %s\n' "$*" >&2; exit 1; }
 
 log "repo=$REPO_ROOT device=$DEVICE mode=${CI_MODE:-quick}"
 log "ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-<unset>}"
 
-# ---------- 0. 基础自检 ----------
+# ---------- 1. NPU 自检 (需要卡) ----------
 command -v python3 >/dev/null 2>&1 || die "python3 not found in container"
 python3 - <<'PY' || die "torch_npu not functional inside container (check --privileged / driver mount)"
 import torch
@@ -38,19 +39,11 @@ print("torch_npu device_count:", torch_npu.npu.device_count())
 assert torch_npu.npu.device_count() >= 1, "device_count==0; --privileged or driver mount missing?"
 PY
 
-# ---------- 1. 清理历史日志 ----------
-bash "$REPO_ROOT/ci/cleanup_ci_logs.sh" || log "cleanup_ci_logs.sh returned non-zero (ignored)"
-
-# ---------- 2. 子模块 ----------
-log "init submodules: csrc/catlass csrc_AscendC950/catlass"
-git submodule update --init --recursive csrc/catlass csrc_AscendC950/catlass
-
-# ---------- 3. 编译安装整包 ----------
-# 默认构建 v2 + v3 两个 backend (BUILD_VERSION=all)
+# ---------- 2. 安装 (复用 build/ 产物) ----------
 export FLASH_ATTN_FORCE_BUILD=TRUE
 export ASCEND_TOOLKIT_HOME="${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}"
-log "pip install -e . (FLASH_ATTN_BUILD_VERSION=${FLASH_ATTN_BUILD_VERSION:-all})"
-pip install -e . --no-build-isolation
+log "python setup.py install (reuse build/ artifacts)"
+python3 setup.py install
 
 log "import check"
 python3 - <<'PY'
@@ -58,7 +51,7 @@ import flash_attn_npu
 print("flash_attn_npu", flash_attn_npu.__version__)
 PY
 
-# ---------- 4. Example ST ----------
+# ---------- 3. Example ST ----------
 if [ "${CI_RUN_EXAMPLE_ST:-true}" != "true" ]; then
   log "CI_RUN_EXAMPLE_ST!=true, skip Example ST"
   exit 0
@@ -67,7 +60,6 @@ fi
 command -v pytest >/dev/null 2>&1 || pip install pytest --quiet
 command -v jq >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq jq >/dev/null)
 
-# quick 模式默认只跑前向类用例, full 跑全部 enabled=true
 MODE="${CI_MODE:-quick}"
 FILTER="${CI_EXAMPLE_CASE_FILTER:-}"
 
@@ -85,12 +77,10 @@ run_case() {
   log "<<< case=$name OK"
 }
 
-# 读取 JSON 中 enabled=true 的用例
 select_cases() {
   jq -r '.cases[] | select(.enabled==true) | "\(.name)\t\(.test_file)\t\(.test_filter // "")\t\(.pytest_args // "")"'
 }
 
-# 按 FILTER 过滤
 filter_cases() {
   if [ -z "$FILTER" ]; then
     cat
