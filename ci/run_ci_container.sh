@@ -19,6 +19,7 @@
 #   CI_DOCKER_IMAGE          (默认 fla-npu-ci:8.5.0-910b)
 #   CI_SKIP_BUILD            (默认 false)  true=跳过阶段1 (已有 build/ 产物)
 #   CI_NPU_LOCK_DIR          (默认 /tmp)
+#   CI_NPU_MAX_RETRIES       (默认 3)      测试失败后最多换卡重试次数
 #   ASCEND_RT_VISIBLE_DEVICES               手动指定宿主机物理卡时跳过自动选卡
 
 set -euo pipefail
@@ -109,6 +110,7 @@ run_docker_test() {
 }
 
 acquire_lock_and_run_test() {
+  # 返回码: 0=测试成功; 1=没拿到锁(不计重试, 可试下一张卡); 2=测试失败(计重试)
   local device_id="$1"
   local lockfile="$CI_NPU_LOCK_DIR/fla-npu-ci-npu-${device_id}.lock"
   mkdir -p "$CI_NPU_LOCK_DIR"
@@ -118,10 +120,12 @@ acquire_lock_and_run_test() {
   fi
   log "acquired NPU lock: $lockfile (physical device=$device_id)"
   trap 'flock -u 9' EXIT
-  if ! run_docker_test "$device_id"; then
-    die "test failed on physical device=$device_id (see logs above); aborting CI (no retry)"
+  if run_docker_test "$device_id"; then
+    return 0
   fi
-  return 0
+  flock -u 9  # 释放锁, 准备换卡重试
+  trap - EXIT
+  return 2
 }
 
 # ---------- 主流程 ----------
@@ -138,7 +142,7 @@ main() {
     log "=== Phase 1 done ==="
   fi
 
-  # 阶段2: 选卡 + 加锁 + 测试 (失败立即退出, 不换卡重试)
+  # 阶段2: 选卡 + 加锁 + 测试 (失败换卡重试, 最多 CI_NPU_MAX_RETRIES 次)
   log "=== Phase 2: test (with NPU lock) ==="
 
   cands="$(get_candidates)"
@@ -146,18 +150,32 @@ main() {
     die "no candidate NPU detected; run 'bash ci/detect_npu.sh --summary' to check"
   fi
 
-  ran_test=false
+  local max_retries="${CI_NPU_MAX_RETRIES:-3}"
+  local attempt=0 test_passed=false rc
+
   while IFS= read -r id; do
     [ -z "$id" ] && continue
-    if acquire_lock_and_run_test "$id"; then
-      ran_test=true
+    set +e
+    acquire_lock_and_run_test "$id"
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+      test_passed=true
       break
     fi
-    log "NPU $id locked, trying next candidate..."
+    if [ "$rc" -eq 2 ]; then
+      attempt=$((attempt + 1))
+      log "test FAILED on physical device=$id (attempt $attempt/$max_retries)"
+      if [ "$attempt" -ge "$max_retries" ]; then
+        die "test failed after $attempt retries (CI_NPU_MAX_RETRIES=$max_retries); aborting CI"
+      fi
+      log "retrying on next available NPU..."
+    fi
+    # rc=1 表示没拿到锁, 不计入重试, 直接试下一张
   done <<< "$cands"
 
-  if [ "$ran_test" != "true" ]; then
-    die "all detected NPU devices are locked; no test was executed"
+  if [ "$test_passed" != "true" ]; then
+    die "no available NPU device to run test (all locked or retries exhausted); aborting CI"
   fi
 
   total_end="$(date +%s)"
