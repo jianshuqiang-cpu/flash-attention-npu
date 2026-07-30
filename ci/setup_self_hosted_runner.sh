@@ -9,9 +9,9 @@
 #     --token <registration_token>
 #
 # 环境变量:
-#   RUNNER_ROOT        (默认 /workspace/actions-runner/flash-linear-attention-npu)
-#   RUNNER_NAME        (默认 <hostname>-flash-linear-attention-npu)
-#   RUNNER_LABELS      (默认 linux,arm64,npu,flash-linear-attention-npu)
+#   RUNNER_ROOT        (默认 /workspace/actions-runner/flash-attention-npu)
+#   RUNNER_NAME        (默认 <hostname>-flash-attention-npu)
+#   RUNNER_LABELS      (默认 linux,arm64,npu,flash-attention-npu)
 #   RUNNER_VERSION     (默认 2.319.0)  runner 版本
 #
 # 注册 token 由 GitHub 仓库管理员在
@@ -20,9 +20,9 @@
 
 set -euo pipefail
 
-RUNNER_ROOT="${RUNNER_ROOT:-/workspace/actions-runner/flash-linear-attention-npu}"
-RUNNER_NAME="${RUNNER_NAME:-$(hostname)-flash-linear-attention-npu}"
-RUNNER_LABELS="${RUNNER_LABELS:-linux,arm64,npu,flash-linear-attention-npu}"
+RUNNER_ROOT="${RUNNER_ROOT:-/workspace/actions-runner/flash-attention-npu}"
+RUNNER_NAME="${RUNNER_NAME:-$(hostname)-flash-attention-npu}"
+RUNNER_LABELS="${RUNNER_LABELS:-linux,arm64,npu,flash-attention-npu}"
 RUNNER_VERSION="${RUNNER_VERSION:-2.319.0}"
 
 REPO_URL=""

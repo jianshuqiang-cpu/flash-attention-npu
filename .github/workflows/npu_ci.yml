@@ -6,7 +6,7 @@ name: NPU CI
 # 触发。只有仓库 Admin 权限账号可触发。
 #
 # 状态检查名: NPU CI / 手动验证
-# runner 标签: self-hosted, linux, arm64, npu, flash-linear-attention-npu
+# runner 标签: self-hosted, linux, arm64, npu, flash-attention-npu
 
 on:
   workflow_dispatch:
@@ -168,7 +168,7 @@ jobs:
     name: 运行 NPU CI
     needs: prepare
     if: needs.prepare.outputs.should_run == 'true'
-    runs-on: [self-hosted, linux, arm64, npu, flash-linear-attention-npu]
+    runs-on: [self-hosted, linux, arm64, npu, flash-attention-npu]
     timeout-minutes: 240
     env:
       CI_MODE: ${{ needs.prepare.outputs.ci_mode }}
