@@ -22,6 +22,9 @@ REPO_ROOT="$(pwd)"
 CASES_JSON="$REPO_ROOT/ci/example_st_cases.json"
 DEVICE="${CI_CONTAINER_DEVICE:-0}"
 
+# git safe.directory (容器内 root 操作宿主机 runner 用户的目录, 会触发 dubious ownership)
+git config --global --add safe.directory "$REPO_ROOT"
+
 log() { printf '[CI-test] %s\n' "$*"; }
 die() { printf '[CI-test][ERROR] %s\n' "$*" >&2; exit 1; }
 
