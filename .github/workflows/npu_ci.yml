@@ -183,6 +183,29 @@ jobs:
     outputs:
       run_outcome: ${{ steps.run.outcome }}
     steps:
+      - name: Debug docker network in CI environment
+        run: |
+          echo "=== host env ==="
+          env | grep -i proxy || echo "(no proxy env)"
+          echo "HOME=$HOME"
+          echo "PWD=$PWD"
+          echo "whoami=$(whoami)"
+          echo ""
+          echo "=== docker info (network) ==="
+          docker info 2>&1 | grep -iE "network|proxy|runtime" | head -10
+          echo ""
+          echo "=== docker container network test ==="
+          docker run --rm "$CI_DOCKER_IMAGE" bash -c "
+            echo '--- container env ---'
+            env | grep -i proxy || echo '(no proxy in container)'
+            echo '--- container resolv.conf ---'
+            cat /etc/resolv.conf
+            echo '--- container connect test ---'
+            curl -v --connect-timeout 15 https://github.com 2>&1 | head -15
+            echo '--- container git clone test ---'
+            cd /tmp && git clone https://github.com/${GITHUB_REPOSITORY}.git test-repo 2>&1 | head -10 && rm -rf test-repo
+          "
+
       - name: Clone repo via docker (容器内能连 GitHub)
         run: |
           set -euo pipefail
