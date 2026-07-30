@@ -180,6 +180,8 @@ jobs:
       CI_RUN_EXAMPLE_ST: "true"
       CI_DOCKER_IMAGE: fla-npu-ci:9.1.0
       TARGET_SHA: ${{ needs.prepare.outputs.sha }}
+    outputs:
+      run_outcome: ${{ steps.run.outcome }}
     steps:
       - name: Clone repo via docker (宿主机无法直连 GitHub)
         run: |
@@ -201,12 +203,17 @@ jobs:
           set -euo pipefail
           bash ci/run_ci_container.sh
 
+  finalize:
+    name: 写最终状态
+    needs: [prepare, run]
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.NPU_CI_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+      RUN_OUTCOME: ${{ needs.run.result }}
+      COMMENT_USER: ${{ github.event.comment.user.login }}
+    steps:
       - name: Set final status + update bot comment
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.NPU_CI_BOT_TOKEN || secrets.GITHUB_TOKEN }}
-          RUN_OUTCOME: ${{ steps.run.outcome }}
-          COMMENT_USER: ${{ github.event.comment.user.login }}
         run: |
           set -euo pipefail
           repo="${GITHUB_REPOSITORY}"
