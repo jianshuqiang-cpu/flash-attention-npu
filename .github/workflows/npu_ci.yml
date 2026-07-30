@@ -206,16 +206,16 @@ jobs:
             cd /tmp && git clone https://github.com/${GITHUB_REPOSITORY}.git test-repo 2>&1 | head -10 && rm -rf test-repo
           "
 
-      - name: Clone repo via docker (容器内能连 GitHub, 浅克隆+重试)
+      - name: Clone repo via docker (容器内能连 GitHub, 浅克隆+重试+host网络)
         run: |
           set -euo pipefail
           # 清空工作目录 (包括隐藏文件)
           rm -rf .[!.]* * 2>/dev/null || true
           # 宿主机 git safe.directory (后续 ls/git log 在宿主机跑)
           git config --global --add safe.directory "$PWD"
-          # 用 docker 容器 clone (宿主机连不上 GitHub, 但容器可以)
-          # 浅克隆 + 大 buffer + 重试, 应对网络不稳定
+          # 用 docker 容器 clone (用 host 网络, 避免 bridge 网络问题)
           docker run --rm \
+            --network host \
             -v "$PWD:/workspace" \
             -w /workspace \
             -e GIT_HTTP_LOW_SPEED_LIMIT=1000 \
@@ -227,11 +227,12 @@ jobs:
               git config --global http.postBuffer 524288000
               git config --global http.lowSpeedLimit 1000
               git config --global http.lowSpeedTime 60
+              git config --global http.version HTTP/1.1
               # 确保目录为空 (重试时清理)
               rm -rf /workspace/.git /workspace/* /workspace/.[!.]* 2>/dev/null || true
               max_retries=5
               for i in $(seq 1 $max_retries); do
-                echo "[clone] attempt $i/$max_retries (shallow clone)"
+                echo "[clone] attempt $i/$max_retries (shallow clone, HTTP/1.1)"
                 if git clone --depth=1 https://github.com/'"${GITHUB_REPOSITORY}"'.git .; then
                   break
                 fi

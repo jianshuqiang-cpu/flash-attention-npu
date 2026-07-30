@@ -72,9 +72,10 @@ run_build_phase() {
     --ipc host \
     -v "$REPO_ROOT:/workspace/flash-attention-npu" \
     -e FLASH_ATTN_BUILD_VERSION="${FLASH_ATTN_BUILD_VERSION:-all}" \
+    -e GIT_CONFIG_GLOBAL=/tmp/gitconfig \
     -w /workspace/flash-attention-npu \
     "$CI_DOCKER_IMAGE" \
-    bash -lc 'bash ci/run_ci_build.sh'
+    bash -lc 'git config --global --add safe.directory /workspace/flash-attention-npu && bash ci/run_ci_build.sh'
 }
 
 # ---------- 阶段2: 测试 (加锁 + 绑卡) ----------
@@ -104,9 +105,10 @@ run_docker_test() {
     -e CI_EXAMPLE_CASE_FILTER="$CI_EXAMPLE_CASE_FILTER" \
     -e CI_CONTAINER_DEVICE="$CI_CONTAINER_DEVICE" \
     -e FLASH_ATTN_BUILD_VERSION="${FLASH_ATTN_BUILD_VERSION:-all}" \
+    -e GIT_CONFIG_GLOBAL=/tmp/gitconfig \
     -w /workspace/flash-attention-npu \
     "$CI_DOCKER_IMAGE" \
-    bash -lc 'bash ci/run_ci_test.sh'
+    bash -lc 'git config --global --add safe.directory /workspace/flash-attention-npu && bash ci/run_ci_test.sh'
 }
 
 acquire_lock_and_run_test() {
