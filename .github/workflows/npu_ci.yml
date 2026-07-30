@@ -209,8 +209,10 @@ jobs:
       - name: Clone repo via docker (容器内能连 GitHub, 浅克隆+重试)
         run: |
           set -euo pipefail
-          # 清空工作目录
-          find . -mindepth 1 -delete 2>/dev/null || true
+          # 清空工作目录 (包括隐藏文件)
+          rm -rf .[!.]* * 2>/dev/null || true
+          # 宿主机 git safe.directory (后续 ls/git log 在宿主机跑)
+          git config --global --add safe.directory "$PWD"
           # 用 docker 容器 clone (宿主机连不上 GitHub, 但容器可以)
           # 浅克隆 + 大 buffer + 重试, 应对网络不稳定
           docker run --rm \
@@ -221,9 +223,12 @@ jobs:
             "$CI_DOCKER_IMAGE" \
             bash -c '
               set -e
+              git config --global --add safe.directory /workspace
               git config --global http.postBuffer 524288000
               git config --global http.lowSpeedLimit 1000
               git config --global http.lowSpeedTime 60
+              # 确保目录为空 (重试时清理)
+              rm -rf /workspace/.git /workspace/* /workspace/.[!.]* 2>/dev/null || true
               max_retries=5
               for i in $(seq 1 $max_retries); do
                 echo "[clone] attempt $i/$max_retries (shallow clone)"
@@ -236,7 +241,7 @@ jobs:
                 fi
                 echo "[clone] failed, retry in 15s..."
                 sleep 15
-                rm -rf .git * .[!.]* 2>/dev/null || true
+                rm -rf /workspace/.git /workspace/* /workspace/.[!.]* 2>/dev/null || true
               done
               # fetch 目标 sha (unshallow 需要)
               git fetch --depth=1 origin '"$TARGET_SHA"'
