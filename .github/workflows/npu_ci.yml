@@ -58,12 +58,13 @@ jobs:
           PR_NUMBER_INPUT: ${{ github.event.inputs.pr_number }}
           CI_MODE_INPUT: ${{ github.event.inputs.ci_mode }}
           EVENT_NAME: ${{ github.event_name }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
         run: |
           set -euo pipefail
           repo="${GITHUB_REPOSITORY}"
           if [ "$EVENT_NAME" = "issue_comment" ]; then
             pr_number="${{ github.event.issue.number }}"
-            actor="${{ github.event.actor }}"
+            actor="$COMMENT_USER"
           else
             pr_number="$PR_NUMBER_INPUT"
             actor="${GITHUB_ACTOR}"
@@ -89,11 +90,12 @@ jobs:
         id: perm
         env:
           GH_TOKEN: ${{ secrets.NPU_CI_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
         run: |
           set -euo pipefail
           repo="${GITHUB_REPOSITORY}"
           if [ "${{ github.event_name }}" = "issue_comment" ]; then
-            actor="${{ github.event.actor }}"
+            actor="$COMMENT_USER"
           else
             actor="${{ github.actor }}"
           fi
@@ -130,6 +132,7 @@ jobs:
         if: steps.check.outputs.should_run == 'true'
         env:
           GH_TOKEN: ${{ secrets.NPU_CI_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
         run: |
           set -euo pipefail
           repo="${GITHUB_REPOSITORY}"
@@ -137,7 +140,11 @@ jobs:
           pr_number="${{ steps.resolve.outputs.pr_number }}"
           ci_mode="${{ steps.resolve.outputs.ci_mode }}"
           run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          actor="${{ github.event_name == 'issue_comment' && github.event.actor || github.actor }}"
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            actor="$COMMENT_USER"
+          else
+            actor="${{ github.actor }}"
+          fi
 
           # 写 pending
           gh api --method POST "repos/$repo/statuses/$sha" \
@@ -191,6 +198,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.NPU_CI_BOT_TOKEN || secrets.GITHUB_TOKEN }}
           RUN_OUTCOME: ${{ steps.run.outcome }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
         run: |
           set -euo pipefail
           repo="${GITHUB_REPOSITORY}"
@@ -198,7 +206,11 @@ jobs:
           pr_number="${{ needs.prepare.outputs.pr_number }}"
           ci_mode="${{ needs.prepare.outputs.ci_mode }}"
           run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          actor="${{ github.event_name == 'issue_comment' && github.event.actor || github.actor }}"
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            actor="$COMMENT_USER"
+          else
+            actor="${{ github.actor }}"
+          fi
 
           if [ "$RUN_OUTCOME" = "success" ]; then
             state=success; desc="NPU CI 通过 ($ci_mode+example)"; status_text="通过"
