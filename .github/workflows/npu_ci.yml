@@ -178,12 +178,22 @@ jobs:
     env:
       CI_MODE: ${{ needs.prepare.outputs.ci_mode }}
       CI_RUN_EXAMPLE_ST: "true"
+      CI_DOCKER_IMAGE: fla-npu-ci:9.1.0
+      TARGET_SHA: ${{ needs.prepare.outputs.sha }}
     steps:
-      - name: Checkout PR head
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare.outputs.sha }}
-          submodules: false
+      - name: Clone repo via docker (宿主机无法直连 GitHub)
+        run: |
+          set -euo pipefail
+          # 清空工作目录 (runner 默认在工作目录)
+          find . -mindepth 1 -delete 2>/dev/null || true
+          # 用 docker 容器 clone 仓库 (宿主机连不上 GitHub, 但容器可以)
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            "$CI_DOCKER_IMAGE" \
+            bash -c "git clone https://github.com/${GITHUB_REPOSITORY}.git . && git fetch origin && git checkout $TARGET_SHA"
+          # 确认 clone 成功
+          ls -la ci/run_ci_container.sh
 
       - name: Run NPU CI container
         id: run
