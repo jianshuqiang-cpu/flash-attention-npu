@@ -183,12 +183,12 @@ jobs:
     outputs:
       run_outcome: ${{ steps.run.outcome }}
     steps:
-      - name: Clone repo via docker (宿主机无法直连 GitHub)
+      - name: Clone repo via docker (容器内能连 GitHub)
         run: |
           set -euo pipefail
-          # 清空工作目录 (runner 默认在工作目录)
+          # 清空工作目录
           find . -mindepth 1 -delete 2>/dev/null || true
-          # 用 docker 容器 clone 仓库 (宿主机连不上 GitHub, 但容器可以)
+          # 用 docker 容器 clone (宿主机连不上 GitHub, 但容器可以)
           docker run --rm \
             -v "$PWD:/workspace" \
             -w /workspace \
@@ -196,6 +196,7 @@ jobs:
             bash -c "git clone https://github.com/${GITHUB_REPOSITORY}.git . && git fetch origin && git checkout $TARGET_SHA"
           # 确认 clone 成功
           ls -la ci/run_ci_container.sh
+          git log --oneline -1
 
       - name: Run NPU CI container
         id: run
