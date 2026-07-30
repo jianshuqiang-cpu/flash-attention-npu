@@ -206,17 +206,42 @@ jobs:
             cd /tmp && git clone https://github.com/${GITHUB_REPOSITORY}.git test-repo 2>&1 | head -10 && rm -rf test-repo
           "
 
-      - name: Clone repo via docker (容器内能连 GitHub)
+      - name: Clone repo via docker (容器内能连 GitHub, 浅克隆+重试)
         run: |
           set -euo pipefail
           # 清空工作目录
           find . -mindepth 1 -delete 2>/dev/null || true
           # 用 docker 容器 clone (宿主机连不上 GitHub, 但容器可以)
+          # 浅克隆 + 大 buffer + 重试, 应对网络不稳定
           docker run --rm \
             -v "$PWD:/workspace" \
             -w /workspace \
+            -e GIT_HTTP_LOW_SPEED_LIMIT=1000 \
+            -e GIT_HTTP_LOW_SPEED_TIME=60 \
             "$CI_DOCKER_IMAGE" \
-            bash -c "git clone https://github.com/${GITHUB_REPOSITORY}.git . && git fetch origin && git checkout $TARGET_SHA"
+            bash -c '
+              set -e
+              git config --global http.postBuffer 524288000
+              git config --global http.lowSpeedLimit 1000
+              git config --global http.lowSpeedTime 60
+              max_retries=5
+              for i in $(seq 1 $max_retries); do
+                echo "[clone] attempt $i/$max_retries (shallow clone)"
+                if git clone --depth=1 https://github.com/'"${GITHUB_REPOSITORY}"'.git .; then
+                  break
+                fi
+                if [ $i -eq $max_retries ]; then
+                  echo "[clone] all retries failed"
+                  exit 1
+                fi
+                echo "[clone] failed, retry in 15s..."
+                sleep 15
+                rm -rf .git * .[!.]* 2>/dev/null || true
+              done
+              # fetch 目标 sha (unshallow 需要)
+              git fetch --depth=1 origin '"$TARGET_SHA"'
+              git checkout '"$TARGET_SHA"'
+            '
           # 确认 clone 成功
           ls -la ci/run_ci_container.sh
           git log --oneline -1
