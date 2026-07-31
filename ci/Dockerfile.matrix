@@ -27,6 +27,9 @@ ARG PY_TAG
 ARG TORCH_VER
 ARG TORCH_NPU_VER
 ARG TORCH_NPU_RELEASE
+# ARCH 在 FROM 之前未声明 (FROM 不需要), 这里直接给默认值 x86_64;
+# --build-arg ARCH=... 会覆盖默认值。取值: x86_64 / aarch64。
+ARG ARCH=x86_64
 
 # CANN toolkit home (官方镜像一般已设; 显式声明防缺失)。8.5.0/9.0.0 镜像若路径不同,
 # 在此调整或改用基础镜像自带的 set_env.sh。
@@ -49,18 +52,22 @@ RUN set -eux; \
 # 2. Python 包管理工具
 RUN python3 -m pip install --upgrade pip wheel setuptools
 
-# 3. torch (cpu, x86_64): 直接下载指定 wheel 文件安装, 避免 pip index 自动解析
-#    带来不确定性。URL 含 %2B (URL 编码的 +), wget 会原样请求。
+# 3. torch: x86_64 下载指定 cpu wheel 安装 (URL 含 %2B, URL 编码的 +);
+#    aarch64 无官方 +cpu wheel, 走 pip 从 PyPI 安装 manylinux aarch64 wheel。
 RUN cd /tmp && \
-    wget -q -O torch.whl \
-      "https://download.pytorch.org/whl/cpu/torch-${TORCH_VER}%2Bcpu-${PY_TAG}-${PY_TAG}-manylinux_2_28_x86_64.whl" && \
-    python3 -m pip install --no-cache-dir torch.whl && \
-    rm -f torch.whl
+    if [ "${ARCH}" = "x86_64" ]; then \
+      wget -q -O torch.whl \
+        "https://download.pytorch.org/whl/cpu/torch-${TORCH_VER}%2Bcpu-${PY_TAG}-${PY_TAG}-manylinux_2_28_x86_64.whl" && \
+      python3 -m pip install --no-cache-dir torch.whl && \
+      rm -f torch.whl; \
+    else \
+      python3 -m pip install --no-cache-dir "torch==${TORCH_VER}"; \
+    fi
 
-# 4. torch_npu (x86_64, 按 PY_TAG + gitcode release tag)
+# 4. torch_npu (按 PY_TAG + ARCH + gitcode release tag)
 RUN cd /tmp && \
     wget -q -O torch_npu.whl \
-      "https://gitcode.com/Ascend/pytorch/releases/download/${TORCH_NPU_RELEASE}/torch_npu-${TORCH_NPU_VER}-${PY_TAG}-${PY_TAG}-manylinux_2_28_x86_64.whl" && \
+      "https://gitcode.com/Ascend/pytorch/releases/download/${TORCH_NPU_RELEASE}/torch_npu-${TORCH_NPU_VER}-${PY_TAG}-${PY_TAG}-manylinux_2_28_${ARCH}.whl" && \
     python3 -m pip install --no-cache-dir torch_npu.whl && \
     rm -f torch_npu.whl
 

@@ -36,21 +36,23 @@ read_combos() {
 }
 
 build_one() {
-  local line="$1" name base_image py_tag torch_ver torch_npu_ver torch_npu_rel
-  IFS='|' read -r name base_image py_tag torch_ver torch_npu_ver torch_npu_rel <<< "$line"
+  local line="$1" name base_image py_tag torch_ver torch_npu_ver torch_npu_rel arch
+  IFS='|' read -r name base_image py_tag torch_ver torch_npu_ver torch_npu_rel arch <<< "$line"
   [ -n "$name" ] || return 0
+  arch="${arch:-x86_64}"
   if [ "${#WANT[@]}" -gt 0 ]; then
     local hit=false w
     for w in "${WANT[@]}"; do [ "$w" = "$name" ] && { hit=true; break; }; done
     [ "$hit" = "true" ] || return 0
   fi
-  log "building $IMAGE_PREFIX:$name (base=$base_image torch=$torch_ver torch_npu=$torch_npu_ver py=$py_tag)"
+  log "building $IMAGE_PREFIX:$name (base=$base_image torch=$torch_ver torch_npu=$torch_npu_ver py=$py_tag arch=$arch)"
   if docker build -t "$IMAGE_PREFIX:$name" \
         --build-arg BASE_IMAGE="$base_image" \
         --build-arg PY_TAG="$py_tag" \
         --build-arg TORCH_VER="$torch_ver" \
         --build-arg TORCH_NPU_VER="$torch_npu_ver" \
         --build-arg TORCH_NPU_RELEASE="$torch_npu_rel" \
+        --build-arg ARCH="$arch" \
         -f "$SCRIPT_DIR/Dockerfile.matrix" "$SCRIPT_DIR"; then
     log "  -> $IMAGE_PREFIX:$name OK"
     return 0
