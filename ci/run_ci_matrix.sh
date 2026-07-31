@@ -81,7 +81,7 @@ docker run --rm \
   -v "$REPO_ROOT:/workspace/flash-attention-npu" \
   -w /workspace/flash-attention-npu \
   "$IMAGE_PREFIX:$first_name" \
-  bash -lc 'git config --global --add safe.directory /workspace/flash-attention-npu && git submodule update --init --recursive csrc/catlass' \
+  bash -lc 'git config --global --add safe.directory "*" && git submodule update --init --recursive csrc/catlass' \
   || die "submodule pre-init failed"
 
 # ---------- 2. 每个 combo 一个容器, 并发编译 ----------
@@ -101,7 +101,7 @@ build_one() {
     -e FLASH_ATTN_BUILD_VERSION="${FLASH_ATTN_BUILD_VERSION:-all}" \
     -w /workspace/flash-attention-npu \
     "$IMAGE_PREFIX:$name" \
-    bash -lc 'git config --global --add safe.directory /workspace/flash-attention-npu && python3 setup.py build --build-base=/tmp/build' \
+    bash -lc 'git config --global --add safe.directory "*" && python3 setup.py build --build-base=/tmp/build' \
     > "$logf" 2>&1
   rc=$?
   echo "$rc" > "$LOG_DIR/${name}.rc"
