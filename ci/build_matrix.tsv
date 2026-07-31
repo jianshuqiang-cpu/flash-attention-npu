@@ -16,7 +16,9 @@
 #       不匹配的组合会在 build_matrix_images.sh 阶段失败。
 #
 # name|base_image|py_tag|torch_ver|torch_npu_ver|torch_npu_release|arch
-910b-cann9.1-torch2.9|swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-beta.1-910b-ubuntu22.04-py3.12-devel|cp312|2.9.0|2.9.0.post2|v26.0.0-pytorch2.9.0|aarch64
+# 910b 暂时注释: 需 aarch64 构建机, 当前 x86_64 机器无法构建/运行该镜像。
+# 待有 aarch64 机器时取消注释, 先 build_matrix_images.sh 910b-... 再跑矩阵。
+# 910b-cann9.1-torch2.9|swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-beta.1-910b-ubuntu22.04-py3.12-devel|cp312|2.9.0|2.9.0.post2|v26.0.0-pytorch2.9.0|aarch64
 # 950 (Ascend 950PR/DT, arch35/dav-3510): 实测机器上有 CANN 9.1.0-beta.1 的 950 镜像 (与 910b 同 CANN 版本)。
 # torch_npu 2.9.0.post2 在 9.1.0-beta.1 上可用 (910b 即如此), 故 torch/torch_npu 与 910b 相同, 只换 950 基础镜像。
 # 备选: cann:9.1.0-beta.3-950-ubuntu22.04-py3.12 (更新; 若 beta.1 对 950 有问题再换)。
