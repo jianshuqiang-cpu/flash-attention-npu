@@ -39,8 +39,8 @@ ENV LD_LIBRARY_PATH=${ASCEND_TOOLKIT_HOME}/lib64:${ASCEND_TOOLKIT_HOME}/runtime/
 ENV PATH=${ASCEND_TOOLKIT_HOME}/bin:${ASCEND_TOOLKIT_HOME}/compiler/ccec_compiler/bin:${PATH:-}
 
 # pip: 基础镜像配置的镜像源可能缺包 (实测 950 镜像装 setuptools 报 "from versions: none"),
-# 加清华源作为额外索引兜底; pip 会合并所有索引的可用版本, 后续 pip 操作一并受益。
-ENV PIP_EXTRA_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# 加阿里云源作为额外索引兜底; pip 会合并所有索引的可用版本, 后续 pip 操作一并受益。
+ENV PIP_EXTRA_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
 # 1. 基础工具
 RUN set -eux; \
