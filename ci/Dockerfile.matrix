@@ -105,11 +105,8 @@ RUN python3 -m pip install --no-cache-dir \
       pytest \
       numpy
 
-# 6. 校验 torch / torch_npu 可 import (不触卡, 仅模块可用性)
-RUN python3 - <<'PY'
-import torch, torch_npu
-print("torch:", torch.__version__)
-print("torch_npu:", torch_npu.__version__)
-PY
+# 6. (已移除 import 校验) 镜像构建环境无 NPU 硬件, torch_npu import 会因缺
+#    libascend_hal.so 等 runtime 库失败。模块可用性留给 run_ci_matrix.sh
+#    编译阶段自然暴露, 届时若缺库再针对性处理。
 
 WORKDIR /workspace/flash-attention-npu
