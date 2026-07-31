@@ -42,12 +42,10 @@ RUN set -eux; \
 # 2. Python 包管理工具
 RUN python3 -m pip install --upgrade pip wheel setuptools
 
-# 3. torch (cpu, aarch64, 按 PY_TAG)。wget -O 固定文件名, 避免 %2B/+ 文件名不一致。
-RUN cd /tmp && \
-    wget -q -O torch.whl \
-      "https://download.pytorch.org/whl/cpu/torch-${TORCH_VER}%2Bcpu-${PY_TAG}-${PY_TAG}-manylinux_2_28_aarch64.whl" && \
-    python3 -m pip install --no-cache-dir torch.whl && \
-    rm -f torch.whl
+# 3. torch (cpu, aarch64): 用 pip 从 PyTorch cpu 索引安装, 自动解析正确的 wheel
+#    文件名 (避免硬编码 manylinux tag 导致 404); cpu 索引无 aarch64 时回退 PyPI。
+RUN python3 -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VER}" || \
+    python3 -m pip install --no-cache-dir "torch==${TORCH_VER}"
 
 # 4. torch_npu (aarch64, 按 PY_TAG + gitcode release tag)
 RUN cd /tmp && \
