@@ -47,9 +47,21 @@ command -v docker >/dev/null 2>&1 || die "docker not found"
 
 WANT=("$@")
 
-# 输出 combo 行 (跳过 # 和空行)
+# 架构过滤: 非空时只构建 tsv 第 7 列 (arch) 匹配的 combo。用于多机器分架构构建:
+# 950 机器设 ARCH_FILTER=x86_64, 910B 机器设 ARCH_FILTER=aarch64, 各建各的。
+ARCH_FILTER="${ARCH_FILTER:-}"
+
+# 输出 combo 行 (跳过 # 和空行); ARCH_FILTER 非空时按第 7 列过滤
 read_combos() {
-  awk -F'|' '/^[[:space:]]*#/ || /^[[:space:]]*$/ {next} {print}' "$MATRIX_FILE"
+  if [ -n "$ARCH_FILTER" ]; then
+    awk -F'|' -v arch="$ARCH_FILTER" '
+      /^[[:space:]]*#/ || /^[[:space:]]*$/ {next}
+      NF >= 7 && $7 == arch {print}
+      NF < 7 {print}
+    ' "$MATRIX_FILE"
+  else
+    awk -F'|' '/^[[:space:]]*#/ || /^[[:space:]]*$/ {next} {print}' "$MATRIX_FILE"
+  fi
 }
 
 build_one() {

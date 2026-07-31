@@ -22,7 +22,13 @@ set -euo pipefail
 
 RUNNER_ROOT="${RUNNER_ROOT:-/workspace/actions-runner/flash-attention-npu}"
 RUNNER_NAME="${RUNNER_NAME:-$(hostname)-flash-attention-npu}"
-RUNNER_LABELS="${RUNNER_LABELS:-linux,arm64,npu,flash-attention-npu}"
+# 标签按本机架构自动设: x86_64 -> x64, aarch64 -> arm64; 都带 linux,npu,flash-attention-npu。
+# workflow 用这些标签把 job 调度到对应架构的 runner。
+case "$(uname -m)" in
+  x86_64)        RUNNER_LABELS="${RUNNER_LABELS:-linux,x64,npu,flash-attention-npu}" ;;
+  aarch64|arm64) RUNNER_LABELS="${RUNNER_LABELS:-linux,arm64,npu,flash-attention-npu}" ;;
+  *)             RUNNER_LABELS="${RUNNER_LABELS:-linux,npu,flash-attention-npu}" ;;
+esac
 RUNNER_VERSION="${RUNNER_VERSION:-2.319.0}"
 
 REPO_URL=""

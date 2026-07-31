@@ -31,6 +31,9 @@ IMAGE_PREFIX="${IMAGE_PREFIX:-fla-npu-matrix}"
 CI_MATRIX_MAX_JOBS="${CI_MATRIX_MAX_JOBS:-0}"
 CI_DOCKER_PRIVILEGED="${CI_DOCKER_PRIVILEGED:-true}"
 LOG_DIR="${REPO_ROOT}/build/matrix-logs"
+# 架构过滤: 非空时只跑 tsv 第 7 列 (arch) 匹配的 combo。用于多机器分架构跑:
+# 950 机器设 ARCH_FILTER=x86_64, 910B 机器设 ARCH_FILTER=aarch64, 各跑各的。
+ARCH_FILTER="${ARCH_FILTER:-}"
 
 log() { printf '[matrix-build] %s\n' "$*"; }
 die() { printf '[matrix-build][ERROR] %s\n' "$*" >&2; exit 1; }
@@ -42,7 +45,15 @@ privileged_args=()
 [ "$CI_DOCKER_PRIVILEGED" = "true" ] && privileged_args+=(--privileged)
 
 read_combos() {
-  awk -F'|' '/^[[:space:]]*#/ || /^[[:space:]]*$/ {next} {print}' "$MATRIX_FILE"
+  if [ -n "$ARCH_FILTER" ]; then
+    awk -F'|' -v arch="$ARCH_FILTER" '
+      /^[[:space:]]*#/ || /^[[:space:]]*$/ {next}
+      NF >= 7 && $7 == arch {print}
+      NF < 7 {print}
+    ' "$MATRIX_FILE"
+  else
+    awk -F'|' '/^[[:space:]]*#/ || /^[[:space:]]*$/ {next} {print}' "$MATRIX_FILE"
+  fi
 }
 
 COMBOS=()

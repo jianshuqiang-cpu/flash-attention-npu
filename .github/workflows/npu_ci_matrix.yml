@@ -3,12 +3,19 @@ name: NPU CI 编译矩阵
 # 多 CANN × torch/torch_npu 兼容编译矩阵。手动触发 (workflow_dispatch), 不跑每次 PR。
 # 在预构建的 fla-npu-matrix:<name> 镜像里并发编译, 汇总 per-combo pass/fail。
 #
-# 前置 (runner 上一次性操作):
-#   1. 确保 fla-npu-ci:9.1.0 镜像存在 (clone 步骤用)
-#   2. bash ci/build_matrix_images.sh   # 构建各 combo 镜像 fla-npu-matrix:<name>
+# 双架构并行: 950 (x86_64) 和 910B (aarch64) 各跑一个 job, 同时执行。
+# 每个 job 用 ARCH_FILTER 只跑本机架构对应的 combo, 互不干扰。
 #
-# runner 标签: self-hosted, linux, arm64, npu, flash-attention-npu
-# 状态检查名: NPU CI 编译矩阵 / 多 CANN×torch 编译
+# 前置 (每台 runner 上一次性操作):
+#   1. 确保 fla-npu-ci:9.1.0 镜像存在 (clone 步骤用)
+#   2. bash ci/build_matrix_images.sh   # 构建本机架构的 combo 镜像
+#      - 950 机器:  ARCH_FILTER=x86_64 bash ci/build_matrix_images.sh
+#      - 910B 机器: ARCH_FILTER=aarch64 bash ci/build_matrix_images.sh
+#
+# runner 标签:
+#   950 机器:  self-hosted, linux, x64, npu, flash-attention-npu
+#   910B 机器: self-hosted, linux, arm64, npu, flash-attention-npu
+# 状态检查名: NPU CI 编译矩阵 / <arch> 编译
 
 on:
   workflow_dispatch:
@@ -24,12 +31,24 @@ permissions:
 
 jobs:
   matrix_build:
-    name: 多 CANN×torch 编译
-    runs-on: [self-hosted, linux, arm64, npu, flash-attention-npu]
+    name: ${{ matrix.arch_label }} 编译
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - arch_filter: x86_64
+            arch_label: x86_64-950
+            runs_on: "[self-hosted, linux, x64, npu, flash-attention-npu]"
+          - arch_filter: aarch64
+            arch_label: aarch64-910B
+            runs_on: "[self-hosted, linux, arm64, npu, flash-attention-npu]"
+    runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 360
     env:
       CI_DOCKER_IMAGE: fla-npu-ci:9.1.0
       CI_MATRIX_MAX_JOBS: ${{ inputs.max_jobs }}
+      ARCH_FILTER: ${{ matrix.arch_filter }}
     steps:
       - name: Clone repo via docker (容器内能连 GitHub, 浅克隆+重试)
         run: |
@@ -60,7 +79,7 @@ jobs:
           ls -la ci/run_ci_matrix.sh
           git log --oneline -1
 
-      - name: Run matrix build
+      - name: Run matrix build (${{ matrix.arch_filter }})
         run: |
           set -euo pipefail
           bash ci/run_ci_matrix.sh
