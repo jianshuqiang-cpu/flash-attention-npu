@@ -3,7 +3,7 @@
 #
 # 字段 (| 分隔):
 #   name              combo 标识, 用作镜像 tag (fla-npu-matrix:<name>) 和日志名
-#   base_image        AscendHub CANN devel 镜像 (含 CANN toolkit + bisheng)
+#   base_image        AscendHub CANN 镜像 (含 CANN toolkit + bisheng)
 #   py_tag            cp311 / cp312, 与 base_image 的 python 版本一致
 #   torch_ver         torch 版本, 如 2.9.0 (README: torch_npu 与 torch 同版本)
 #   torch_npu_ver     torch_npu wheel 版本字符串, 如 2.9.0.post2
@@ -15,8 +15,8 @@
 #
 # name|base_image|py_tag|torch_ver|torch_npu_ver|torch_npu_release
 910b-cann9.1-torch2.9|swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-beta.1-910b-ubuntu22.04-py3.12-devel|cp312|2.9.0|2.9.0.post2|v26.0.0-pytorch2.9.0
-# 950 (Ascend 950PR/DT, arch35/dav-3510): CANN 9.0.0。torch_npu 2.9.0.post2 原生对应 CANN 9.0.0,
-# 所以 torch/torch_npu 与 910b 相同, 只是基础镜像换成 950 的 CANN 9.0.0 镜像。
-# !! base_image tag 是按 AscendHub 命名规律 (cann:<ver>-<chip>-<os>-py<py>-devel) 推测的,
-# !! 需在 AscendHub 上核实 950 + CANN 9.0.0 的确切 tag (chip 可能是 950 / 950pr 等), 不对就改这一字段。
-950-cann9.0-torch2.9|swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-beta.1-950-ubuntu22.04-py3.12|cp312|2.9.0|2.9.0.post2|v26.0.0-pytorch2.9.0
+# 950 (Ascend 950PR/DT, arch35/dav-3510): 实测机器上有 CANN 9.1.0-beta.1 的 950 镜像 (与 910b 同 CANN 版本)。
+# torch_npu 2.9.0.post2 在 9.1.0-beta.1 上可用 (910b 即如此), 故 torch/torch_npu 与 910b 相同, 只换 950 基础镜像。
+# 备选: cann:9.1.0-beta.3-950-ubuntu22.04-py3.12 (更新; 若 beta.1 对 950 有问题再换)。
+# 注意: 该 950 镜像无 -devel 后缀, 需确认内含 bisheng 编译器 (见构建说明)。
+950-cann9.1-torch2.9|swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-beta.1-950-ubuntu22.04-py3.12|cp312|2.9.0|2.9.0.post2|v26.0.0-pytorch2.9.0

@@ -1,0 +1,66 @@
+name: NPU CI 编译矩阵
+
+# 多 CANN × torch/torch_npu 兼容编译矩阵。手动触发 (workflow_dispatch), 不跑每次 PR。
+# 在预构建的 fla-npu-matrix:<name> 镜像里并发编译, 汇总 per-combo pass/fail。
+#
+# 前置 (runner 上一次性操作):
+#   1. 确保 fla-npu-ci:9.1.0 镜像存在 (clone 步骤用)
+#   2. bash ci/build_matrix_images.sh   # 构建各 combo 镜像 fla-npu-matrix:<name>
+#
+# runner 标签: self-hosted, linux, arm64, npu, flash-attention-npu
+# 状态检查名: NPU CI 编译矩阵 / 多 CANN×torch 编译
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_jobs:
+        description: "并发容器数上限 (0=不限; 内存吃紧时调小, 如 3)"
+        required: false
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  matrix_build:
+    name: 多 CANN×torch 编译
+    runs-on: [self-hosted, linux, arm64, npu, flash-attention-npu]
+    timeout-minutes: 360
+    env:
+      CI_DOCKER_IMAGE: fla-npu-ci:9.1.0
+      CI_MATRIX_MAX_JOBS: ${{ inputs.max_jobs }}
+    steps:
+      - name: Clone repo via docker (容器内能连 GitHub, 浅克隆+重试)
+        run: |
+          set -euo pipefail
+          rm -rf .[!.]* * 2>/dev/null || true
+          git config --global --add safe.directory "$PWD"
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            "$CI_DOCKER_IMAGE" \
+            bash -c '
+              set -e
+              git config --global --add safe.directory /workspace
+              git config --global http.postBuffer 524288000
+              rm -rf /workspace/.git /workspace/* /workspace/.[!.]* 2>/dev/null || true
+              for i in $(seq 1 5); do
+                echo "[clone] attempt $i/5 (shallow)"
+                if git clone --depth=1 https://github.com/'"${GITHUB_REPOSITORY}"'.git .; then
+                  break
+                fi
+                if [ $i -eq 5 ]; then echo "[clone] all retries failed"; exit 1; fi
+                sleep 15
+                rm -rf /workspace/.git /workspace/* /workspace/.[!.]* 2>/dev/null || true
+              done
+              git fetch --depth=1 origin '"${{ github.sha }}"'
+              git checkout '"${{ github.sha }}"'
+            '
+          ls -la ci/run_ci_matrix.sh
+          git log --oneline -1
+
+      - name: Run matrix build
+        run: |
+          set -euo pipefail
+          bash ci/run_ci_matrix.sh
