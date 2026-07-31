@@ -21,6 +21,13 @@ ARG TORCH_NPU_VER
 ARG TORCH_NPU_RELEASE
 FROM ${BASE_IMAGE}
 
+# FROM 之前声明的 ARG 只能用于 FROM 本身; 构建阶段内使用需重新声明 (不带值,
+# 会继承 FROM 之前传入的同名 ARG 值)。否则 RUN 指令里这些变量会是空字符串。
+ARG PY_TAG
+ARG TORCH_VER
+ARG TORCH_NPU_VER
+ARG TORCH_NPU_RELEASE
+
 # CANN toolkit home (官方镜像一般已设; 显式声明防缺失)。8.5.0/9.0.0 镜像若路径不同,
 # 在此调整或改用基础镜像自带的 set_env.sh。
 ENV ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest
