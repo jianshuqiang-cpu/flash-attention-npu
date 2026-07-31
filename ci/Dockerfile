@@ -4,7 +4,7 @@
 #          叠加本仓 CI 所需的编译/测试工具 + torch 2.9.0 + torch_npu 2.9.0.post2。
 #
 # 构建:
-#   docker build -t fla-npu-ci:8.5.0-910b -f ci/Dockerfile .
+#   docker build -t fla-npu-ci:9.1.0 -f ci/Dockerfile .
 
 # 服务器本地已有的 CANN toolkit 镜像 (aarch64, 910b, ubuntu22.04, py3.12)
 # 已预装: CANN 9.1.0-beta.1 toolkit (含 bisheng 编译器, ascendcl, tiling_api 等)

@@ -31,6 +31,12 @@ on:
   issue_comment:
     types: [created]
 
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: write
+  issues: write
+
 concurrency:
   # 同一 PR 的同一 head commit 重复触发不会并发跑; 不同 PR / 不同 commit 各自独立
   group: npu-ci-${{ github.event.issue.number || github.event.inputs.pr_number }}-${{ github.ref }}
@@ -261,7 +267,10 @@ jobs:
   finalize:
     name: 写最终状态
     needs: [prepare, run]
-    if: always()
+    # 只在 prepare 确认要跑 (should_run=true) 时才写最终状态。否则:
+    #   - 普通评论 (prepare 被 if 跳过) -> sha 为空, gh api 报错
+    #   - 已通过 commit 重复触发 (should_run=false) -> run 跳过, 把已通过的 commit 误标成 failure
+    if: always() && needs.prepare.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.NPU_CI_BOT_TOKEN || secrets.GITHUB_TOKEN }}

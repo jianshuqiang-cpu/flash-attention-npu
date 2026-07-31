@@ -16,7 +16,7 @@
 #   CI_EXAMPLE_CASE_FILTER   (默认空)      只跑指定 case name (逗号分隔)
 #   CI_CONTAINER_DEVICE      (默认 0)      容器内逻辑设备号
 #   CI_DOCKER_PRIVILEGED     (默认 true)   是否带 --privileged
-#   CI_DOCKER_IMAGE          (默认 fla-npu-ci:8.5.0-910b)
+#   CI_DOCKER_IMAGE          (默认 fla-npu-ci:9.1.0)
 #   CI_SKIP_BUILD            (默认 false)  true=跳过阶段1 (已有 build/ 产物)
 #   CI_NPU_LOCK_DIR          (默认 /tmp)
 #   CI_NPU_MAX_RETRIES       (默认 3)      测试失败后最多换卡重试次数
@@ -32,7 +32,7 @@ CI_RUN_EXAMPLE_ST="${CI_RUN_EXAMPLE_ST:-true}"
 CI_EXAMPLE_CASE_FILTER="${CI_EXAMPLE_CASE_FILTER:-}"
 CI_CONTAINER_DEVICE="${CI_CONTAINER_DEVICE:-0}"
 CI_DOCKER_PRIVILEGED="${CI_DOCKER_PRIVILEGED:-true}"
-CI_DOCKER_IMAGE="${CI_DOCKER_IMAGE:-fla-npu-ci:8.5.0-910b}"
+CI_DOCKER_IMAGE="${CI_DOCKER_IMAGE:-fla-npu-ci:9.1.0}"
 CI_SKIP_BUILD="${CI_SKIP_BUILD:-false}"
 CI_NPU_LOCK_DIR="${CI_NPU_LOCK_DIR:-/tmp}"
 
@@ -153,32 +153,42 @@ main() {
   fi
 
   local max_retries="${CI_NPU_MAX_RETRIES:-3}"
-  local attempt=0 test_passed=false rc
+  local attempt=0 test_passed=false rc any_failure
 
-  while IFS= read -r id; do
-    [ -z "$id" ] && continue
-    set +e
-    acquire_lock_and_run_test "$id"
-    rc=$?
-    set -e
-    if [ "$rc" -eq 0 ]; then
-      test_passed=true
-      break
-    fi
-    if [ "$rc" -eq 2 ]; then
-      attempt=$((attempt + 1))
-      log "test FAILED on physical device=$id (attempt $attempt/$max_retries)"
-      if [ "$attempt" -ge "$max_retries" ]; then
-        die "test failed after $attempt retries (CI_NPU_MAX_RETRIES=$max_retries); aborting CI"
+  # 外层循环: 一轮候选卡走完若仍失败 (且还有重试次数), 重新遍历候选卡再试。
+  # 否则单卡场景下内层循环只走一次, 失败一次就直接 abort, CI_NPU_MAX_RETRIES 形同虚设。
+  while [ "$test_passed" != "true" ]; do
+    any_failure=false
+    while IFS= read -r id; do
+      [ -z "$id" ] && continue
+      set +e
+      acquire_lock_and_run_test "$id"
+      rc=$?
+      set -e
+      if [ "$rc" -eq 0 ]; then
+        test_passed=true
+        break
       fi
-      log "retrying on next available NPU..."
-    fi
-    # rc=1 表示没拿到锁, 不计入重试, 直接试下一张
-  done <<< "$cands"
+      if [ "$rc" -eq 2 ]; then
+        any_failure=true
+        attempt=$((attempt + 1))
+        log "test FAILED on physical device=$id (attempt $attempt/$max_retries)"
+        if [ "$attempt" -ge "$max_retries" ]; then
+          die "test failed after $attempt attempts (CI_NPU_MAX_RETRIES=$max_retries); aborting CI"
+        fi
+        log "retrying on next available NPU..."
+      fi
+      # rc=1 表示没拿到锁, 不计入重试, 直接试下一张
+    done <<< "$cands"
 
-  if [ "$test_passed" != "true" ]; then
-    die "no available NPU device to run test (all locked or retries exhausted); aborting CI"
-  fi
+    if [ "$test_passed" != "true" ]; then
+      if [ "$any_failure" != "true" ]; then
+        # 整轮全是 rc=1 (没拿到锁), 没有任何卡可跑, 不重试
+        die "no available NPU device to run test (all locked); aborting CI"
+      fi
+      log "all candidates exhausted this round, retrying (attempt $attempt/$max_retries)..."
+    fi
+  done
 
   total_end="$(date +%s)"
   log "CI end: $(date '+%Y-%m-%d %H:%M:%S') (total=$((total_end - total_start))s)"
