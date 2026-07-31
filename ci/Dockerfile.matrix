@@ -56,24 +56,45 @@ RUN set -eux; \
 # 2. Python 包管理工具
 RUN python3 -m pip install --upgrade pip wheel setuptools
 
-# 3. torch: x86_64 下载指定 cpu wheel 安装 (URL 含 %2B, URL 编码的 +);
-#    aarch64 无官方 +cpu wheel, 走 pip 从 PyPI 安装 manylinux aarch64 wheel。
+# 2.5 拷入预下载的 wheel 缓存 (来自构建上下文的 wheels/ 目录; 空目录也无妨)。
+#     step 3/4 会先查 /wheels/ 有无目标 wheel, 有则用, 无则 wget。
+COPY wheels/ /wheels/
+
+# 3. torch: x86_64 优先用 /wheels/ 下预下载的 wheel (省下载), 没有再 wget。
+#    注意: 真实文件名含 '+' (如 torch-2.9.0+cpu-...), URL 里 '+' 编码为 '%2B'。
+#    pip 按文件名解析 wheel 元数据, 必须保留原始文件名, 不能改名成 torch.whl。
+#    aarch64 无官方 +cpu wheel, 走 pip 从 PyPI 安装。
 RUN cd /tmp && \
     if [ "${ARCH}" = "x86_64" ]; then \
-      wget -q -O torch.whl \
-        "https://download.pytorch.org/whl/cpu/torch-${TORCH_VER}%2Bcpu-${PY_TAG}-${PY_TAG}-manylinux_2_28_x86_64.whl" && \
-      python3 -m pip install --no-cache-dir torch.whl && \
-      rm -f torch.whl; \
+      torch_fname="torch-${TORCH_VER}+cpu-${PY_TAG}-${PY_TAG}-manylinux_2_28_x86_64.whl"; \
+      if [ -f "/wheels/${torch_fname}" ]; then \
+        echo "[torch] using cached /wheels/${torch_fname}"; \
+        python3 -m pip install --no-cache-dir "/wheels/${torch_fname}"; \
+      else \
+        echo "[torch] downloading (not in cache)"; \
+        wget -q -O "${torch_fname}" \
+          "https://download.pytorch.org/whl/cpu/torch-${TORCH_VER}%2Bcpu-${PY_TAG}-${PY_TAG}-manylinux_2_28_x86_64.whl" && \
+        python3 -m pip install --no-cache-dir "${torch_fname}" && \
+        rm -f "${torch_fname}"; \
+      fi; \
     else \
       python3 -m pip install --no-cache-dir "torch==${TORCH_VER}"; \
     fi
 
-# 4. torch_npu (按 PY_TAG + ARCH + gitcode release tag)
+# 4. torch_npu (按 PY_TAG + ARCH + gitcode release tag); 优先用 /wheels/ 下缓存。
+#    同理保留原始文件名供 pip 解析。
 RUN cd /tmp && \
-    wget -q -O torch_npu.whl \
-      "https://gitcode.com/Ascend/pytorch/releases/download/${TORCH_NPU_RELEASE}/torch_npu-${TORCH_NPU_VER}-${PY_TAG}-${PY_TAG}-manylinux_2_28_${ARCH}.whl" && \
-    python3 -m pip install --no-cache-dir torch_npu.whl && \
-    rm -f torch_npu.whl
+    npu_whl="torch_npu-${TORCH_NPU_VER}-${PY_TAG}-${PY_TAG}-manylinux_2_28_${ARCH}.whl"; \
+    if [ -f "/wheels/${npu_whl}" ]; then \
+      echo "[torch_npu] using cached /wheels/${npu_whl}"; \
+      python3 -m pip install --no-cache-dir "/wheels/${npu_whl}"; \
+    else \
+      echo "[torch_npu] downloading (not in cache)"; \
+      wget -q -O "${npu_whl}" \
+        "https://gitcode.com/Ascend/pytorch/releases/download/${TORCH_NPU_RELEASE}/${npu_whl}" && \
+      python3 -m pip install --no-cache-dir "${npu_whl}" && \
+      rm -f "${npu_whl}"; \
+    fi
 
 # 5. 编译/测试所需 Python 包 (本仓不依赖 triton)
 RUN python3 -m pip install --no-cache-dir \
