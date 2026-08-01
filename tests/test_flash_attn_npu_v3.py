@@ -12,19 +12,12 @@ else:
 
 def group_matmul(head, kv_head, left, right, high_prec = 1):
     group_num = head // kv_head
-    score = None
-    for i in range(kv_head):
-        if high_prec == 0:
-            group_score = torch.matmul(left[i * group_num:(i + 1) * group_num, :, :].to(torch.float32),
-                                        right[i:(i + 1), :, :].to(torch.float32)).to(torch.float32)
-        else:
-            group_score = torch.matmul(left[i * group_num:(i + 1) * group_num, :, :].to(torch.float32),
-                                        right[i:(i + 1), :, :].to(torch.float32))
-        if score is None:
-            score = group_score
-        else:
-            score = torch.cat((score, group_score), 0)
-    return score
+    left_f32 = left.to(torch.float32)
+    right_f32 = right.to(torch.float32)
+    left_grouped = left_f32.view(kv_head, group_num, *left_f32.shape[1:])
+    score = torch.matmul(left_grouped, right_f32.unsqueeze(1))
+    score = score.reshape(head, *score.shape[2:])
+    return score.to(torch.float32)
 
 def softmax1(
     qk_result,
@@ -62,7 +55,7 @@ def qkMM1(
         if result is None:
             result = result_split
         else:
-            result = result + result_split
+            result += result_split
     return result
 
 def pvMM2(
@@ -81,7 +74,7 @@ def pvMM2(
         if result is None:
             result = result_split
         else:
-            result = result + result_split
+            result += result_split
     return result
 
 def ref_flash_attention(
@@ -93,20 +86,15 @@ def ref_flash_attention(
     data_type,
     softcap,
     ):
-    inner_prec = 0
-    interm_dtype = torch.float16 if inner_prec == 1 else torch.float32
+    interm_dtype = torch.float32
     query = query.permute(1, 0, 2)
     key = key.permute(1, 2, 0)
     value = value.permute(1, 0, 2)
-    scale = torch.tensor(scale)
-    scale = scale.to(torch.float16) if inner_prec == 1 else scale.to(torch.float32)
     context_len = key.shape[2]
     context_size = 512
-    group_num = query.shape[0] // key.shape[0]
     gl = None
-    gl_high = None
     go = None
-    go_high = None
+    gm = None
     if mask is not None:
         mask = mask.cpu()
     for kv_start in range(0, context_len, context_size):
@@ -124,12 +112,8 @@ def ref_flash_attention(
             qk_result = softcap * torch.tanh(qk_result / softcap)
         if mask is not None:
             qk_result += sub_mask
-        if kv_start == 0:
-            gm = None
         p_result, row_sum, dm, gm = softmax1(qk_result, kv_start == 0, gm, interm_dtype)
         p_result = p_result.to(data_type)
-        if kv_start == 0:
-            gm_high = None
         lo = pvMM2(p_result, sub_value).to(interm_dtype)
         if kv_start == 0:
             gl = row_sum
@@ -144,6 +128,57 @@ def ref_flash_attention(
     go = go.permute(1, 0, 2)
     lse = torch.squeeze((torch.log(gl) + gm), dim=-1).to(torch.float32)
     return go.to(data_type), lse
+
+def create_binary_matrix(qSeqlen, kvSeqlen, preToken, nextToken):
+    preToken = kvSeqlen - qSeqlen - preToken
+    nextToken = kvSeqlen - qSeqlen + nextToken
+    rows = torch.arange(qSeqlen).unsqueeze(1)
+    cols = torch.arange(kvSeqlen).unsqueeze(0)
+    diff = cols - rows
+    matrix = (diff < preToken) | (diff > nextToken)
+    return matrix
+
+def resolve_window_golden(window_size_left, window_size_right, q_seqlen, kv_seqlen, is_causal):
+    window_size_left_golden = window_size_left
+    window_size_right_golden = window_size_right
+    if kv_seqlen > 0 and window_size_left_golden >= kv_seqlen - 1:
+        window_size_left_golden = -1
+    if q_seqlen > 0 and window_size_right_golden >= q_seqlen - 1:
+        window_size_right_golden = -1
+    if is_causal:
+        window_size_right_golden = 0
+    is_causal_golden = (window_size_left_golden < 0 and window_size_right_golden == 0)
+    is_local_golden = (window_size_left_golden >= 0 or window_size_right_golden > 0) and not is_causal_golden
+    return window_size_left_golden, window_size_right_golden, is_causal_golden, is_local_golden
+
+def apply_swa_correction(out, golden_lse, q_seqlen, kv_seqlen, window_size_left_golden, window_size_right_golden, is_local_golden):
+    if is_local_golden:
+        preTokens = window_size_left_golden
+        nextTokens = window_size_right_golden
+        preTokensChange = preTokens - kv_seqlen + q_seqlen
+        nextTokensChange = nextTokens + kv_seqlen - q_seqlen
+        nextTokensError = -nextTokensChange if nextTokensChange < 0 else 0
+        preTokensError = (q_seqlen - kv_seqlen - preTokensChange) if q_seqlen > kv_seqlen + preTokensChange else 0
+        actualSeq = q_seqlen
+        actualSeq -= nextTokensError
+        actualSeq -= preTokensError
+        if actualSeq != q_seqlen:
+            if nextTokensError != 0:
+                actualSeq = q_seqlen - actualSeq
+                out[ :actualSeq, :, :] = 0
+                golden_lse[:, :actualSeq] = torch.inf
+            elif preTokensError != 0:
+                actualSeq = actualSeq
+                out[actualSeq:, :, :] = 0
+                golden_lse[:, actualSeq:] = torch.inf
+
+def reconstruct_paged_kv(key_cache_cpu, value_cache_cpu, block_table, kv_seqlen, block_size):
+    token_idx = torch.arange(kv_seqlen)
+    block_numbers = block_table[token_idx // block_size].long()
+    block_offsets = (token_idx % block_size).long()
+    key_cache_per_batch = key_cache_cpu[block_numbers, block_offsets]
+    value_cache_per_batch = value_cache_cpu[block_numbers, block_offsets]
+    return key_cache_per_batch, value_cache_per_batch
 
 test_cases = [
     # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode,
@@ -351,16 +386,7 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     new_kv_seqlen_list = None
     new_q_seqlen_list_cpu = None
     new_kv_seqlen_list_cpu = None
-    window_size_left_golden = window_size_left
-    window_size_right_golden = window_size_right
-    if kv_seqlen > 0 and window_size_left_golden >= kv_seqlen - 1:
-        window_size_left_golden = -1
-    if q_seqlen > 0 and window_size_right_golden >= q_seqlen - 1:
-        window_size_right_golden = -1
-    if is_causal:
-        window_size_right_golden = 0
-    is_causal_golden = (window_size_left_golden < 0 and window_size_right_golden == 0)
-    is_local_golden = (window_size_left_golden >= 0 or window_size_right_golden > 0) and not is_causal_golden
+    window_size_left_golden, window_size_right_golden, is_causal_golden, is_local_golden = resolve_window_golden(window_size_left, window_size_right, q_seqlen, kv_seqlen, is_causal)
     if layout == "TND":
         new_q_seqlen_list_cpu = [0]
         pre_seq_sum = 0
@@ -408,18 +434,6 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         return_softmax_lse=True
     )
 
-    def create_binary_matrix(qSeqlen, kvSeqlen, preToken, nextToken):
-        preToken = kvSeqlen - qSeqlen - preToken
-        nextToken = kvSeqlen - qSeqlen + nextToken
-        matrix = [[0 for _ in range(kvSeqlen)] for _ in range(qSeqlen)]
-        for i in range(qSeqlen):
-            for j in range(kvSeqlen):
-                is_below_pretoken_line = (-i + j) < preToken
-                is_above_nexttoken_line = (-i + j) > nextToken
-                if is_below_pretoken_line or is_above_nexttoken_line:
-                    matrix[i][j] = 1
-        return torch.tensor(matrix, dtype=torch.bool)
-
     golden_out = None
     golden_out = None
     if layout == "BSND":
@@ -428,6 +442,9 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     else:
         golden_out = torch.empty((t_q_sum, num_heads, head_size), dtype=data_type)
         golden_lseL = torch.empty((num_heads, t_q_sum), dtype=torch.float32)
+    key_cache_cpu = key_cache.detach().cpu()
+    value_cache_cpu = value_cache.detach().cpu()
+    query_cpu_all = query.detach().cpu()
     for i in range(batch_size):
         q_seqlen_per_batch = q_sequences[i]
         kv_seqlen_per_batch = kv_sequences[i]
@@ -443,74 +460,27 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         elif is_local_golden:
             atten_mask = create_binary_matrix(q_seqlen_per_batch, kv_seqlen_per_batch, window_size_left_golden, window_size_right_golden)
         if layout == "BSND":
-            query_cpu_per_batch = query.detach().cpu()[i]
+            query_cpu_per_batch = query_cpu_all[i]
             if cache_mode == 1:
-                keys = []
-                values = []
                 block_table = block_tables.cpu()[i]
-                key_cache_cpu = key_cache.detach().cpu()
-                value_cache_cpu = value_cache.detach().cpu()
-                for j in range(kv_seqlen_per_batch):
-                    block_number = int(block_table[j // block_size])
-                    block_offset = j % block_size
-                    k = key_cache_cpu[block_number, block_offset, :, :]
-                    k = k.reshape(kv_heads, head_size)
-                    keys.append(k)
-                    v = value_cache_cpu[block_number, block_offset, :, :]
-                    v = v.reshape(kv_heads, head_size)
-                    values.append(v)
-                key_cache_per_batch = torch.stack(keys, dim=0)
-                value_cache_per_batch = torch.stack(values, dim=0)
+                key_cache_per_batch, value_cache_per_batch = reconstruct_paged_kv(key_cache_cpu, value_cache_cpu, block_table, kv_seqlen_per_batch, block_size)
             else:
-                key_cache_per_batch = key_cache.detach().cpu()[i]
-                value_cache_per_batch = value_cache.detach().cpu()[i]
+                key_cache_per_batch = key_cache_cpu[i]
+                value_cache_per_batch = value_cache_cpu[i]
         else:
-            query_cpu_per_batch = query.detach().cpu()[new_q_seqlen_list_cpu[i] : new_q_seqlen_list_cpu[i + 1]]
+            query_cpu_per_batch = query_cpu_all[new_q_seqlen_list_cpu[i] : new_q_seqlen_list_cpu[i + 1]]
             if cache_mode == 0:
-                key_cache_per_batch = key_cache.detach().cpu()[new_kv_seqlen_list_cpu[i] : new_kv_seqlen_list_cpu[i + 1]]
-                value_cache_per_batch = value_cache.detach().cpu()[new_kv_seqlen_list_cpu[i] : new_kv_seqlen_list_cpu[i + 1]]
+                key_cache_per_batch = key_cache_cpu[new_kv_seqlen_list_cpu[i] : new_kv_seqlen_list_cpu[i + 1]]
+                value_cache_per_batch = value_cache_cpu[new_kv_seqlen_list_cpu[i] : new_kv_seqlen_list_cpu[i + 1]]
             else:
-                keys = []
-                values = []
                 block_table = block_tables.cpu()[i]
-                key_cache_cpu = key_cache.detach().cpu()
-                value_cache_cpu = value_cache.detach().cpu()
-                for j in range(kv_seqlen_per_batch):
-                    block_number = int(block_table[j // block_size])
-                    block_offset = j % block_size
-                    k = key_cache_cpu[block_number, block_offset, :, :]
-                    k = k.reshape(kv_heads, head_size)
-                    keys.append(k)
-                    v = value_cache_cpu[block_number, block_offset, :, :]
-                    v = v.reshape(kv_heads, head_size)
-                    values.append(v)
-                key_cache_per_batch = torch.stack(keys, dim=0)
-                value_cache_per_batch = torch.stack(values, dim=0)
+                key_cache_per_batch, value_cache_per_batch = reconstruct_paged_kv(key_cache_cpu, value_cache_cpu, block_table, kv_seqlen_per_batch, block_size)
         if atten_mask is not None:
             output, golden_lse = ref_flash_attention(query_cpu_per_batch, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type, softcap)
         else:
             output, golden_lse = ref_flash_attention(query_cpu_per_batch, key_cache_per_batch, value_cache_per_batch, scale, None, data_type, softcap)
         out = output.reshape(q_seqlen_per_batch, num_heads, head_size)
-        if is_local_golden:
-            preTokens = window_size_left_golden
-            nextTokens = window_size_right_golden
-            preTokensChange = preTokens - kv_seqlen_per_batch + q_seqlen_per_batch
-            nextTokensChange = nextTokens + kv_seqlen_per_batch - q_seqlen_per_batch
-            nextTokensError = -nextTokensChange if nextTokensChange < 0 else 0
-            preTokensError = (
-                q_seqlen_per_batch - kv_seqlen_per_batch - preTokensChange
-            ) if q_seqlen_per_batch > kv_seqlen_per_batch + preTokensChange else 0
-            actualSeq = q_seqlen_per_batch
-            actualSeq -= nextTokensError
-            actualSeq -= preTokensError
-            if actualSeq != q_seqlen_per_batch:
-                if nextTokensError != 0:
-                    actualSeq = q_seqlen_per_batch - actualSeq
-                    out[ :actualSeq, :, :] = 0
-                    golden_lse[:, :actualSeq] = torch.inf
-                elif preTokensError != 0:
-                    out[actualSeq:, :, :] = 0
-                    golden_lse[:, actualSeq:] = torch.inf
+        apply_swa_correction(out, golden_lse, q_seqlen_per_batch, kv_seqlen_per_batch, window_size_left_golden, window_size_right_golden, is_local_golden)
         if layout == "BSND":
             golden_out[i:i+1] = out
             golden_lseL[i:i+1] = golden_lse.reshape(1, num_heads, q_seqlen_per_batch)
@@ -522,6 +492,7 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     torch.testing.assert_close(out_out.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
     if "Ascend910" in name:
         torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
+
 
 test_cases = [
     # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap)
@@ -580,10 +551,13 @@ def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen,
     atten_mask = None
     if is_causal:
         atten_mask = torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=1).bool()
+    key_cache_cpu = key_cache.detach().cpu()
+    value_cache_cpu = value_cache.detach().cpu()
+    query_cpu_all = query.detach().cpu()
     for i in range(batch_size):
-        key_cache_per_batch = key_cache.detach().cpu()[i]
-        value_cache_per_batch = value_cache.detach().cpu()[i]
-        query_cpu = query.detach().cpu()[i]
+        key_cache_per_batch = key_cache_cpu[i]
+        value_cache_per_batch = value_cache_cpu[i]
+        query_cpu = query_cpu_all[i]
         if is_causal:
             output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type, softcap)
         else:
@@ -645,16 +619,7 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     max_seqlen_q = q_seqlen
     max_seqlen_k = kv_seqlen
     scale = 1.0 / (head_size ** 0.5)
-    window_size_left_golden = window_size_left
-    window_size_right_golden = window_size_right
-    if kv_seqlen > 0 and window_size_left_golden >= kv_seqlen - 1:
-        window_size_left_golden = -1
-    if q_seqlen > 0 and window_size_right_golden >= q_seqlen - 1:
-        window_size_right_golden = -1
-    if is_causal:
-        window_size_right_golden = 0
-    is_causal_golden = (window_size_left_golden < 0 and window_size_right_golden == 0)
-    is_local_golden = (window_size_left_golden >= 0 or window_size_right_golden > 0) and not is_causal_golden
+    window_size_left_golden, window_size_right_golden, is_causal_golden, is_local_golden = resolve_window_golden(window_size_left, window_size_right, q_seqlen, kv_seqlen, is_causal)
 
     output_npu, softmax_lse = flash_attn_varlen_func(
         query,
@@ -674,50 +639,24 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     golden_lseL = torch.empty((num_heads, batch_size * q_seqlen), dtype=torch.float32)
     atten_mask = None
 
-    def create_binary_matrix(qSeqlen, kvSeqlen, preToken, nextToken):
-        preToken = kvSeqlen - qSeqlen - preToken
-        nextToken = kvSeqlen - qSeqlen + nextToken
-        matrix = [[0 for _ in range(kvSeqlen)] for _ in range(qSeqlen)]
-        for i in range(qSeqlen):
-            for j in range(kvSeqlen):
-                is_below_pretoken_line = (-i + j) < preToken
-                is_above_nexttoken_line = (-i + j) > nextToken
-                if is_below_pretoken_line or is_above_nexttoken_line:
-                    matrix[i][j] = 1
-        return torch.tensor(matrix, dtype=torch.bool)
-
     if is_causal_golden:
         atten_mask = (torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=kv_seqlen - q_seqlen + 1)).to(torch.bool)
     elif is_local_golden:
         atten_mask = create_binary_matrix(q_seqlen, kv_seqlen, window_size_left_golden, window_size_right_golden)
 
+    key_cpu = key.detach().cpu()
+    value_cpu = value.detach().cpu()
+    query_cpu_all = query.detach().cpu()
     for i in range(1, batch_size + 1):
-        key_per_batch = key.detach().cpu()[(i - 1) * kv_seqlen : i * kv_seqlen]
-        value_per_batch = value.detach().cpu()[(i - 1) * kv_seqlen : i * kv_seqlen]
-        query_cpu = query.detach().cpu()[(i - 1) * q_seqlen : i * q_seqlen]
+        key_per_batch = key_cpu[(i - 1) * kv_seqlen : i * kv_seqlen]
+        value_per_batch = value_cpu[(i - 1) * kv_seqlen : i * kv_seqlen]
+        query_cpu = query_cpu_all[(i - 1) * q_seqlen : i * q_seqlen]
         if is_causal_golden or is_local_golden:
             output, golden_lse = ref_flash_attention(query_cpu, key_per_batch, value_per_batch, scale, atten_mask, data_type, softcap)
         else:
             output, golden_lse = ref_flash_attention(query_cpu, key_per_batch, value_per_batch, scale, None, data_type, softcap)
         out = output.reshape(q_seqlen, num_heads, head_size)
-        if is_local_golden:
-            preTokens = window_size_left_golden
-            nextTokens = window_size_right_golden
-            preTokensChange = preTokens - kv_seqlen + q_seqlen
-            nextTokensChange = nextTokens + kv_seqlen - q_seqlen
-            nextTokensError = -nextTokensChange if nextTokensChange < 0 else 0
-            preTokensError = (q_seqlen - kv_seqlen - preTokensChange) if q_seqlen > kv_seqlen + preTokensChange else 0
-            actualSeq = q_seqlen
-            actualSeq -= nextTokensError
-            actualSeq -= preTokensError
-            if actualSeq != q_seqlen:
-                if nextTokensError != 0:
-                    actualSeq = q_seqlen - actualSeq
-                    out[ :actualSeq, :, :] = 0
-                    golden_lse[:, :actualSeq] = torch.inf
-                elif preTokensError != 0:
-                    out[actualSeq:, :, :] = 0
-                    golden_lse[:, actualSeq:] = torch.inf
+        apply_swa_correction(out, golden_lse, q_seqlen, kv_seqlen, window_size_left_golden, window_size_right_golden, is_local_golden)
         golden_out[(i - 1) * q_seqlen : i * q_seqlen] = out
         golden_lseL[:, (i - 1) * q_seqlen : i * q_seqlen] = golden_lse.reshape(num_heads, q_seqlen)
     rtol = 1e-2

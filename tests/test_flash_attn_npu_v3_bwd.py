@@ -186,7 +186,7 @@ def test_fa_bsnd_bwd(
     assert_bwd_results(*results)
 
 
-test_cases_bsnd_swa = [
+test_cases_bsd_swa = [
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 0, 0.0),
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 256, 0.0),
     (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, -128, 864, 0.0),
