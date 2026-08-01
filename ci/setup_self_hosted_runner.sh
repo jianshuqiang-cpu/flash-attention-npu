@@ -71,19 +71,23 @@ fi
 mkdir -p "$RUNNER_ROOT"
 cd "$RUNNER_ROOT"
 
-# 1. 下载并解压 runner (若已存在则跳过)
-if [ ! -x "./run.sh" ]; then
+# 1. 下载并解压 runner (已解压则跳过; 已有 tar 包则直接解压; 否则下载)
+if [ -x "./run.sh" ]; then
+  log "runner already extracted at $RUNNER_ROOT, skip download"
+else
   pkg="actions-runner-linux-${runner_arch}-${RUNNER_VERSION}.tar.gz"
   url="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${pkg}"
-  log "downloading $url"
-  if ! curl -fL -o "$pkg" "$url"; then
-    die "download failed; check network/proxy to github.com"
+  if [ -f "$pkg" ]; then
+    log "found existing $pkg, skip download"
+  else
+    log "downloading $url"
+    if ! curl -fL -o "$pkg" "$url"; then
+      die "download failed; check network/proxy to github.com"
+    fi
   fi
   tar xzf "$pkg"
-  rm -f "$pkg"
+  # 保留 tar 包, 下次重装/换目录时可复用 (不删)
   log "extracted runner to $RUNNER_ROOT"
-else
-  log "runner already present at $RUNNER_ROOT, skip download"
 fi
 
 # 2. 配置 (带 --replace 替换同名 runner)
