@@ -63,13 +63,26 @@ while IFS= read -r line; do
 done < <(read_combos)
 [ "${#COMBOS[@]}" -gt 0 ] || die "no combo in $MATRIX_FILE"
 
+# 从 combo 行解析镜像名: 若第 8 列 (image) 非空则直接用该镜像 (预构建), 否则用 $IMAGE_PREFIX:$name
+combo_image() {
+  local line="$1" name img
+  name="${line%%|*}"
+  img="$(printf '%s' "$line" | awk -F'|' '{print $8}')"
+  if [ -n "$img" ]; then
+    printf '%s\n' "$img"
+  else
+    printf '%s\n' "${IMAGE_PREFIX}:${name}"
+  fi
+}
+
 mkdir -p "$LOG_DIR"
 
 # 检查镜像是否都已构建
 missing=()
 for line in "${COMBOS[@]}"; do
   name="${line%%|*}"
-  docker image inspect "$IMAGE_PREFIX:$name" >/dev/null 2>&1 || missing+=("$name")
+  img="$(combo_image "$line")"
+  docker image inspect "$img" >/dev/null 2>&1 || missing+=("$name ($img)")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
   die "missing matrix images: ${missing[*]}; run 'bash ci/build_matrix_images.sh' first"
@@ -85,23 +98,25 @@ log "logs dir: $LOG_DIR"
 
 # ---------- 1. 预初始化子模块 (单容器一次) ----------
 first_name="${COMBOS[0]%%|*}"
-log "pre-init submodule csrc/catlass (once, via $IMAGE_PREFIX:$first_name)"
+first_img="$(combo_image "${COMBOS[0]}")"
+log "pre-init submodule csrc/catlass (once, via $first_img)"
 docker run --rm \
   "${privileged_args[@]}" \
   --network host \
   -v "$REPO_ROOT:/workspace/flash-attention-npu" \
   -w /workspace/flash-attention-npu \
-  "$IMAGE_PREFIX:$first_name" \
+  "$first_img" \
   bash -lc 'git config --global --add safe.directory "*" && git submodule update --init --recursive csrc/catlass' \
   || die "submodule pre-init failed"
 
 # ---------- 2. 每个 combo 一个容器, 并发编译 ----------
 build_one() {
-  local line="$1" name logf rc
+  local line="$1" name logf rc img
   name="${line%%|*}"
+  img="$(combo_image "$line")"
   logf="$LOG_DIR/${name}.log"
   : > "$logf"
-  echo "[matrix-build] >>> $name -> $logf"
+  echo "[matrix-build] >>> $name ($img) -> $logf"
   set +e
   docker run --rm \
     "${privileged_args[@]}" \
@@ -111,7 +126,7 @@ build_one() {
     -e FLASH_ATTN_SKIP_SUBMODULE_INIT=1 \
     -e FLASH_ATTN_BUILD_VERSION="${FLASH_ATTN_BUILD_VERSION:-all}" \
     -w /workspace/flash-attention-npu \
-    "$IMAGE_PREFIX:$name" \
+    "$img" \
     bash -lc 'git config --global --add safe.directory "*" && python3 setup.py build --build-base=/tmp/build' \
     > "$logf" 2>&1
   rc=$?

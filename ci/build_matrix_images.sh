@@ -65,14 +65,19 @@ read_combos() {
 }
 
 build_one() {
-  local line="$1" name base_image py_tag torch_ver torch_npu_ver torch_npu_rel arch
-  IFS='|' read -r name base_image py_tag torch_ver torch_npu_ver torch_npu_rel arch <<< "$line"
+  local line="$1" name base_image py_tag torch_ver torch_npu_ver torch_npu_rel arch image
+  IFS='|' read -r name base_image py_tag torch_ver torch_npu_ver torch_npu_rel arch image <<< "$line"
   [ -n "$name" ] || return 0
   arch="${arch:-x86_64}"
   if [ "${#WANT[@]}" -gt 0 ]; then
     local hit=false w
     for w in "${WANT[@]}"; do [ "$w" = "$name" ] && { hit=true; break; }; done
     [ "$hit" = "true" ] || return 0
+  fi
+  # 第 8 列 (image) 非空: 该 combo 用预构建镜像, 跳过构建
+  if [ -n "$image" ]; then
+    log "skip $name: using prebuilt image '$image' (no build needed)"
+    return 0
   fi
   log "building $IMAGE_PREFIX:$name (base=$base_image torch=$torch_ver torch_npu=$torch_npu_ver py=$py_tag arch=$arch)"
 
