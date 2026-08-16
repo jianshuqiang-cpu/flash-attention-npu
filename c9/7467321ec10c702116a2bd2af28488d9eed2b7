@@ -1,0 +1,26 @@
+csrc/ascend910/flash_attn_npu/rescale_o.hpp
+  h_ef82bc50880103 669-670
+csrc/ascend910/flash_attn_npu_3/mha_fwd_kvcache.cpp
+  h_ef82bc50880103 560-564,566-569
+csrc/ascend910/flash_attn_npu_4/mha_fwd_kvcache.cpp
+  h_ef82bc50880103 561-565,567-570
+csrc/ascend910/flash_attn_npu_3/rescale_o.hpp
+  h_ef82bc50880103 669-670
+csrc/ascend910/flash_attn_npu/mha_fwd_kvcache.cpp
+  h_ef82bc50880103 556-560
+csrc/ascend910/flash_attn_npu_4/rescale_o_low_prec.hpp
+  h_ef82bc50880103 358-359
+csrc/ascend910/flash_attn_npu_4/rescale_o.hpp
+  h_ef82bc50880103 672-673
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "c97467321ec10c702116a2bd2af28488d9eed2b7",
+  "prompts": {},
+  "humans": {
+    "h_ef82bc50880103": {
+      "author": "jianshuqiang-npu <jianshuqiang@gmail.com>"
+    }
+  }
+}
