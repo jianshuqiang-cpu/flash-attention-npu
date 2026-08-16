@@ -1,0 +1,18 @@
+tests/test_flash_attn_npu_v3.py
+  h_c80f9240011ffc 218
+csrc/ascend950/flash_attn_npu_3/fai_kernel.cpp
+  h_c80f9240011ffc 313-316
+csrc/ascend950/flash_attn_npu_4/fai_kernel.cpp
+  h_c80f9240011ffc 320-323
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "d20b8ac61017e10612b363a50e7892c01ecf9cea",
+  "prompts": {},
+  "humans": {
+    "h_c80f9240011ffc": {
+      "author": "zhangwanhao <zhangwanhao1@huawei.com>"
+    }
+  }
+}
