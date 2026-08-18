@@ -1,0 +1,16 @@
+tests/test_flash_attn_npu_v4.py
+  h_ef82bc50880103 645,651-653
+tests/test_flash_attn_npu_v3.py
+  h_ef82bc50880103 795,801-803
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "ac5d19d061a88c08ad481a78f630e04cf40a9aac",
+  "prompts": {},
+  "humans": {
+    "h_ef82bc50880103": {
+      "author": "jianshuqiang-npu <jianshuqiang@gmail.com>"
+    }
+  }
+}
