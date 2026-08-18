@@ -1,0 +1,68 @@
+README.zh.md
+  h_c80f9240011ffc 75,77,83,86
+  s_f1f666b162edb2::t_546e61efba6876 76,78-82,84-85,87-89
+setup.py
+  s_8107ee9c855a4a::t_f0d56986afa844 254-255,260
+  s_8107ee9c855a4a::t_7f06fe06ab56b0 261-264,267
+  s_8107ee9c855a4a::t_b266860b9cd557 68-75
+  s_8107ee9c855a4a::t_16b1487395f94e 67,76
+  s_8107ee9c855a4a::t_df97ddea75dbe3 205-210
+  s_8107ee9c855a4a::t_a63a869c6cfa7b 211
+  s_8107ee9c855a4a::t_2a6a2c86522a5a 256-257
+  h_c80f9240011ffc 17,90-132,258-259,265-266,268,273-276,291-296,340,357-362,369-370,399-402,406-410
+  s_8107ee9c855a4a::t_7ffc311b36b345 212
+README.md
+  s_f1f666b162edb2::t_0e3f3bf828581e 74,76-80,82-83,85-87
+  h_c80f9240011ffc 73,75,81,84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "46914f4bcaa0a591ad44117fe99472ca9f1389c1",
+  "prompts": {},
+  "humans": {
+    "h_c80f9240011ffc": {
+      "author": "zhangwanhao <zhangwanhao1@huawei.com>"
+    }
+  },
+  "sessions": {
+    "s_8107ee9c855a4a": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a8335eea4623127ce9c7be7",
+        "model": "deepseek_v4_flash_official__max"
+      },
+      "human_author": "zhangwanhao <zhangwanhao1@huawei.com>",
+      "custom_attributes": {
+        "edit_kind": "bash",
+        "external_session_id": "6a8335eea4623127ce9c7be7",
+        "session_id": "6a8335eea4623127ce9c7be7",
+        "tool_use_id": "6a83be75a4623127ce9c7e02",
+        "tool_name": "RunCommand",
+        "operation_id": "6a83be75a4623127ce9c7e02",
+        "display_model_name": "DeepSeek-V4-Flash 正式版"
+      }
+    },
+    "s_f1f666b162edb2": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a844ce1a4623127ce9c835f",
+        "model": "DeepSeek-V4-Flash-Official"
+      },
+      "human_author": "zhangwanhao <zhangwanhao1@huawei.com>",
+      "custom_attributes": {
+        "tool_use_id": "6a844d8da4623127ce9c8379",
+        "client_type": "ide",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "session_id": "6a844ce1a4623127ce9c835f",
+        "operation_id": "6a844d8da4623127ce9c8379",
+        "source_scene": "agent",
+        "dedupe_key": "6a844ce1a4623127ce9c835f:6a844d8da4623127ce9c8379:afterEdit:2d8ca35a",
+        "tool_type": "builtin",
+        "edit_kind": "file_edit",
+        "runtime_client": "trae-tob-git-ai",
+        "external_session_id": "6a844ce1a4623127ce9c835f"
+      }
+    }
+  }
+}
