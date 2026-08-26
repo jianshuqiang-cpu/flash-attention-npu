@@ -1,0 +1,35 @@
+csrc/ascend950/flash_attn_npu_3/autogen/fai_dispatch_bf16_bsnd.cpp
+  s_ec4c95907093fe::t_08fa679b5344c4 5-9,12-13
+csrc/ascend950/flash_attn_npu_3/autogen/fai_dispatch_bf16_tnd.cpp
+  s_ec4c95907093fe::t_0681e1ba0c75be 5-9,12-13
+csrc/ascend950/flash_attn_npu_3/autogen/fai_dispatch_fp16_bsnd.cpp
+  s_ec4c95907093fe::t_5e5aacade2fef9 5-9,12-13
+csrc/ascend950/flash_attn_npu_3/autogen/fai_dispatch_fp16_tnd.cpp
+  s_ec4c95907093fe::t_274cec2ad1f44a 5-9,12-13
+csrc/ascend950/flash_attn_npu_4/autogen/fai_dispatch_bf16_bsnd.cpp
+  s_ec4c95907093fe::t_5659c7e3aa019c 5-9,12-13
+csrc/ascend950/flash_attn_npu_4/autogen/fai_dispatch_bf16_tnd.cpp
+  s_ec4c95907093fe::t_056281f322311f 5-9,12-13
+csrc/ascend950/flash_attn_npu_4/autogen/fai_dispatch_fp16_bsnd.cpp
+  s_ec4c95907093fe::t_a6fcdef175affc 5-9,12-13
+csrc/ascend950/flash_attn_npu_4/autogen/fai_dispatch_fp16_tnd.cpp
+  s_ec4c95907093fe::t_dfa8c547638c81 5-9,12-13
+csrc/ascend950/flash_attn_npu_4/autogen/generate_kernels.py
+  s_ec4c95907093fe::t_db99695e01ed28 55-56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "81ac461619cc41c6b846abf2cc23d307d49d3387",
+  "prompts": {},
+  "sessions": {
+    "s_ec4c95907093fe": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a8d4b0de3737b32dc33a65c",
+        "model": "qwen3.8-max__max"
+      },
+      "human_author": "jianshuqiang-npu <jianshuqiang@gmail.com>"
+    }
+  }
+}
