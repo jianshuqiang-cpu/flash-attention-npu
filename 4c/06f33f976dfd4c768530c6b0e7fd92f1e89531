@@ -1,0 +1,127 @@
+csrc/ascend910/flash_attn_npu/fag_epilogue_op.hpp
+  s_dda959121880ec::t_4bcde4e8c3d29b 17
+csrc/ascend950/flash_attn_npu_4/tilingdata.h
+  s_dda959121880ec::t_49b5636a4e2066 12-13
+csrc/ascend950/flash_attn_npu_3/tiling.cpp
+  s_dda959121880ec::t_abc096dc72f725 20
+csrc/ascend910/flash_attn_npu/fag_general_dispatch_impl.hpp
+  s_dda959121880ec::t_e08bb82a64ecf4 27
+csrc/ascend950/flash_attn_npu_4/mha_fwd.cpp
+  s_dda959121880ec::t_764ccc026c011b 28-29
+  s_dda959121880ec::t_2d82d8c9f0bdc6 307
+  s_dda959121880ec::t_9690c7b3bded48 27
+  s_dda959121880ec::t_aa03f5b70b288d 370
+  s_dda959121880ec::t_6aca1be9645b65 374
+csrc/ascend950/flash_attn_npu_3/tilingdata.h
+  s_dda959121880ec::t_799938bb5459cd 12-13
+csrc/ascend910/flash_attn_npu_3/bwd_dispatch_common.hpp
+  s_dda959121880ec::t_6f6d937faf0b1c 22
+  s_dda959121880ec::t_a2c4a39910900e 43
+csrc/ascend910/flash_attn_npu/mha_varlen_bwd.cpp
+  s_dda959121880ec::t_fbd7d416ffd13a 16
+csrc/ascend910/flash_attn_npu/fag_epilogue_sfmg.hpp
+  s_dda959121880ec::t_096fdcdc5a7fb6 17
+csrc/ascend910/flash_attn_npu_4/fag_tiling.cpp
+  s_dda959121880ec::t_dff746b01ddb03 3
+csrc/ascend910/flash_attn_npu/fag_tiling.cpp
+  s_dda959121880ec::t_600e885ca78384 16
+csrc/ascend950/flash_attn_npu_4/tiling.cpp
+  s_dda959121880ec::t_31fa3ae25ed7c1 20
+csrc/ascend910/flash_attn_npu_3/fag_common/epilogue_fag_deterministic_add.hpp
+  s_dda959121880ec::t_83bdd7c95a38ad 11
+csrc/ascend950/flash_attn_npu_3/fwd_dispatch_impl.hpp
+  s_dda959121880ec::t_c002b34b783159 12
+  s_dda959121880ec::t_f1acda374d125f 1-11,13-94
+csrc/ascend910/flash_attn_npu_3/fag_kernel.cpp
+  s_dda959121880ec::t_2297ceaa7a99c1 16
+csrc/ascend950/flash_attn_npu_3/fwd_dispatch.hpp
+  s_dda959121880ec::t_3e13ec00ae9c05 1-62
+csrc/ascend950/flash_attn_npu_3/fwd_kernel.cpp
+  s_dda959121880ec::t_364448bba24dbf 40
+csrc/ascend910/flash_attn_npu/fag_kernel_common.hpp
+  s_dda959121880ec::t_fb97ffe1d7350e 1-2
+csrc/ascend950/flash_attn_npu_3/mha_fwd.cpp
+  s_dda959121880ec::t_3626c10a3b2f34 377
+  s_dda959121880ec::t_b771252e42343b 320
+  s_dda959121880ec::t_c6f98ee8d9af86 381
+  s_dda959121880ec::t_f2e18b2d18dd6b 25
+  s_dda959121880ec::t_5a995dca5309e6 26-27
+csrc/ascend910/flash_attn_npu_3/fag_tiling.cpp
+  s_dda959121880ec::t_abb5bb976b569d 3
+csrc/ascend910/flash_attn_npu_4/fag_common/epilogue_fag_deterministic_add.hpp
+  s_dda959121880ec::t_f560f44f91b57f 11
+csrc/ascend950/flash_attn_npu_3/autogen/generate_kernels.py
+  s_dda959121880ec::t_0ad48fae6d0e45 67
+  s_dda959121880ec::t_725ab46d4dc639 13,15
+  s_dda959121880ec::t_0c62f509a1d369 61
+  s_dda959121880ec::t_d09a90cd7849f6 45
+  s_dda959121880ec::t_8464d5ade284ce 54-55
+csrc/ascend950/flash_attn_npu_4/fwd_dispatch_impl.hpp
+  s_dda959121880ec::t_2cd30afabbba01 12
+  s_dda959121880ec::t_adbf0a0cfb3cc0 11
+csrc/ascend910/flash_attn_npu/fag_epilogue_pre.hpp
+  s_dda959121880ec::t_4c1aeef326e082 17
+csrc/ascend950/flash_attn_npu_4/fwd_kernel.cpp
+  s_dda959121880ec::t_5fb77cdb3d2d19 40
+csrc/ascend910/flash_attn_npu_4/fag_kernel.cpp
+  s_dda959121880ec::t_de8238c19fa2d5 16
+csrc/ascend910/flash_attn_npu_3/bwd_dispatch.hpp
+  s_dda959121880ec::t_4ad37fe718e4a3 57
+csrc/ascend910/flash_attn_npu/fag_epilogue_post.hpp
+  s_dda959121880ec::t_6c6a62ae700c36 17
+csrc/ascend950/flash_attn_npu_4/autogen/generate_kernels.py
+  s_dda959121880ec::t_15c13c4d61ad49 61
+  s_dda959121880ec::t_e0dcc9b706e493 45
+  s_dda959121880ec::t_10b2d6333361db 67
+  s_dda959121880ec::t_193a1e8942938b 13,15
+  s_dda959121880ec::t_81362092dcef9a 54-55
+csrc/ascend910/flash_attn_npu_4/bwd_dispatch.hpp
+  s_dda959121880ec::t_4437001a975c80 57
+csrc/ascend950/flash_attn_npu_3/autogen/fwd_dispatch_bf16_bsnd.cpp
+  s_dda959121880ec::t_5c1f268aeec499 10,12
+csrc/ascend950/flash_attn_npu_3/autogen/fwd_dispatch_bf16_tnd.cpp
+  s_dda959121880ec::t_dccc01504ec8c3 10,12
+csrc/ascend950/flash_attn_npu_3/autogen/fwd_dispatch_fp16_bsnd.cpp
+  s_dda959121880ec::t_1c8638d32ca47f 10,12
+csrc/ascend950/flash_attn_npu_3/autogen/fwd_dispatch_fp16_tnd.cpp
+  s_dda959121880ec::t_ae39f29290f51a 10,12
+csrc/ascend950/flash_attn_npu_4/autogen/fwd_dispatch_bf16_bsnd.cpp
+  s_dda959121880ec::t_0a261463e271a1 10,12
+csrc/ascend950/flash_attn_npu_4/autogen/fwd_dispatch_bf16_tnd.cpp
+  s_dda959121880ec::t_129a84757f054c 10,12
+csrc/ascend950/flash_attn_npu_4/autogen/fwd_dispatch_fp16_bsnd.cpp
+  s_dda959121880ec::t_8a8a666a8e6ae6 10,12
+csrc/ascend950/flash_attn_npu_4/autogen/fwd_dispatch_fp16_tnd.cpp
+  s_dda959121880ec::t_565e09f1de571e 10,12
+csrc/ascend950/flash_attn_npu_4/fwd_dispatch.hpp
+  s_dda959121880ec::t_91258a7f99b382 6-7,35,37,40,43,45,49,51,55,57,62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "4c06f33f976dfd4c768530c6b0e7fd92f1e89531",
+  "prompts": {},
+  "sessions": {
+    "s_dda959121880ec": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a8e4befe3737b32dc33ab17",
+        "model": "qwen3.8-max"
+      },
+      "human_author": "jianshuqiang-npu <jianshuqiang@gmail.com>",
+      "custom_attributes": {
+        "edit_kind": "file_edit",
+        "source_scene": "agent",
+        "tool_type": "builtin",
+        "operation_id": "6a8eae25e3737b32dc33b059",
+        "tool_use_id": "6a8eae25e3737b32dc33b059",
+        "dedupe_key": "6a8e4befe3737b32dc33ab17:6a8eae25e3737b32dc33b059:afterEdit:ff0a545a",
+        "client_type": "ide",
+        "runtime_client": "trae-tob-git-ai",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "session_id": "6a8e4befe3737b32dc33ab17",
+        "external_session_id": "6a8e4befe3737b32dc33ab17"
+      }
+    }
+  }
+}
