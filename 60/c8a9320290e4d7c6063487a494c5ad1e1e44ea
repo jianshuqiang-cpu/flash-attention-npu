@@ -1,0 +1,16 @@
+csrc/ascend950/flash_attn_npu_3/mha_fwd.cpp
+  h_ef82bc50880103 273,320,323-324,368,370-371,376-378,381
+csrc/ascend950/flash_attn_npu_4/mha_fwd.cpp
+  h_ef82bc50880103 261,307,310-311,361,363-364,369-371,374
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "60c8a9320290e4d7c6063487a494c5ad1e1e44ea",
+  "prompts": {},
+  "humans": {
+    "h_ef82bc50880103": {
+      "author": "jianshuqiang-npu <jianshuqiang@gmail.com>"
+    }
+  }
+}
