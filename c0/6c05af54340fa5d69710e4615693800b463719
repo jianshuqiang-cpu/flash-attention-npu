@@ -1,0 +1,12 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "c06c05af54340fa5d69710e4615693800b463719",
+  "prompts": {},
+  "humans": {
+    "h_ef82bc50880103": {
+      "author": "jianshuqiang-npu <jianshuqiang@gmail.com>"
+    }
+  }
+}
