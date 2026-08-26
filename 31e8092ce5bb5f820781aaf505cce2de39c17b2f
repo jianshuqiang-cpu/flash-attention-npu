@@ -1,0 +1,14 @@
+tests/test_flash_attn_npu_v3.py
+  h_c80f9240011ffc 218
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "31e8092ce5bb5f820781aaf505cce2de39c17b2f",
+  "prompts": {},
+  "humans": {
+    "h_c80f9240011ffc": {
+      "author": "zhangwanhao <zhangwanhao1@huawei.com>"
+    }
+  }
+}

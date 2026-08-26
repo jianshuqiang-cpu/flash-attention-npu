@@ -1,0 +1,32 @@
+csrc/ascend910/flash_attn_npu_4/flash_api.cpp
+  h_ef82bc50880103 291
+csrc/ascend910/flash_attn_npu/mha_fwd_kvcache.cpp
+  h_ef82bc50880103 567
+csrc/ascend910/flash_attn_npu_4/init_outputs.hpp
+  h_ef82bc50880103 40,62-63,87,89-90,92-94,111,134-135
+csrc/ascend910/flash_attn_npu_3/init_outputs.hpp
+  h_ef82bc50880103 40,62-63,87,89-90,92-94,111,134-135
+csrc/ascend910/flash_attn_npu/flash_api.cpp
+  h_ef82bc50880103 532
+csrc/ascend910/flash_attn_npu_4/mha_fwd_kvcache.cpp
+  h_ef82bc50880103 568
+csrc/ascend910/flash_attn_npu/init_outputs.hpp
+  h_ef82bc50880103 46,68-69,93,95-96,98-100,117,140-141
+csrc/ascend910/flash_attn_npu_3/flash_api.cpp
+  h_ef82bc50880103 374
+csrc/ascend910/flash_attn_npu_3/mha_fwd_kvcache.cpp
+  h_ef82bc50880103 567
+tests/test_flash_attn_npu_v2.py
+  h_ef82bc50880103 171,421,696-716
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "4e1e708a96917650f356dc6dba39252960132738",
+  "prompts": {},
+  "humans": {
+    "h_ef82bc50880103": {
+      "author": "jianshuqiang-npu <jianshuqiang@gmail.com>"
+    }
+  }
+}

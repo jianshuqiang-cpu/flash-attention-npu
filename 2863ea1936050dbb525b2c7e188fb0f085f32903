@@ -1,0 +1,144 @@
+tests/npu_precision_utils.py
+  h_c80f9240011ffc 156
+csrc/ascend950/flash_attn_npu_3/init_outputs.hpp
+  h_c80f9240011ffc 1-84
+csrc/ascend950/flash_attn_npu_4/init_outputs.hpp
+  s_daff3d2608eeb2::t_f7dbc9c6ffad3c 61-62
+  h_c80f9240011ffc 40-41
+  s_64d8705a4ad5f2::t_228843ecff87c7 54-56
+  s_5de1b5fd3f2b9a::t_b6446a9b158b69 43-44
+  s_c48450699ea5d8::t_5b7f51b42883bd 72-73
+  s_c48450699ea5d8::t_cf3eac9738d56a 74-76
+tests/test_flash_attn_npu_v3.py
+  s_e9fcf62aed4c2b::t_9580aa9f5a2f11 342-346
+  s_e9fcf62aed4c2b::t_69e6d8a9215e50 370,492,545-554,761-768,797-798,801
+  s_e9fcf62aed4c2b::t_3e86624b5d303d 317,780-783,794-796
+  h_c80f9240011ffc 1-2,12,28,48,67,86,147,204,315,457,469,558-559,563,603,617,639-640,680,695,715,733,745,750,774-779,784-793,799
+  s_e9fcf62aed4c2b::t_a430ed9b4cd26e 318-320,339-341
+  s_e9fcf62aed4c2b::t_960117c6847610 347-349,367-369
+  s_e9fcf62aed4c2b::t_f4b6d380450de8 493-495,542-544
+tests/test_flash_attn_npu_v4.py
+  h_c80f9240011ffc 428,625-645,648,651
+  s_7cc8f770c1ddda::t_e507d30f800a90 221-235,237-254,256-260,262,265-269,272-276,279-283,286-290,293-297,300-304,307-311,314-318,321-325,328-332,335-339,342-351,354-363,366-370,373-377,380-384,387-396,400-401,409-410,517
+csrc/ascend950/flash_attn_npu_3/fai_kernel.cpp
+  h_c80f9240011ffc 35,105-106,209,216-222,309,311-319,323-337,594-595,653-654,679
+csrc/ascend950/flash_attn_npu_4/fai_kernel.cpp
+  h_c80f9240011ffc 344,601-602,660-661
+csrc/ascend950/flash_attn_npu_4/online_softmax_high_prec.hpp
+  s_7cc8f770c1ddda::t_34fd37271825d1 362,392-393,398-399,1295
+csrc/ascend950/flash_attn_npu_4/online_softmax_low_prec.hpp
+  s_7cc8f770c1ddda::t_0973ed4b2fdd5c 1-703
+csrc/ascend950/flash_attn_npu_4/rescale_o.hpp
+  s_7cc8f770c1ddda::t_b2e63a8c98cb76 110-111,155-161,797-798,814-818,831-832
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "2863ea1936050dbb525b2c7e188fb0f085f32903",
+  "prompts": {},
+  "humans": {
+    "h_c80f9240011ffc": {
+      "author": "zhangwanhao <zhangwanhao1@huawei.com>"
+    }
+  },
+  "sessions": {
+    "s_5de1b5fd3f2b9a": {
+      "agent_id": {
+        "tool": "trae-code-edit",
+        "id": "ai_tab-2026081613513401000215208460485B0",
+        "model": "default"
+      },
+      "human_author": null,
+      "custom_attributes": {
+        "source_scene": "cue",
+        "edit_kind": "file_edit",
+        "client_type": "ide",
+        "tool": "trae-code-edit",
+        "external_session_id": "2026081613513401000215208460485B0"
+      }
+    },
+    "s_64d8705a4ad5f2": {
+      "agent_id": {
+        "tool": "trae-code-edit",
+        "id": "ai_tab-202608161351530100031552207084E91",
+        "model": "default"
+      },
+      "human_author": null,
+      "custom_attributes": {
+        "source_scene": "cue",
+        "edit_kind": "file_edit",
+        "external_session_id": "202608161351530100031552207084E91",
+        "client_type": "ide",
+        "tool": "trae-code-edit"
+      }
+    },
+    "s_7cc8f770c1ddda": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a814efc1975bac4bb0a7565",
+        "model": "deepseek_v4_flash_official__dev"
+      },
+      "human_author": null,
+      "custom_attributes": {
+        "operation_id": "6a8150251975bac4bb0a75a0",
+        "edit_kind": "bash",
+        "session_id": "6a814efc1975bac4bb0a7565",
+        "external_session_id": "6a814efc1975bac4bb0a7565",
+        "tool_name": "RunCommand",
+        "display_model_name": "DeepSeek-V4-Flash 正式版",
+        "tool_use_id": "6a8150251975bac4bb0a75a0"
+      }
+    },
+    "s_c48450699ea5d8": {
+      "agent_id": {
+        "tool": "trae-code-edit",
+        "id": "ai_tab-202608161352040100031552205765926",
+        "model": "default"
+      },
+      "human_author": null,
+      "custom_attributes": {
+        "external_session_id": "202608161352040100031552205765926",
+        "tool": "trae-code-edit",
+        "edit_kind": "file_edit",
+        "source_scene": "cue",
+        "client_type": "ide"
+      }
+    },
+    "s_daff3d2608eeb2": {
+      "agent_id": {
+        "tool": "trae-code-edit",
+        "id": "ai_tab-20260816135158010003155221727380E",
+        "model": "default"
+      },
+      "human_author": null,
+      "custom_attributes": {
+        "source_scene": "cue",
+        "tool": "trae-code-edit",
+        "external_session_id": "20260816135158010003155221727380E",
+        "client_type": "ide",
+        "edit_kind": "file_edit"
+      }
+    },
+    "s_e9fcf62aed4c2b": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a8083ee1975bac4bb0a6951",
+        "model": "glm-5.2"
+      },
+      "human_author": "zhangwanhao <zhangwanhao1@huawei.com>",
+      "custom_attributes": {
+        "client_type": "ide",
+        "source_scene": "agent",
+        "edit_kind": "file_edit",
+        "session_id": "6a8083ee1975bac4bb0a6951",
+        "dedupe_key": "6a8083ee1975bac4bb0a6951:6a808cea1975bac4bb0a6a9c:afterEdit:e22acf83",
+        "operation_id": "6a808cea1975bac4bb0a6a9c",
+        "runtime_client": "trae-tob-git-ai",
+        "tool_type": "builtin",
+        "external_session_id": "6a8083ee1975bac4bb0a6951",
+        "tool_use_id": "6a808cea1975bac4bb0a6a9c",
+        "tool_id": "icube:applyChatSnapshotPatch"
+      }
+    }
+  }
+}

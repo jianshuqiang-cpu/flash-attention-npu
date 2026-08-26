@@ -1,0 +1,100 @@
+csrc/ascend950/flash_attn_npu_3/fai_tiling.cpp
+  h_c80f9240011ffc 171-172
+csrc/ascend950/flash_attn_npu_4/fai_tiling.cpp
+  h_c80f9240011ffc 171-172
+csrc/ascend950/flash_attn_npu_4/rescale_o.hpp
+  s_3b5afd767e3e59::t_9e475983aa9df0 668,671-688,690-694
+  s_3b5afd767e3e59::t_32e698c6663c4a 269,365,434,542,628
+  s_3b5afd767e3e59::t_d172da1daef0ea 139
+  s_3b5afd767e3e59::t_b5f4eccc172e2a 208,293,387,492,566
+  s_3b5afd767e3e59::t_65283da4f123f0 216-217,219-224
+  s_3b5afd767e3e59::t_21c83661df715d 266,362,431,539,625
+  s_3b5afd767e3e59::t_e2bb451a672c90 194,197
+  s_3b5afd767e3e59::t_aef09523476268 302-303,305-310
+  s_3b5afd767e3e59::t_c485b604b58175 374
+  s_3b5afd767e3e59::t_66a8fb2135e210 228-229,314-315,406,511-512,586-587
+  s_3b5afd767e3e59::t_252d1ad70aa42b 232-233,318-319,409,515-516,590-591
+  s_3b5afd767e3e59::t_94b43d39ce9384 142
+  s_3b5afd767e3e59::t_a41149d844a14c 669,689,695
+  s_3b5afd767e3e59::t_911c253f46acb0 499-500,502-507
+  s_3b5afd767e3e59::t_0ed6d965d3bbf3 204,289,383,488,562
+  s_3b5afd767e3e59::t_b9634105f0cc1f 236-237,322-323,412,519-520,594-595
+  s_3b5afd767e3e59::t_dd8c5a5ca706e9 111-112
+  s_3b5afd767e3e59::t_8aee95c78f038c 132
+  s_3b5afd767e3e59::t_5c3c4a3c3bc417 263,359,428,536,622
+  s_3b5afd767e3e59::t_30309e963830f8 152
+  s_3b5afd767e3e59::t_f231825a7770c2 574-575,577-582
+  s_3b5afd767e3e59::t_fe23a0aac1480b 373,377
+  s_3b5afd767e3e59::t_eb5079ed2cd473 278,281
+  s_3b5afd767e3e59::t_b13e4212ff616c 552,555
+  h_c80f9240011ffc 102,131,138,141,148,151,191,218,274,304,370,397,475,501,548,576
+  s_3b5afd767e3e59::t_3bf1aba0087c56 235,247,257,268,321,333,343,353,364,411,422,433,518,530,541,593,605,616,627
+  s_3b5afd767e3e59::t_8cbeff404f21c9 227,241,251,262,313,327,337,347,358,405,416,427,510,524,535,585,599,610,621
+  s_3b5afd767e3e59::t_ef60e4b8278151 206,291,385,490,564
+  s_3b5afd767e3e59::t_dc53845f312802 231,244,254,265,317,330,340,350,361,408,419,430,514,527,538,589,602,613,624
+  s_3b5afd767e3e59::t_c2cbc554e32133 395-396,398-403
+  s_3b5afd767e3e59::t_73aebe764f76c6 478,481
+  s_3b5afd767e3e59::t_0d199fab8dad6b 149
+csrc/ascend950/flash_attn_npu_3/rescale_o.hpp
+  s_3b5afd767e3e59::t_e9fadcd7e4753f 292,388
+  s_3b5afd767e3e59::t_8e17173867a91a 247,367,433
+  s_3b5afd767e3e59::t_8019d1e8f345d8 244,364,430
+  s_3b5afd767e3e59::t_95ef0c53a86e31 474,494,500
+  s_3b5afd767e3e59::t_3923bb687306fe 212,224,235,246,321,333,344,355,366,411,422,432
+  s_3b5afd767e3e59::t_bde5296c3febaa 204,218,229,240,313,327,338,349,360,405,416,426
+  s_3b5afd767e3e59::t_66c71af9984155 181
+  s_3b5afd767e3e59::t_0fd2e8b0e88493 127
+  s_3b5afd767e3e59::t_5994042a9a4766 193-194,196-201
+  s_3b5afd767e3e59::t_32921fdb1444b7 302-303,305-310
+  s_3b5afd767e3e59::t_606e4d7e6d5d7d 102-103
+  h_c80f9240011ffc 93,122,126,129,168,195,252,259,304,372,397
+  s_3b5afd767e3e59::t_aebbc6e534141b 130
+  s_3b5afd767e3e59::t_1bb5c1e881a6d4 205-206,406
+  s_3b5afd767e3e59::t_da8720e8ec31cf 183,185
+  s_3b5afd767e3e59::t_461e0394f83421 256
+  s_3b5afd767e3e59::t_cbd8f42efb9909 395-396,398-403
+  s_3b5afd767e3e59::t_bd0bf034543433 208,221,232,243,317,330,341,352,363,408,419,429
+  s_3b5afd767e3e59::t_da9333abc4ca50 209-210,318-319,409
+  s_3b5afd767e3e59::t_511473e0d8f87b 241,427
+  s_3b5afd767e3e59::t_b4d6ad096fd0f0 288,384
+  s_3b5afd767e3e59::t_e0dd718b171c98 213-214,322-323,412
+  s_3b5afd767e3e59::t_ba079fe58e09df 171,174
+  s_3b5afd767e3e59::t_ecdc36b216dddb 290,386
+  s_3b5afd767e3e59::t_28026756a91169 375,378
+  s_3b5afd767e3e59::t_372ba4ceb861c2 473,476-493,495-499
+  s_3b5afd767e3e59::t_8d35e21ab476f6 123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "44fb74ad48e28f2a24b505056cee408e6460d5e8",
+  "prompts": {},
+  "humans": {
+    "h_c80f9240011ffc": {
+      "author": "zhangwanhao <zhangwanhao1@huawei.com>"
+    }
+  },
+  "sessions": {
+    "s_3b5afd767e3e59": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a82b010a4623127ce9c76cc",
+        "model": "DeepSeek-V4-Flash-Official"
+      },
+      "human_author": "zhangwanhao <zhangwanhao1@huawei.com>",
+      "custom_attributes": {
+        "client_type": "ide",
+        "tool_type": "builtin",
+        "source_scene": "agent",
+        "edit_kind": "file_edit",
+        "session_id": "6a82b010a4623127ce9c76cc",
+        "tool_use_id": "6a82dd47a4623127ce9c79f0",
+        "external_session_id": "6a82b010a4623127ce9c76cc",
+        "operation_id": "6a82dd47a4623127ce9c79f0",
+        "dedupe_key": "6a82b010a4623127ce9c76cc:6a82dd47a4623127ce9c79f0:afterEdit:6f8eebe5",
+        "runtime_client": "trae-tob-git-ai",
+        "tool_id": "icube:applyChatSnapshotPatch"
+      }
+    }
+  }
+}
