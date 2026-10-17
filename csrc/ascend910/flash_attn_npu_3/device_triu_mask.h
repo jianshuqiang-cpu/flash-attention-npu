@@ -33,7 +33,6 @@ inline at::Tensor MakeDeviceTriuMask()
 
     const auto cache_idx = static_cast<size_t>(idx);
     std::call_once(once_flags[cache_idx], [idx, cache_idx]() {
-        c10_npu::assertNotCapturing("The triangular mask cache must be initialized before NPU graph capture");
         constexpr int64_t dim = 2048;
         at::Tensor mask =
             at::ones({dim, dim}, at::TensorOptions().dtype(at::kByte).device(at::Device(at::kPrivateUse1, idx)));

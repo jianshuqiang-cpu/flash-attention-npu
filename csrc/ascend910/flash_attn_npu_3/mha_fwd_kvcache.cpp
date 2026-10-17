@@ -247,8 +247,10 @@ class FAInferKernel {
 
         strideQ = static_cast<uint64_t>(qHeads * embed);
         strideO = static_cast<uint64_t>(qHeads * embedV);
-        strideK = static_cast<uint64_t>(kvHeads * embed);
-        strideV = static_cast<uint64_t>(kvHeads * embedV);
+        strideK = PAGED_CACHE_FLAG ? params.tiling.keyTokenStride : static_cast<uint64_t>(kvHeads * embed);
+        strideV = PAGED_CACHE_FLAG ? params.tiling.valueTokenStride : static_cast<uint64_t>(kvHeads * embedV);
+        headStrideK = PAGED_CACHE_FLAG ? params.tiling.keyHeadStride : static_cast<uint64_t>(embed);
+        headStrideV = PAGED_CACHE_FLAG ? params.tiling.valueHeadStride : static_cast<uint64_t>(embedV);
 
         uint32_t coreIdx = AscendC::GetBlockIdx();
         uint32_t coreNum = AscendC::GetBlockNum();
@@ -299,6 +301,8 @@ class FAInferKernel {
 
         blockMmadQK.SetPingPongState(&pingPongState);
         blockMmadPV.SetPingPongState(&pingPongState);
+        blockMmadQK.SetPageStride(params.tiling.keyPageStride);
+        blockMmadPV.SetPageStride(params.tiling.valuePageStride);
 
         uint32_t L1_QK_SIZE = BlockMmadQK::L1TileShape::M * qL1DynNum * sizeof(ElementQ);
         uint32_t kPVPoolSize = BlockMmadPV::L1TileShape::M * kPVDynNum * sizeof(ElementP) * DOUBLE_BUFFER;
@@ -648,8 +652,8 @@ class FAInferKernel {
 
         uint64_t gmOffsetQ = qBOffset + static_cast<uint64_t>(qSBlockIdx * curQSBlockTile) * strideQ +
                              static_cast<uint64_t>(qNStartIdx * embed);
-        uint64_t gmOffsetK = kBOffset + static_cast<uint64_t>(kvNIdx * embed);
-        uint64_t gmOffsetV = vBOffset + static_cast<uint64_t>(kvNIdx * embedV);
+        uint64_t gmOffsetK = kBOffset + static_cast<uint64_t>(kvNIdx) * headStrideK;
+        uint64_t gmOffsetV = vBOffset + static_cast<uint64_t>(kvNIdx) * headStrideV;
         // newkv are (b, s_new, h_k, d); batch b starts at b * kvNewSeqlen tokens.
         uint64_t gmOffsetKNew =
             appendKVFlag ? static_cast<uint64_t>(BIdx) * kvNewSeqlen * strideK + static_cast<uint64_t>(kvNIdx * embed)
@@ -1072,6 +1076,8 @@ class FAInferKernel {
     uint64_t strideO;
     uint64_t strideK;
     uint64_t strideV;
+    uint64_t headStrideK;
+    uint64_t headStrideV;
     uint32_t embedRound;
     uint32_t embedRoundV;
     uint32_t groupSize;
