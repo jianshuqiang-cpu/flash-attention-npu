@@ -15,13 +15,12 @@ using namespace Catlass;
 
 namespace Catlass::Epilogue {
     enum class LseModeT {NONE = 0, OUT_ONLY = 1};
-    template <LseModeT LSE_MODE_, typename SM_DTYPE_, bool HAS_SOFTCAP_, bool HAS_SINK_ = false>
+    template <LseModeT LSE_MODE_, typename SM_DTYPE_, bool HAS_SOFTCAP_>
     struct EpilogueAtlasA2OnlineSoftmaxT {
         using ArchTag = Arch::AtlasA2;
         using IntermPrec = SM_DTYPE_;
         static constexpr LseModeT LSE_MODE = LSE_MODE_;
         static constexpr bool HAS_SOFTCAP = HAS_SOFTCAP_;
-        static constexpr bool HAS_SINK = HAS_SINK_;
     };
 
     template <LseModeT LSE_MODE_, typename SM_DTYPE_>
