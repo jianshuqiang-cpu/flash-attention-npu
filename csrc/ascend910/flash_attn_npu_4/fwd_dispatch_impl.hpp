@@ -20,13 +20,14 @@
 
 #include "mha_fwd_kvcache.cpp"
 
-// 7-param FAInfer (no IS_FD template arg — main moved flash-decode to tiling).
-#define FWD_LAUNCH(DTYPE, PAGED, MASK_TYPE, LAYOUT_TYPE, SOFTCAP)                                                      \
+// FD remains a tiling/runtime decision. Sink is compile-time isolated so the
+// no-sink kernel does not pay for sink GM reads or vector instructions.
+#define FWD_LAUNCH(DTYPE, PAGED, MASK_TYPE, LAYOUT_TYPE, SOFTCAP, SINK_MODE)                                           \
     SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED, MASK_TYPE, LAYOUT_TYPE, Catlass::Epilogue::LseModeT::OUT_ONLY,      \
-                       SOFTCAP><<<launchBlockDim, nullptr, aclStream>>>(                                               \
+                       SOFTCAP, SINK_MODE><<<launchBlockDim, nullptr, aclStream>>>(                                    \
         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice, qSeqDevice,      \
         kvSeqDevice, workspaceDevice, tilingDevice, runtimeDevice, a.blockTableStride, sequsedQDevice,                 \
-        sequsedKVDevice)
+        sequsedKVDevice, sinkDevice)
 
 #define FWD_BOOL_SWITCH(COND, CONST_NAME, ...)                                                                         \
     do {                                                                                                               \
@@ -80,11 +81,20 @@ void launch_fwd_dtype(const FwdLaunchArgs& a)
     uint8_t* runtimeDevice = a.runtimeDevice;
     uint8_t* sequsedQDevice = a.sequsedQDevice;
     uint8_t* sequsedKVDevice = a.sequsedKVDevice;
+    uint8_t* sinkDevice = a.sinkDevice;
     (void)flashDecodeFlag;
 
     FWD_BOOL_SWITCH(paged_KV, IsPaged, {
         FWD_MASK_SWITCH(is_local, is_causal, MaskType, {
-            FWD_BOOL_SWITCH(has_softcap, HasSoftcap, { FWD_LAUNCH(DType, IsPaged, MaskType, LAYOUT, HasSoftcap); });
+            FWD_BOOL_SWITCH(has_softcap, HasSoftcap, {
+                if (sinkDevice != nullptr) {
+                    FWD_LAUNCH(DType, IsPaged, MaskType, LAYOUT, HasSoftcap,
+                               Catlass::Epilogue::SinkModeT::ENABLE);
+                } else {
+                    FWD_LAUNCH(DType, IsPaged, MaskType, LAYOUT, HasSoftcap,
+                               Catlass::Epilogue::SinkModeT::DISABLE);
+                }
+            });
         });
     });
 }

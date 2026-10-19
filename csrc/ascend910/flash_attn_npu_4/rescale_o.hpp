@@ -22,16 +22,17 @@ template <
     class InputType_,
     class UpdateType_,
     class LseType_,
-    LseModeT LSE_MODE_>
+    LseModeT LSE_MODE_,
+    SinkModeT SINK_MODE_>
 class BlockEpilogue<
-    EpilogueAtlasA2RescaleOT<LSE_MODE_, float>,
+    EpilogueAtlasA2RescaleOT<LSE_MODE_, float, SINK_MODE_>,
     OutputType_,
     InputType_,
     UpdateType_,
     LseType_>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2RescaleOT<LSE_MODE_, float>;
+    using DispatchPolicy = EpilogueAtlasA2RescaleOT<LSE_MODE_, float, SINK_MODE_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
 
     using ElementOutput = typename OutputType_::Element;
@@ -45,6 +46,7 @@ public:
     using LayoutLse = typename LseType_::Layout;
 
     static constexpr LseModeT LSE_MODE = DispatchPolicy::LSE_MODE;
+    static constexpr SinkModeT SINK_MODE = DispatchPolicy::SINK_MODE;
 
     static constexpr uint32_t HALF_ELENUM_PER_BLK = 16;
     static constexpr uint32_t BLOCK_SIZE = 16;
@@ -140,6 +142,13 @@ public:
         uint32_t totalRowNum, int32_t invalidPrefixEndRow, uint32_t qSeqlen, uint32_t qSThisSubBlock,
         const AscendC::LocalTensor<float> &lseUbTensor)
     {
+        // Causal/SWA scheduling marks rows without a visible KV token as an
+        // invalid prefix/suffix. With a sink those rows are nevertheless valid:
+        // the virtual sink token supplies denominator exp(sink) and LSE=sink.
+        // O still remains zero and is handled by ClearInvalidOutputRows below.
+        if constexpr (SINK_MODE == SinkModeT::ENABLE) {
+            return;
+        }
         if (totalRowNum == 0U || (invalidSuffixStartRow == 0 && invalidPrefixEndRow == qSeqlen)) {
             return;
         }

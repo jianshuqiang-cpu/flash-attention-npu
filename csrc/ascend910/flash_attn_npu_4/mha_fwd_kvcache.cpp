@@ -31,7 +31,8 @@ using namespace KernelCommon;
 namespace SplitFuse {
 template <class BlockMmadQK, class BlockMmadPV, class EpilogueOnlineSoftmax, class EpilogueRescaleO,
           bool PAGED_CACHE_FLAG, FaiKenel::MaskType MASK_TYPE = FaiKenel::MaskType::NO_MASK,
-          FaiKenel::inputLayout INPUT_LAYOUT = FaiKenel::inputLayout::BSND, class CombineScale = void>
+          FaiKenel::inputLayout INPUT_LAYOUT = FaiKenel::inputLayout::BSND, class CombineScale = void,
+          Epilogue::SinkModeT SINK_MODE = Epilogue::SinkModeT::DISABLE>
 class FAInferKernel {
   public:
     using ArchTag = typename BlockMmadQK::ArchTag;
@@ -64,6 +65,7 @@ class FAInferKernel {
     using LayoutUpdate = typename EpilogueRescaleO::LayoutUpdate;
 
     static constexpr Epilogue::LseModeT LSE_MODE = EpilogueRescaleO::LSE_MODE;
+    static constexpr bool HAS_SINK = SINK_MODE == Epilogue::SinkModeT::ENABLE;
 
     // SWA empty-window tiles: init output (0) and lse (inf) without running attention.
     using InitOutDispatchPolicy = Epilogue::EpilogueAtlasA2InitOutWhenZero<LSE_MODE>;
@@ -101,6 +103,7 @@ class FAInferKernel {
         int32_t invalidPrefixEndRow;
         int32_t qSBlockIdx;
         int32_t curQNBlockTile;
+        bool applySink;
     };
 
     struct GlobalTensorBundle {
@@ -121,6 +124,7 @@ class FAInferKernel {
         AscendC::GlobalTensor<ElementOTmp>& gOUpdate;
         AscendC::GlobalTensor<int32_t>& gSeqUsedQ;
         AscendC::GlobalTensor<int32_t>& gSeqUsedKv;
+        AscendC::GlobalTensor<bfloat16_t>& gSink;
         // FA4 has no append-KV API. Alias these to K/V so the shared scheduler
         // stays source-compatible while kvNewSeqlen remains zero.
         AscendC::GlobalTensor<ElementK>& gKNew;
@@ -145,6 +149,73 @@ class FAInferKernel {
         if (hasSeqUsedKv)
             return static_cast<uint32_t>(gSeqUsed.GetValue(bIdx));
         return static_cast<uint32_t>(gCuSeq.GetValue(bIdx + 1) - gCuSeq.GetValue(bIdx));
+    }
+
+    // Empty visible windows bypass online softmax. When the sequence itself is
+    // non-empty, the sink is therefore the only softmax logit: O stays zero and
+    // LSE must be the per-head sink value. The no-sink path compiles this out.
+    __aicore__ inline void WriteEmptyTaskSinkLse(
+        AscendC::GlobalTensor<ElementLse> gLseBase, uint32_t lseHeadStride, uint32_t qSBlockSize,
+        uint32_t qNBlockSize, uint32_t qNStartIdx, AscendC::GlobalTensor<bfloat16_t> gSink)
+    {
+        if constexpr (!HAS_SINK) {
+            return;
+        }
+        AscendC::LocalTensor<float> sinkUb = resource.ubBuf.template GetBufferByByte<float>(0);
+        const uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
+        const uint32_t subBlockNum = AscendC::GetSubBlockNum();
+        if (qNBlockSize == 1U) {
+            const uint32_t tokenSplit = qSBlockSize / subBlockNum;
+            const uint32_t tokenBegin = subBlockIdx * tokenSplit;
+            const uint32_t tokenCount = (subBlockIdx == subBlockNum - 1U) ? qSBlockSize - tokenBegin : tokenSplit;
+            if (tokenCount == 0U) {
+                return;
+            }
+            AscendC::Duplicate(sinkUb, AscendC::ToFloat(gSink.GetValue(qNStartIdx)), tokenCount);
+            AscendC::PipeBarrier<PIPE_ALL>();
+            AscendC::DataCopyPad(gLseBase[tokenBegin], sinkUb,
+                                 AscendC::DataCopyExtParams(1, tokenCount * sizeof(float), 0, 0, 0));
+            AscendC::PipeBarrier<PIPE_ALL>();
+            return;
+        }
+
+        const uint32_t qNSplit = qNBlockSize / subBlockNum;
+        const uint32_t headBegin = subBlockIdx * qNSplit;
+        const uint32_t headCount = (subBlockIdx == subBlockNum - 1U) ? qNBlockSize - headBegin : qNSplit;
+        for (uint32_t localHead = 0; localHead < headCount; ++localHead) {
+            const float sinkValue = AscendC::ToFloat(gSink.GetValue(qNStartIdx + headBegin + localHead));
+            AscendC::Duplicate(sinkUb, sinkValue, qSBlockSize);
+            AscendC::PipeBarrier<PIPE_ALL>();
+            AscendC::DataCopyPad(gLseBase[(headBegin + localHead) * lseHeadStride], sinkUb,
+                                 AscendC::DataCopyExtParams(1, qSBlockSize * sizeof(float), 0, 0, 0));
+            AscendC::PipeBarrier<PIPE_ALL>();
+        }
+    }
+
+    // FD partial LSE is row-major [qS, qN]. Only the split owning KV block 0
+    // receives the sink; combine-scale then folds that single virtual token
+    // together with all other KV splits exactly once.
+    __aicore__ inline void WriteEmptySplitSinkLse(
+        AscendC::GlobalTensor<ElementLse> gPartialLse, uint32_t qSBlockSize, uint32_t qNBlockSize,
+        uint32_t qNStartIdx, AscendC::GlobalTensor<bfloat16_t> gSink)
+    {
+        if constexpr (!HAS_SINK) {
+            return;
+        }
+        if (AscendC::GetSubBlockIdx() != 0U) {
+            return;
+        }
+        AscendC::LocalTensor<float> sinkUb = resource.ubBuf.template GetBufferByByte<float>(0);
+        for (uint32_t localHead = 0; localHead < qNBlockSize; ++localHead) {
+            const float sinkValue = AscendC::ToFloat(gSink.GetValue(qNStartIdx + localHead));
+            AscendC::Duplicate(sinkUb, sinkValue, qSBlockSize);
+            AscendC::PipeBarrier<PIPE_ALL>();
+            AscendC::DataCopyPad(
+                gPartialLse[localHead], sinkUb,
+                AscendC::DataCopyExtParams(qSBlockSize, sizeof(float), 0,
+                                           (qNBlockSize - 1U) * sizeof(float), 0));
+            AscendC::PipeBarrier<PIPE_ALL>();
+        }
     }
 
     __aicore__ inline FAInferKernel() {}
@@ -205,6 +276,10 @@ class FAInferKernel {
         gSeqUsedKv.SetGlobalBuffer((__gm__ int32_t*)params.seqUsedKv);
         hasSeqUsedQ = params.seqUsedQ != nullptr;
         hasSeqUsedKv = params.seqUsedKv != nullptr;
+        AscendC::GlobalTensor<bfloat16_t> gSink;
+        if constexpr (HAS_SINK) {
+            gSink.SetGlobalBuffer((__gm__ bfloat16_t*)params.sink);
+        }
         AscendC::GlobalTensor<ElementO> gO;
         gO.SetGlobalBuffer((__gm__ ElementO*)params.o);
         AscendC::GlobalTensor<ElementLse> gLse;
@@ -230,7 +305,7 @@ class FAInferKernel {
 
         GlobalTensorBundle globalTensors{
             gQ,     gK,   gV, gMask, gBlockTable, gActualQseqlen, gActualKvseqlen, gO,        gLse,
-            gLseFD, gOFD, gS, gP,    gOTmp,       gOUpdate,       gSeqUsedQ,       gSeqUsedKv, gK, gV};
+            gLseFD, gOFD, gS, gP,    gOTmp,       gOUpdate,       gSeqUsedQ,       gSeqUsedKv, gSink, gK, gV};
 
         uint32_t coreIdx = AscendC::GetBlockIdx();
         uint32_t coreNum = AscendC::GetBlockNum();
@@ -526,6 +601,7 @@ class FAInferKernel {
         auto& gP = globalTensors.gP;
         auto& gOTmp = globalTensors.gOTmp;
         auto& gOUpdate = globalTensors.gOUpdate;
+        auto& gSink = globalTensors.gSink;
         auto& gKNew = globalTensors.gKNew;
         auto& gVNew = globalTensors.gVNew;
 
@@ -722,6 +798,9 @@ class FAInferKernel {
         uint32_t stackSeqTilePad = MAX_KV_STACK_LEN;
         uint32_t taskStackCount = 0;
 
+        // In FD mode exactly one split owns the virtual sink token. Assign it
+        // to the split beginning at KV block 0; all other splits remain pure KV.
+        const bool taskOwnsSink = HAS_SINK && (stS2IdxNow == 0);
         const bool isEmptyTask = kvStart >= kvEnd;
         if (__builtin_expect(isEmptyTask, false)) {
 #ifdef __DAV_C220_VEC__
@@ -730,6 +809,12 @@ class FAInferKernel {
                 LayoutLse layoutLseInit(qHeads, lseHeadStride);
                 EpilogueInitOut epilogueInitOut(resource);
                 epilogueInitOut(gO[gmOffsetO], gLse[gmOffsetLse], layoutOInit, layoutLseInit, qSBlockSize, qNBlockSize);
+                if (taskOwnsSink && kvSeqlen != 0U) {
+                    WriteEmptyTaskSinkLse(gLse[gmOffsetLse], lseHeadStride, qSBlockSize, qNBlockSize, qNStartIdx,
+                                          gSink);
+                }
+            } else if (taskOwnsSink && kvSeqlen != 0U) {
+                WriteEmptySplitSinkLse(gLseFD[gmOffsetLseFD], qSBlockSize, qNBlockSize, qNStartIdx, gSink);
             }
 #endif
             if (pipelineDrain == 0) {
@@ -791,6 +876,7 @@ class FAInferKernel {
                 desc.invalidPrefixEndRow = invalidPrefixEndRow;
                 desc.qSBlockIdx = qSBlockIdx;
                 desc.curQNBlockTile = curQNBlockTile;
+                desc.applySink = taskOwnsSink;
                 uint64_t gmOffsetS = static_cast<uint64_t>(coreIdx * WORKSPACE_BLOCK_SIZE_DB * STACK_SLOTS +
                                                            curStackTileMod * WORKSPACE_BLOCK_SIZE_DB);
                 GemmCoord actualBlockShapeQK{rowNum, desc.stackSeqTile, embed};
@@ -831,12 +917,14 @@ class FAInferKernel {
                             epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], gMask, layOutP, layOutS, layOutMask,
                                                   actualBlockShapeQK, desc.firstStack, qSBlockSize, qNBlockSize,
                                                   curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
-                                                  triUp, triDown, kvSStartIdx, kvSEndIdx, isSplitKV);
+                                                  triUp, triDown, kvSStartIdx, kvSEndIdx, isSplitKV,
+                                                  desc.applySink && desc.lastStack, qNStartIdx, gSink);
                         } else {
                             epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], gMask, layOutP, layOutS, layOutMask,
                                                   actualBlockShapeQK, desc.firstStack, qSBlockSize, qNBlockSize,
                                                   curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
-                                                  triUp, triDown, kvSStartIdx, kvSEndIdx, false);
+                                                  triUp, triDown, kvSStartIdx, kvSEndIdx, false,
+                                                  desc.applySink && desc.lastStack, qNStartIdx, gSink);
                         }
                     } else {
                         uint32_t lastNoMaskTile;
@@ -855,12 +943,14 @@ class FAInferKernel {
                             epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK,
                                                   desc.firstStack, (stackSeqCount == lastNoMaskStackId), qSBlockSize,
                                                   qNBlockSize, curStackTileMod, desc.taskStateSlot, qkReady,
-                                                  softmaxPingPongFlag, isSplitKV, false, false);
+                                                  softmaxPingPongFlag, isSplitKV, false, false,
+                                                  desc.applySink && desc.lastStack, qNStartIdx, gSink);
                         } else {
                             epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK,
                                                   desc.firstStack, (stackSeqCount == lastNoMaskTile), qSBlockSize,
                                                   qNBlockSize, curStackTileMod, desc.taskStateSlot, qkReady,
-                                                  softmaxPingPongFlag, false, false, false);
+                                                  softmaxPingPongFlag, false, false, false,
+                                                  desc.applySink && desc.lastStack, qNStartIdx, gSink);
                         }
                     }
                 } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
@@ -889,7 +979,8 @@ class FAInferKernel {
                                               curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
                                               kvSStartIdx, doTriUPreMask, doTriUNextMask, windowSizeLeftStartLen,
                                               windowSizeLeftEndLen, windowSizeRightStartLen, windowSizeRightEndLen,
-                                              (flashDecodeFlag != 0U) ? isSplitKV : false);
+                                              (flashDecodeFlag != 0U) ? isSplitKV : false,
+                                              desc.applySink && desc.lastStack, qNStartIdx, gSink);
                     } else {
                         bool isLastNoMaskStackTile =
                             (windowSizeRightStartLen >= kvSeqlen) || (windowSizeRightStartLen < 0);
@@ -903,7 +994,8 @@ class FAInferKernel {
                                               desc.firstStack, (stackSeqCount == noMaskStackSeqNum - 1), qSBlockSize,
                                               qNBlockSize, curStackTileMod, desc.taskStateSlot, qkReady,
                                               softmaxPingPongFlag, (flashDecodeFlag != 0U) ? isSplitKV : false,
-                                              startsWithMaskTile, startsWithMaskThenNomaskFlag);
+                                              startsWithMaskTile, startsWithMaskThenNomaskFlag,
+                                              desc.applySink && desc.lastStack, qNStartIdx, gSink);
                         startsWithMaskTile = false;
                     }
                 } else {
@@ -911,11 +1003,12 @@ class FAInferKernel {
                         epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK,
                                               desc.firstStack, 0, qSBlockSize, qNBlockSize, curStackTileMod,
                                               desc.taskStateSlot, qkReady, softmaxPingPongFlag, isSplitKV, false,
-                                              false);
+                                              false, desc.applySink && desc.lastStack, qNStartIdx, gSink);
                     } else {
                         epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK,
                                               desc.firstStack, 0, qSBlockSize, qNBlockSize, curStackTileMod,
-                                              desc.taskStateSlot, qkReady, softmaxPingPongFlag, false, false, false);
+                                              desc.taskStateSlot, qkReady, softmaxPingPongFlag, false, false, false,
+                                              desc.applySink && desc.lastStack, qNStartIdx, gSink);
                     }
                 }
                 Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(softmaxReady);
@@ -1041,11 +1134,12 @@ namespace SplitFuse {
 template <typename InputDtypeQ = half, typename InputDtypeKv = half, typename IntermCalcPrec = float,
           bool PagedCacheFlag = false, FaiKenel::MaskType maskCategory = FaiKenel::MaskType::NO_MASK,
           FaiKenel::inputLayout inLayout = FaiKenel::inputLayout::TND,
-          Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE, bool HAS_SOFTCAP = false>
+          Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE, bool HAS_SOFTCAP = false,
+          Epilogue::SinkModeT sinkMode = Epilogue::SinkModeT::DISABLE>
 __global__ __aicore__ void FAInfer(uint64_t fftsAddr, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask,
                                    GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen,
                                    GM_ADDR actualKvseqlen, GM_ADDR workspace, GM_ADDR tiling, GM_ADDR runtime,
-                                   uint64_t blockTableStride, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv)
+                                   uint64_t blockTableStride, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR sink)
 {
     AscendC::SetSyncBaseAddr(fftsAddr);
 
@@ -1079,7 +1173,8 @@ __global__ __aicore__ void FAInfer(uint64_t fftsAddr, GM_ADDR q, GM_ADDR k, GM_A
     using SType = Gemm::GemmType<ElementS, LayoutS>;
     using BlockMmadQK = Gemm::Block::BlockMmad<DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK, QType, KType, SType>;
 
-    using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec, HAS_SOFTCAP>;
+    using DispatchPolicyOnlineSoftmax =
+        Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec, HAS_SOFTCAP, sinkMode>;
     using PType = Gemm::GemmType<ElementP, LayoutP>;
     using maskType = Gemm::GemmType<ElementMask, LayoutMask>;
     using EpilogueOnlineSoftmax = Epilogue::Block::BlockEpilogue<DispatchPolicyOnlineSoftmax, PType, SType, maskType>;
@@ -1091,7 +1186,7 @@ __global__ __aicore__ void FAInfer(uint64_t fftsAddr, GM_ADDR q, GM_ADDR k, GM_A
     using OTmpType = Gemm::GemmType<ElementOTmp, LayoutOTmp>;
     using BlockMmadPV = Gemm::Block::BlockMmad<DispatchPolicyPV, L1TileShapePV, L0TileShapePV, PType, VType, OTmpType>;
 
-    using DispatchPolicyRescaleO = Epilogue::EpilogueAtlasA2RescaleOT<lseMode, IntermCalcPrec>;
+    using DispatchPolicyRescaleO = Epilogue::EpilogueAtlasA2RescaleOT<lseMode, IntermCalcPrec, sinkMode>;
     using OType = Gemm::GemmType<ElementO, LayoutO>;
     using OUpdateType = Gemm::GemmType<ElementUpdate, LayoutUpdate>;
     using LseType = Gemm::GemmType<ElementLse, LayoutLse>;
@@ -1101,10 +1196,10 @@ __global__ __aicore__ void FAInfer(uint64_t fftsAddr, GM_ADDR q, GM_ADDR k, GM_A
     using SplitInfoType = splitNode[25];
     using CombineScale = Epilogue::Block::CombineScale<OType, LseType, SplitInfoType>;
     using FAInferKernelType = FAInferKernel<BlockMmadQK, BlockMmadPV, EpilogueOnlineSoftmax, EpilogueRescaleO,
-                                            PagedCacheFlag, maskCategory, inLayout, CombineScale>;
+                                            PagedCacheFlag, maskCategory, inLayout, CombineScale, sinkMode>;
 
     FAIKernelParams params{q,   k,         v,      mask,    blockTables,      actualQseqlen, actualKvseqlen, o,
-                           lse, workspace, tiling, runtime, blockTableStride, seqUsedQ,      seqUsedKv};
+                           lse, workspace, tiling, runtime, blockTableStride, seqUsedQ,      seqUsedKv,     sink};
     FAInferKernelType flashAttnInfer;
     flashAttnInfer(params);
 }
