@@ -21,9 +21,9 @@
 #include "mha_fwd_kvcache.cpp"
 
 // 7-param FAInfer (no IS_FD template arg — main moved flash-decode to tiling).
-#define FWD_LAUNCH(DTYPE, PAGED, MASK_TYPE, LAYOUT_TYPE, SOFTCAP)                                                      \
+#define FWD_LAUNCH(DTYPE, PAGED, MASK_TYPE, LAYOUT_TYPE, SOFTCAP, HAS_SINK)                                            \
     SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED, MASK_TYPE, LAYOUT_TYPE, Catlass::Epilogue::LseModeT::OUT_ONLY,      \
-                       SOFTCAP><<<launchBlockDim, nullptr, aclStream>>>(                                               \
+                       SOFTCAP, HAS_SINK><<<launchBlockDim, nullptr, aclStream>>>(                                     \
         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice, qSeqDevice,      \
         kvSeqDevice, workspaceDevice, tilingDevice, runtimeDevice, a.blockTableStride, sequsedQDevice,                 \
         sequsedKVDevice, sinkDevice)
@@ -85,7 +85,10 @@ void launch_fwd_dtype(const FwdLaunchArgs& a)
 
     FWD_BOOL_SWITCH(paged_KV, IsPaged, {
         FWD_MASK_SWITCH(is_local, is_causal, MaskType, {
-            FWD_BOOL_SWITCH(has_softcap, HasSoftcap, { FWD_LAUNCH(DType, IsPaged, MaskType, LAYOUT, HasSoftcap); });
+            FWD_BOOL_SWITCH(has_softcap, HasSoftcap, {
+                FWD_BOOL_SWITCH(sinkDevice != nullptr, HasSink,
+                                { FWD_LAUNCH(DType, IsPaged, MaskType, LAYOUT, HasSoftcap, HasSink); });
+            });
         });
     });
 }
