@@ -32,7 +32,7 @@ inline uint64_t MetadataBytes(bool /*has_mask*/)
     return sizeof(FAInferStaticTilingData);
 }
 
-constexpr uint64_t WORKSPACE_BLOCK_SIZE_DB = static_cast<uint64_t>(128) * 512;
+constexpr uint64_t WORKSPACE_BLOCK_SIZE_DB = static_cast<uint64_t>(256) * 512;
 constexpr uint64_t PRELAUNCH_NUM = 3;
 inline uint64_t Mm1OutSize(uint64_t blockDim)
 {

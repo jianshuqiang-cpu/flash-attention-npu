@@ -517,12 +517,10 @@ std::vector<at::Tensor> mha_fwd(
             }
         }
 
-        uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;
-        uint64_t PRELANCH_NUM = 3;
-        uint64_t mm1OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB * 4 * PRELANCH_NUM;
-        uint64_t smOnlineOutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB * 2 * PRELANCH_NUM;
-        uint64_t mm2OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB * 4 * PRELANCH_NUM;
-        uint64_t UpdateSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB * 4 * PRELANCH_NUM;
+        const uint64_t mm1OutSize = fa_metadata::Mm1OutSize(static_cast<uint64_t>(blockDim));
+        const uint64_t smOnlineOutSize = fa_metadata::SmOnlineOutSize(static_cast<uint64_t>(blockDim));
+        const uint64_t mm2OutSize = fa_metadata::Mm2OutSize(static_cast<uint64_t>(blockDim));
+        const uint64_t UpdateSize = fa_metadata::UpdateOutSize(static_cast<uint64_t>(blockDim));
         uint64_t splitLseTotalSize = tiling_cpu_ptr->get_splitLseTotalSize();
         uint64_t splitOTotalSize = tiling_cpu_ptr->get_splitOTotalSize();
         int64_t workSpaceSize = static_cast<int64_t>(mm1OutSize + smOnlineOutSize + mm2OutSize + UpdateSize +
