@@ -101,8 +101,6 @@ class FAInferKernel {
         int32_t invalidPrefixEndRow;
         int32_t qSBlockIdx;
         int32_t curQNBlockTile;
-        bool applySink;
-        uint32_t qNStartIdx;
     };
 
     struct GlobalTensorBundle {
@@ -131,8 +129,6 @@ class FAInferKernel {
 
     bool hasSeqUsedQ = false;
     bool hasSeqUsedKv = false;
-    bool hasSink = false;
-    AscendC::GlobalTensor<bfloat16_t> gSink;
 
     // *Used* lengths from seqused; cu uses the forward's leading-zero format.
     __aicore__ inline uint32_t QSeqLenOf(uint32_t bIdx, AscendC::GlobalTensor<int32_t>& gCuSeq,
@@ -209,10 +205,6 @@ class FAInferKernel {
         gSeqUsedKv.SetGlobalBuffer((__gm__ int32_t*)params.seqUsedKv);
         hasSeqUsedQ = params.seqUsedQ != nullptr;
         hasSeqUsedKv = params.seqUsedKv != nullptr;
-        hasSink = params.sink != nullptr;
-        if (hasSink) {
-            gSink.SetGlobalBuffer((__gm__ bfloat16_t*)params.sink);
-        }
         AscendC::GlobalTensor<ElementO> gO;
         gO.SetGlobalBuffer((__gm__ ElementO*)params.o);
         AscendC::GlobalTensor<ElementLse> gLse;
@@ -730,7 +722,6 @@ class FAInferKernel {
         uint32_t stackSeqTilePad = MAX_KV_STACK_LEN;
         uint32_t taskStackCount = 0;
 
-        const bool taskOwnsSink = hasSink && (stS2IdxNow == 0);
         const bool isEmptyTask = kvStart >= kvEnd;
         if (__builtin_expect(isEmptyTask, false)) {
 #ifdef __DAV_C220_VEC__
@@ -739,13 +730,6 @@ class FAInferKernel {
                 LayoutLse layoutLseInit(qHeads, lseHeadStride);
                 EpilogueInitOut epilogueInitOut(resource);
                 epilogueInitOut(gO[gmOffsetO], gLse[gmOffsetLse], layoutOInit, layoutLseInit, qSBlockSize, qNBlockSize);
-                if (taskOwnsSink) {
-                    epilogueRescaleO.OverwriteEmptyTaskLse(
-                        gLse, lseHeadStride, qSBlockIdx * curQSBlockTile, qSBlockSize, qNBlockSize, qNStartIdx, gSink);
-                }
-            } else if (taskOwnsSink) {
-                epilogueRescaleO.OverwriteEmptySplitLse(
-                    gLseFD[gmOffsetLseFD], qSBlockSize, qNBlockSize, qNStartIdx, gSink);
             }
 #endif
             if (pipelineDrain == 0) {
@@ -807,8 +791,6 @@ class FAInferKernel {
                 desc.invalidPrefixEndRow = invalidPrefixEndRow;
                 desc.qSBlockIdx = qSBlockIdx;
                 desc.curQNBlockTile = curQNBlockTile;
-                desc.applySink = taskOwnsSink;
-                desc.qNStartIdx = qNStartIdx;
                 uint64_t gmOffsetS = static_cast<uint64_t>(coreIdx * WORKSPACE_BLOCK_SIZE_DB * STACK_SLOTS +
                                                            curStackTileMod * WORKSPACE_BLOCK_SIZE_DB);
                 GemmCoord actualBlockShapeQK{rowNum, desc.stackSeqTile, embed};
@@ -990,16 +972,14 @@ class FAInferKernel {
                                      gLse[pvDesc.gmOffsetLse], layoutO, layoutOTmp, layoutUpdate, layoutLse,
                                      actualBlockShapePV, pvReady, pvDesc.qSBlockSize, pvDesc.qNBlockSize,
                                      pvDesc.firstStack, pvDesc.lastStack, pvDesc.slot, pvDesc.taskStateSlot,
-                                     splitParams, 0, 0, 0, 0, 1, hasSink, pvDesc.applySink && pvDesc.lastStack,
-                                     pvDesc.qNStartIdx, gSink);
+                                     splitParams);
                 } else {
                     epilogueRescaleO(
                         gO[pvDesc.gmOffsetO], gOTmp[gmOffsetOTmp], gOUpdate[gmOffsetUpdate], gLse[pvDesc.gmOffsetLse],
                         layoutO, layoutOTmp, layoutUpdate, layoutLse, actualBlockShapePV, pvReady, pvDesc.qSBlockSize,
                         pvDesc.qNBlockSize, pvDesc.firstStack, pvDesc.lastStack, pvDesc.slot, pvDesc.taskStateSlot,
                         typename EpilogueRescaleO::SplitKVParams(), pvDesc.invalidSuffixStartRow,
-                        pvDesc.invalidPrefixEndRow, pvDesc.qSeqlen, pvDesc.qSBlockIdx, pvDesc.curQNBlockTile, hasSink,
-                        pvDesc.applySink && pvDesc.lastStack, pvDesc.qNStartIdx, gSink);
+                        pvDesc.invalidPrefixEndRow, pvDesc.qSeqlen, pvDesc.qSBlockIdx, pvDesc.curQNBlockTile);
                 }
 #endif
             }
@@ -1065,7 +1045,7 @@ template <typename InputDtypeQ = half, typename InputDtypeKv = half, typename In
 __global__ __aicore__ void FAInfer(uint64_t fftsAddr, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask,
                                    GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen,
                                    GM_ADDR actualKvseqlen, GM_ADDR workspace, GM_ADDR tiling, GM_ADDR runtime,
-                                   uint64_t blockTableStride, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR sink)
+                                   uint64_t blockTableStride, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv)
 {
     AscendC::SetSyncBaseAddr(fftsAddr);
 
@@ -1124,7 +1104,7 @@ __global__ __aicore__ void FAInfer(uint64_t fftsAddr, GM_ADDR q, GM_ADDR k, GM_A
                                             PagedCacheFlag, maskCategory, inLayout, CombineScale>;
 
     FAIKernelParams params{q,   k,         v,      mask,    blockTables,      actualQseqlen, actualKvseqlen, o,
-                           lse, workspace, tiling, runtime, blockTableStride, seqUsedQ,      seqUsedKv,     sink};
+                           lse, workspace, tiling, runtime, blockTableStride, seqUsedQ,      seqUsedKv};
     FAInferKernelType flashAttnInfer;
     flashAttnInfer(params);
 }

@@ -48,7 +48,6 @@ struct FwdLaunchArgs {
     uint8_t* runtimeDevice;
     uint8_t* sequsedQDevice;
     uint8_t* sequsedKVDevice;
-    uint8_t* sinkDevice; // nullptr disables learnable_sink
 };
 
 // Per-(dtype, layout) implementation, defined in autogen/fwd_dispatch_<dtype>_<layout>.cpp
