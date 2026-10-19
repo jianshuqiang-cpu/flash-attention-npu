@@ -14,7 +14,7 @@ constexpr uint32_t PV_READY_ID = 3;
 constexpr uint32_t PRE_LAUNCH = 2;
 constexpr uint32_t N_SPLIT_HELPER = 2;
 constexpr uint32_t MAX_KV_STACK_LEN = 512;
-constexpr uint32_t Q_TILE_CEIL = 256;
+constexpr uint32_t Q_TILE_CEIL = 128;
 constexpr uint32_t WORKSPACE_BLOCK_SIZE_DB = Q_TILE_CEIL * MAX_KV_STACK_LEN;
 constexpr uint32_t L1_MAX_SIZE = 524288;
 constexpr uint32_t L1_MAX_N_NUM = 128;
@@ -99,8 +99,8 @@ __aicore__ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 
 __aicore__ inline uint32_t GetQSBlockTile(uint32_t kvSeqlen)
 {
-    (void)kvSeqlen;
-    return Q_TILE_CEIL;
+    uint32_t qSBlockTile = Q_TILE_CEIL;
+    return qSBlockTile;
 }
 
 __aicore__ inline uint32_t GetStackSeqTile(bool isNewBlock, uint32_t kvSIdx, uint32_t kvSIdxLocal,

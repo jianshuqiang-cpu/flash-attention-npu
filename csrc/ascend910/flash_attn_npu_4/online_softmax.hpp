@@ -82,24 +82,19 @@ public:
         constexpr uint32_t MASK_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t MASK32_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t MASK16_UB_TENSOR_OFFSET = 5 * UB_UINT8_BLOCK_SIZE;
+        constexpr uint32_t SOFTCAP_UB_TENSOR_OFFSET = 6 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t LM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
 
-        // A 256-row Q tile is split into at most 128 rows per vector core.
-        // HM/LL hold one value per row, while GM/GL keep three task-state slots.
         constexpr uint32_t HM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE;
-        // Softcap only needs one 64-float (256-byte) vector. Keep it out of
-        // LM's first 128 floats: sink writes LM through scalar SetValue and
-        // immediately consumes it from PIPE_V, so aliasing the preceding
-        // softcap vector creates an input-dependent read-after-write hazard.
-        // LM reserves 1 KiB before HM; its upper 512 bytes are otherwise idle.
-        constexpr uint32_t SOFTCAP_UB_TENSOR_OFFSET = LM_UB_TENSOR_OFFSET + 2 * REPEAT_SIZE_IN_BYTE;
-        static_assert(SOFTCAP_UB_TENSOR_OFFSET + REPEAT_SIZE_IN_BYTE <= HM_UB_TENSOR_OFFSET,
-            "softcap vector overlaps HM task state");
-        constexpr uint32_t LL_UB_TENSOR_OFFSET = HM_UB_TENSOR_OFFSET + 128 * sizeof(float);
-        constexpr uint32_t GM_UB_TENSOR_OFFSET = LL_UB_TENSOR_OFFSET + 128 * sizeof(float);
-        constexpr uint32_t GL_UB_TENSOR_OFFSET = GM_UB_TENSOR_OFFSET + 3 * 128 * sizeof(float);
-        constexpr uint32_t DM_UB_TENSOR_OFFSET = GL_UB_TENSOR_OFFSET + 3 * 128 * sizeof(float);
+        constexpr uint32_t LL_UB_TENSOR_OFFSET =
+            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + REPEAT_SIZE_IN_BYTE;
+        constexpr uint32_t GM_UB_TENSOR_OFFSET =
+            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 2 * REPEAT_SIZE_IN_BYTE;
+        constexpr uint32_t GL_UB_TENSOR_OFFSET =
+            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 5 * REPEAT_SIZE_IN_BYTE;
+        constexpr uint32_t DM_UB_TENSOR_OFFSET =
+            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 8 * REPEAT_SIZE_IN_BYTE;
 
         scaleValue = scaleValue_;
         softcapValue = softcapValue_;
@@ -521,11 +516,11 @@ public:
         AscendC::Adds<float, false>(
             lsUbTensor[sUbOffset], lsUbTensor[sUbOffset], 1.0f, (uint64_t)0, repeatTimes, repeatParams);
 
-        AscendC::Duplicate<float, false>(softcapUbTensor, 2 * softcapValue, (uint64_t)0, 1, 1, 8);
+        AscendC::Duplicate<float, false>(softcapUbTensor, 2 * softcapValue, (uint64_t)0, repeatTimes, 1, 8);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Div<float, false>(
             lsUbTensor[sUbOffset], softcapUbTensor, lsUbTensor[sUbOffset], (uint64_t)0, repeatTimes,
-            AscendC::BinaryRepeatParams(1, 1, 1, 8, 0, 8));
+            AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Adds<float, false>(
             lsUbTensor[sUbOffset], lsUbTensor[sUbOffset], -softcapValue, (uint64_t)0, repeatTimes, repeatParams);
@@ -635,12 +630,6 @@ public:
     __aicore__ inline
     void WriteSinkLogits(uint32_t rowOffset, uint32_t rowNum)
     {
-        // LM is produced/consumed by PIPE_V, while GetValue/SetValue execute on
-        // PIPE_S. PipeBarrier<PIPE_ALL> does not establish a scalar/vector
-        // dependency. Explicitly close both sides of the hand-off so scalar
-        // sink writes cannot race the preceding row-max or following Max/Sub.
-        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID7);
-        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID7);
         for (uint32_t row = 0; row < rowNum; ++row) {
             uint32_t head = qNStartIdx_;
             if (qNBlockSize_ > 1U) {
@@ -652,8 +641,7 @@ public:
             }
             lmUbTensor.SetValue(rowOffset + row, AscendC::ToFloat(gSink_.GetValue(head)));
         }
-        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID7);
-        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID7);
+        AscendC::PipeBarrier<PIPE_ALL>();
     }
 
     __aicore__ inline
@@ -939,7 +927,7 @@ public:
         uint32_t columnNumPad = layoutOutput.stride(0);
         uint32_t sUbOffset = pingpongFlag * MAX_UB_S_ELEM_NUM;
         uint32_t dmUbOffsetCurCycle = curStackTileMod * MAX_ROW_NUM_SUB_CORE + rowOffset;
-        uint32_t stateRowOffset = taskStateSlot * 128 + rowOffset;
+        uint32_t stateRowOffset = taskStateSlot * 64 + rowOffset;
 
         if constexpr (!doTriUMask) {
             if (isLastNoMaskStackTile && isLastRowLoop) {
