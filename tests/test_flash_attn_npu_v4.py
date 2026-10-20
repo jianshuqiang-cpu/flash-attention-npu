@@ -394,10 +394,7 @@ test_cases = [
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, num_splits, softcap, add_unused_qkv", test_cases)
 def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, num_splits, softcap, add_unused_qkv):
 
-    # num_splits>1 (active KV split) is currently only wired for paged KV + varlen-q (TND).
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
-    if num_splits > 1 and not (cache_mode == 1 and layout == "TND"):
-        pytest.skip("num_splits>1 requires paged KV cache and TND (varlen-q) layout")
     if not (1 <= head_size <= 256):
         pytest.skip("head_size must be in [1, 256]")
 
