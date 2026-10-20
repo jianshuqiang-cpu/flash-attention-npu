@@ -100,6 +100,9 @@ public:
     void SetPingPongState(BlockPingPongState* state) { pingPongState = state; }
 
     __aicore__ inline
+    void SetPageStride(uint64_t stride) { pageStride = stride; }
+
+    __aicore__ inline
     void init(Arch::Resource<ArchTag> &resource, uint32_t nDyn, uint32_t kDyn,
               uint32_t KVStackLen = 512, uint32_t l1BufAddrStart = 0)
     {
@@ -131,17 +134,18 @@ public:
     }
 
     __aicore__ inline
-    void getKVOffset(uint32_t &kOffset, uint32_t nIdx, uint32_t &strideKV)
+    void getKVOffset(uint64_t &kOffset, uint32_t nIdx, uint32_t &strideKV)
     {
-        kOffset = nIdx * maxKVStackLen * strideKV;
+        kOffset = static_cast<uint64_t>(nIdx) * maxKVStackLen * strideKV;
     }
 
     __aicore__ inline
-    void getKVOffset(AscendC::GlobalTensor<int32_t> &gBlockTable, uint32_t &kOffset, uint32_t blockStartOffset, 
+    void getKVOffset(AscendC::GlobalTensor<int32_t> &gBlockTable, uint64_t &kOffset, uint32_t blockStartOffset,
         uint32_t nowNIdx, uint32_t &strideKV, uint32_t &blockSize)
     {
         uint32_t blockTableId = gBlockTable.GetValue(nowNIdx);
-        kOffset = blockTableId * blockSize * strideKV + blockStartOffset * strideKV;
+        kOffset = static_cast<uint64_t>(blockTableId) * pageStride +
+                  static_cast<uint64_t>(blockStartOffset) * strideKV;
     }
 
     __aicore__ inline
@@ -189,7 +193,7 @@ public:
         uint32_t embed = actualOriShape[COORD_DIM1];
         uint32_t stackSeqTile = actualOriShape[COORD_DIM2];
         GemmCoord actualShape{rowNum, embed, 0};
-        uint32_t gBOffset = 0;
+        uint64_t gBOffset = 0;
 
         LayoutBInL1 layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(stackSeqTile, embed);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID4);
@@ -328,6 +332,7 @@ protected:
 
     uint32_t blockStartOffset = 0;
     uint32_t maxKVStackLen = 0;
+    uint64_t pageStride = 0;
 };
 
 }
