@@ -246,7 +246,9 @@ class FAInferKernel {
         scaleValue = fARuntimeData->scaleValue;
         softcapValue = fARuntimeData->softcapValue;
         maxQSeqlen = fATilingData->maxQSeqlen;
-        flashDecodeFlag = fATilingData->flashDecodeFlag;
+        // Static tiling is shape-only. The host clears the runtime bit for a
+        // per-call sliding window, which must not enter FlashDecode.
+        flashDecodeFlag = fATilingData->flashDecodeFlag & fARuntimeData->flashDecodeFlag;
 
         // FD workspace sizing: reserve head of workspace for gLseFD/gOFD.
         uint64_t Lsesize = 0;
@@ -393,9 +395,53 @@ class FAInferKernel {
         uint32_t issuedStackCount = 0;
         uint32_t taskStateSequence = 0;
 
+        // BBND / dense TND / dense BSND put adjacent heads next to each
+        // other within a token. Keep those heads on adjacent cores and at
+        // the same KV position. BNBD retains the legacy range partition.
+        // Workspace addresses above retain the original metadata offsets;
+        // only execution switches to complete, non-FD output tasks.
+        const bool tokenMajorStorage = headStrideK == embed && headStrideV == embedV &&
+            strideK == uint64_t(kvHeads) * embed && strideV == uint64_t(kvHeads) * embedV;
+        // One core owns one KV head and completes all of its Q-token/head tiles.
+        const bool useTokenMajorSchedule = fATilingData->tokenMajorCoreCount != 0U &&
+            fATilingData->tokenMajorCoreCount == coreNum && tokenMajorStorage;
+        if (useTokenMajorSchedule) {
+            flashDecodeFlag = 0U;
+        }
+
         const bool idleCoreFD =
             (flashDecodeFlag != 0U) && (fATilingData->needCoreNum != 0U) && (coreIdx >= fATilingData->needCoreNum);
-        if (flashDecodeFlag != 0U && !idleCoreFD) {
+        if (useTokenMajorSchedule) {
+            const uint32_t cohortCount = coreNum / kvHeads;
+            const uint32_t kvHead = coreIdx % kvHeads;
+            // core 2*c and core 2*c+1 (for two KV heads) visit batches
+            // c, c+cohortCount, ... together; S2 stays sequential per core.
+            for (uint32_t b = coreIdx / kvHeads; b < batch; b += cohortCount) {
+                uint32_t qLen = maxQSeqlen;
+                uint32_t kvLen = static_cast<uint32_t>(gActualKvseqlen.GetValue(b));
+                if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
+                    qLen = QSeqLenOf(b, gActualQseqlen, gSeqUsedQ);
+                    if constexpr (!PAGED_CACHE_FLAG) {
+                        kvLen = KvSeqLenOf(b, gActualKvseqlen, gSeqUsedKv);
+                    }
+                }
+                const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, GetQNBlockTile(qLen, groupSize));
+                const uint32_t qSBlockNum = CeilDiv(qLen, GetQSBlockTile(kvLen));
+                for (uint32_t qSBlock = 0; qSBlock < qSBlockNum; ++qSBlock) {
+                    for (uint32_t qNBlock = 0; qNBlock < qNBlockNumPerGroup; ++qNBlock) {
+                        const bool lastTask = b + cohortCount >= batch && qSBlock + 1 == qSBlockNum &&
+                            qNBlock + 1 == qNBlockNumPerGroup;
+                        const uint32_t drain = lastTask ? PRE_LAUNCH : 0U;
+                        const uint32_t stateSlot = taskStateSequence % STACK_SLOTS;
+                        const uint32_t qNBlockIdx = kvHead * qNBlockNumPerGroup + qNBlock;
+                        const bool hasTaskWork = runMainLoop(
+                            coreIdx, b, qLen, kvLen, qNBlockIdx, qSBlock, false, 0, 0, 0, 0,
+                            globalTensors, descriptors, stateSlot, issuedStackCount, drain, softmaxPingPongFlag);
+                        taskStateSequence += static_cast<uint32_t>(hasTaskWork);
+                    }
+                }
+            }
+        } else if (flashDecodeFlag != 0U && !idleCoreFD) {
             uint32_t startBIdx = fATilingData->coreInfo[coreIdx].startBIdx;
             uint32_t startN1Idx = fATilingData->coreInfo[coreIdx].startN1Idx;
             uint32_t startS1Idx = fATilingData->coreInfo[coreIdx].startS1Idx;

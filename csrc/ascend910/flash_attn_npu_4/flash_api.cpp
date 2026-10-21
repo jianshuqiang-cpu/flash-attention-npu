@@ -33,6 +33,7 @@ using namespace KernelCommon;
 #include "device_triu_mask.h"
 #include "fa_fd_enable.h"
 #include "fa_split.h"
+#include "fa_token_major_schedule.h"
 #include "fwd_dispatch.hpp"
 #include "fag_tiling.cpp"
 #include "bwd_dispatch.hpp"
@@ -402,6 +403,9 @@ std::vector<at::Tensor> mha_fwd(
     } else if (is_causal) {
         runtimeData.set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL));
     }
+    // Reusable metadata decides FD from shape only. Sliding window is per-call,
+    // so the host turns the schedule off here instead of inside the kernel.
+    runtimeData.flashDecodeFlag = is_local ? 0U : 1U;
     if (has_softcap) {
         runtimeData.set_scaleValue(softmax_scale / softcap);
     } else {
@@ -544,6 +548,7 @@ std::vector<at::Tensor> mha_fwd(
         splitCtx.seqlens_k_cpu = seqlens_k_cpu;
         splitCtx.blockDim = blockDim;
         splitCtx.num_splits = static_cast<int32_t>(num_splits);
+        tiling_cpu_ptr->tokenMajorCoreCount = fa_split::TokenMajorCoreCount(splitCtx);
         if (flashDecodeFlag) {
             fa_split::splitBN2S1GS2(tiling_cpu_ptr, splitCtx);
             auto needCoreNum = tiling_cpu_ptr->get_needCoreNum();

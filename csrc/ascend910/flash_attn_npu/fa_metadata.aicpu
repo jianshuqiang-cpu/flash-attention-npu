@@ -13,6 +13,7 @@
 #include "aicpu_api.h"
 #include "fa_metadata_args.h"
 #include "fa_split.h"
+#include "fa_token_major_schedule.h"
 #include "tilingdata.h"
 #include <cstdint>
 
@@ -167,19 +168,21 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV2(void *args)
             (maxQ * groupSize <= 128u) && (maxQ <= 16u) &&
             (maxKvSeqlen >= 1024u) && (maxQ > 0u) && (isLongSeq || isShortSeq);
         tilingData->flashDecodeFlag = fdFlag ? 1u : 0u;
+        fa_split::SplitContext ctx{};
+        ctx.batch_size = static_cast<int32_t>(metaArgs->batch);
+        ctx.num_heads = static_cast<int32_t>(metaArgs->numHeads);
+        ctx.num_heads_k = static_cast<int32_t>(metaArgs->numHeadsK);
+        ctx.seqlen_q = static_cast<int32_t>(metaArgs->maxQSeqlen);
+        ctx.head_size_v = static_cast<int32_t>(metaArgs->embeddingSizeV);
+        ctx.cu_seqlen_q_cpu = const_cast<int32_t *>(cuSeqlensQ);
+        ctx.seqlens_k_cpu = const_cast<int32_t *>(seqlensK);
+        ctx.is_varlen_q = metaArgs->isVarlen != 0;
+        ctx.blockDim = bd;
+        ctx.num_splits = static_cast<int32_t>(metaArgs->numSplits);
+        ctx.kvNewSeqlen = 0;
+        tilingData->padding3 = fa_split::TokenMajorCoreCount(ctx, metaArgs->isVarlenKv != 0);
         if (fdFlag) {
-            fa_split::SplitContext ctx;
-            ctx.batch_size = static_cast<int32_t>(metaArgs->batch);
-            ctx.num_heads = static_cast<int32_t>(metaArgs->numHeads);
-            ctx.num_heads_k = static_cast<int32_t>(metaArgs->numHeadsK);
-            ctx.seqlen_q = static_cast<int32_t>(metaArgs->maxQSeqlen);
-            ctx.head_size_v = static_cast<int32_t>(metaArgs->embeddingSizeV);
-            ctx.cu_seqlen_q_cpu = const_cast<int32_t *>(cuSeqlensQ);
-            ctx.seqlens_k_cpu = const_cast<int32_t *>(seqlensK);
             ctx.is_varlen_q = false;
-            ctx.blockDim = bd;
-            ctx.num_splits = static_cast<int32_t>(metaArgs->numSplits);
-            ctx.kvNewSeqlen = 0;  // scheduler-metadata path: no append-KV FD split yet
             fa_split::splitBN2S1GS2(tilingData, ctx);
             tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(static_cast<uint64_t>(bd))
                 + tilingData->splitLseTotalSize + tilingData->splitOTotalSize;

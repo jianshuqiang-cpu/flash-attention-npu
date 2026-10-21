@@ -49,7 +49,8 @@ struct FAInferStaticTilingData {
     uint64_t workSpaceSize;
     uint64_t padding1;
     uint64_t padding2;
-    uint32_t padding3;
+    // Former padding3: nonzero only for uniform, single-Q/G-task cohorts.
+    uint32_t tokenMajorCoreCount;
     uint64_t splitLseTotalSize;
     uint64_t splitOTotalSize;
     uint32_t totalSplitNodeNum;
@@ -123,9 +124,9 @@ struct FAInferStaticTilingData {
     {
         return padding2;
     }
-    uint32_t get_padding3() const
+    uint32_t get_tokenMajorCoreCount() const
     {
-        return padding3;
+        return tokenMajorCoreCount;
     }
     uint64_t get_splitLseTotalSize() const
     {
@@ -216,9 +217,9 @@ struct FAInferStaticTilingData {
     {
         padding2 = value;
     }
-    void set_padding3(uint32_t value)
+    void set_tokenMajorCoreCount(uint32_t value)
     {
-        padding3 = value;
+        tokenMajorCoreCount = value;
     }
     void set_splitLseTotalSize(uint64_t value)
     {
@@ -265,6 +266,10 @@ struct FAInferRuntimeData {
     uint64_t valueTokenStride;
     uint64_t keyHeadStride;
     uint64_t valueHeadStride;
+    // Per-call FlashDecode gate. 0 forces the non-FD schedule even when the
+    // reusable shape metadata would split KV. The host sets this to 0 for
+    // sliding-window attention.
+    uint32_t flashDecodeFlag = 0;
 
     uint32_t get_numBlocks() const
     {

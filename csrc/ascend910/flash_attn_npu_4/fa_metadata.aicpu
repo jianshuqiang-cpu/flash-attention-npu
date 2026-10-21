@@ -7,6 +7,7 @@
 #include "fa_fd_enable.h"
 #include "fa_metadata_args.h"
 #include "fa_split.h"
+#include "fa_token_major_schedule.h"
 #include "tilingdata.h"
 #include <cstdint>
 
@@ -100,7 +101,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV4(void *args)
             fa_fd::EnableFlashDecodeBySplitCore(metaArgs->batch, metaArgs->numHeads, metaArgs->numHeadsK,
                                                 metaArgs->maxQSeqlen, bd, qLens, cacheSeqlens);
         tilingData->flashDecodeFlag = fdFlag ? 1u : 0u;
-        if (fdFlag) {
+        {
             fa_split::SplitContext ctx;
             ctx.batch_size = static_cast<int32_t>(metaArgs->batch);
             ctx.num_heads = static_cast<int32_t>(metaArgs->numHeads);
@@ -111,7 +112,10 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV4(void *args)
             ctx.seqlens_k_cpu = cacheSeqlens;
             ctx.blockDim = bd;
             ctx.num_splits = static_cast<int32_t>(metaArgs->numSplits);
-            fa_split::splitBN2S1GS2(tilingData, ctx);
+            tilingData->tokenMajorCoreCount = fa_split::TokenMajorCoreCount(ctx);
+            if (fdFlag) {
+                fa_split::splitBN2S1GS2(tilingData, ctx);
+            }
             tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(static_cast<uint64_t>(bd))
                 + tilingData->splitLseTotalSize + tilingData->splitOTotalSize;
         }

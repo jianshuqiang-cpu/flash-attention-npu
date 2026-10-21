@@ -33,6 +33,7 @@ using namespace KernelCommon;
 #include "fa_metadata_args.h"
 #include "device_triu_mask.h"
 #include "fa_split.h"
+#include "fa_token_major_schedule.h"
 #include "fwd_dispatch.hpp"
 #include "bwd_dispatch.hpp"
 #include <cmath>
@@ -589,6 +590,7 @@ std::vector<at::Tensor> mha_fwd(
         splitCtx.blockDim = blockDim;
         splitCtx.num_splits = static_cast<int32_t>(num_splits);
         splitCtx.kvNewSeqlen = appendKV ? static_cast<int32_t>(kvNewSeqlen) : 0;
+        tiling_cpu_ptr->set_tokenMajorCoreCount(fa_split::TokenMajorCoreCount(splitCtx));
         if (flashDecodeFlag) {
             fa_split::splitBN2S1GS2(tiling_cpu_ptr, splitCtx);
             auto needCoreNum = tiling_cpu_ptr->get_needCoreNum();

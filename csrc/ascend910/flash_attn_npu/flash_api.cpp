@@ -28,6 +28,7 @@
 #include "fa_metadata_args.h"
 #include "device_triu_mask.h"
 #include "fa_split.h"
+#include "fa_token_major_schedule.h"
 #include "fwd_dispatch.hpp"
 #include "varlen_bwd_dispatch.hpp"
 #include <cmath>
@@ -498,6 +499,7 @@ std::vector<at::Tensor> mha_fwd_kvcache(
         splitCtx.blockDim = blockDim;
         splitCtx.num_splits = static_cast<int32_t>(num_splits);
         splitCtx.kvNewSeqlen = appendKV ? static_cast<int32_t>(kvNewSeqlen) : 0;
+        tiling_cpu_ptr->set_tokenMajorCoreCount(fa_split::TokenMajorCoreCount(splitCtx));
         if (flashDecodeFlag) {
             fa_split::splitBN2S1GS2(tiling_cpu_ptr, splitCtx);
             auto needCoreNum = tiling_cpu_ptr->get_needCoreNum();
@@ -819,6 +821,9 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,                   // batch_size x
             totalTaskNum += curTaskNum;
         }
         tiling_cpu_ptr->set_totalTaskNum(totalTaskNum);
+        const uint32_t tokenMajorCoreCount = fa_split::TokenMajorCoreCountUniform(
+            batch_size, num_heads, num_heads_k, seqlen_q, seqlen_k, blockDim, 0, 0);
+        tiling_cpu_ptr->set_tokenMajorCoreCount(tokenMajorCoreCount);
         tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
         tilingDevice = static_cast<uint8_t*>(const_cast<void*>(tiling_gpu_tensor.data_ptr()));
     }
@@ -1124,6 +1129,19 @@ std::vector<at::Tensor> mha_varlen_fwd(
             totalTaskNum += curTaskNum;
         }
         tiling_cpu_ptr->set_totalTaskNum(totalTaskNum);
+        fa_split::SplitContext tokenCtx{};
+        tokenCtx.batch_size = batch_size;
+        tokenCtx.num_heads = num_heads;
+        tokenCtx.num_heads_k = num_heads_k;
+        tokenCtx.seqlen_q = max_seqlen_q;
+        tokenCtx.head_size_v = head_size_og;
+        tokenCtx.cu_seqlen_q_cpu = cu_seqlens_q_cpu;
+        tokenCtx.seqlens_k_cpu = cu_seqlens_k_cpu;
+        tokenCtx.is_varlen_q = true;
+        tokenCtx.blockDim = blockDim;
+        tokenCtx.num_splits = 0;
+        tokenCtx.kvNewSeqlen = 0;
+        tiling_cpu_ptr->set_tokenMajorCoreCount(fa_split::TokenMajorCoreCount(tokenCtx, true));
         tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1)); // Tiling to Device
         tilingDevice = static_cast<uint8_t*>(const_cast<void*>(tiling_gpu_tensor.data_ptr()));
 

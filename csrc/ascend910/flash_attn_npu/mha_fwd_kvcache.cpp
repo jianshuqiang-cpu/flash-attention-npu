@@ -331,10 +331,46 @@ namespace SplitFuse {
             uint32_t issuedStackCount = 0;
             uint32_t taskStateSequence = 0;
 
+            const bool useTokenMajorSchedule = fATilingData->padding3 != 0U &&
+                fATilingData->padding3 == coreNum && kvNewSeqlen == 0U;
+            if (useTokenMajorSchedule) {
+                flashDecodeFlag = 0U;
+            }
+
             const bool idleCoreFD = (flashDecodeFlag != 0U) &&
                 (fATilingData->needCoreNum != 0U) &&
                 (coreIdx >= fATilingData->needCoreNum);
-            if (flashDecodeFlag != 0U && !idleCoreFD) {
+            if (useTokenMajorSchedule) {
+                const uint32_t cohortCount = coreNum / kvHeads;
+                const uint32_t kvHead = coreIdx % kvHeads;
+                for (uint32_t b = coreIdx / kvHeads; b < batch; b += cohortCount) {
+                    uint32_t qLen = maxQSeqlen;
+                    uint32_t kvLen = static_cast<uint32_t>(gActualKvseqlen.GetValue(b));
+                    if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
+                        qLen = static_cast<uint32_t>(gActualQseqlen.GetValue(b + 1)) -
+                            static_cast<uint32_t>(gActualQseqlen.GetValue(b));
+                        if constexpr (!PAGED_CACHE_FLAG) {
+                            kvLen = static_cast<uint32_t>(gActualKvseqlen.GetValue(b + 1)) -
+                                static_cast<uint32_t>(gActualKvseqlen.GetValue(b));
+                        }
+                    }
+                    const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, GetQNBlockTile(qLen, groupSize));
+                    const uint32_t qSBlockNum = CeilDiv(qLen, GetQSBlockTile(kvLen));
+                    for (uint32_t qSBlock = 0; qSBlock < qSBlockNum; ++qSBlock) {
+                        for (uint32_t qNBlock = 0; qNBlock < qNBlockNumPerGroup; ++qNBlock) {
+                            const bool lastTask = b + cohortCount >= batch && qSBlock + 1 == qSBlockNum &&
+                                qNBlock + 1 == qNBlockNumPerGroup;
+                            const uint32_t drain = lastTask ? PRE_LAUNCH : 0U;
+                            const uint32_t stateSlot = taskStateSequence % STACK_SLOTS;
+                            const uint32_t qNBlockIdx = kvHead * qNBlockNumPerGroup + qNBlock;
+                            const bool hasTaskWork = runMainLoop(
+                                coreIdx, b, qNBlockIdx, qSBlock, false, 0, 0, 0, 0,
+                                globalTensors, descriptors, stateSlot, issuedStackCount, drain, softmaxPingPongFlag);
+                            taskStateSequence += static_cast<uint32_t>(hasTaskWork);
+                        }
+                    }
+                }
+            } else if (flashDecodeFlag != 0U && !idleCoreFD) {
                 uint32_t startBIdx = fATilingData->coreInfo[coreIdx].startBIdx;
                 uint32_t startN1Idx = fATilingData->coreInfo[coreIdx].startN1Idx;
                 uint32_t startS1Idx = fATilingData->coreInfo[coreIdx].startS1Idx;
