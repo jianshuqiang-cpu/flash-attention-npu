@@ -31,6 +31,7 @@ using namespace KernelCommon;
 
 #include "fa_metadata_args.h"
 #include "device_triu_mask.h"
+#include "fa_fd_enable.h"
 #include "fa_split.h"
 #include "fwd_dispatch.hpp"
 #include "fag_tiling.cpp"
@@ -521,29 +522,15 @@ std::vector<at::Tensor> mha_fwd(
         }
         tiling_cpu_ptr->set_totalTaskNum(totalTaskNum);
 
-        int64_t maxQSeqlenCalc = 0;
-        int64_t minQSeqlenCalc = std::numeric_limits<int64_t>::max();
-        int64_t maxKVSeqlenCalc = 0;
-        for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
-            int64_t qSeqlenVal = seqlen_q;
-            int64_t kvSeqlenVal = *(seqlens_k_cpu + batchIdx);
-            if (seqlens_q_cpu != nullptr) {
-                qSeqlenVal = *(seqlens_q_cpu + batchIdx);
-            }
-            if (is_varlen_kv) {
-                kvSeqlenVal = *(seqlens_k_cpu + batchIdx + 1) - *(seqlens_k_cpu + batchIdx);
-            }
-            maxQSeqlenCalc = std::max(maxQSeqlenCalc, qSeqlenVal);
-            minQSeqlenCalc = std::min(minQSeqlenCalc, qSeqlenVal);
-            maxKVSeqlenCalc = std::max(maxKVSeqlenCalc, kvSeqlenVal);
-        }
-        uint32_t numTasks = static_cast<uint32_t>(batch_size * num_heads_k);
-        bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * blockDim) &&
-                         (maxKVSeqlenCalc >= static_cast<int64_t>(blockDim) * 512);
-        bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * blockDim) && (maxKVSeqlenCalc >= 1024);
-        flashDecodeFlag = (num_splits != 1) && !is_local && (maxQSeqlenCalc * groupSize <= 128) &&
-                          (maxQSeqlenCalc <= 16) && (maxKVSeqlenCalc >= 1024) && (minQSeqlenCalc > 0) &&
-                          (isLongSeq || isShortSeq);
+        // Sliding-window attention stays on the non-FD path. Causal and no-mask
+        // cases follow SplitCore: FD is on when one Q row's KV blocks are split
+        // across cores (numOfFdHead > 0). num_splits == 1 still forces FD off.
+        flashDecodeFlag = (num_splits != 1) && !is_local &&
+                          fa_fd::EnableFlashDecodeBySplitCore(static_cast<uint32_t>(batch_size),
+                                                              static_cast<uint32_t>(num_heads),
+                                                              static_cast<uint32_t>(num_heads_k),
+                                                              static_cast<uint32_t>(seqlen_q), blockDim, seqlens_q_cpu,
+                                                              seqlens_k_cpu);
         tiling_cpu_ptr->set_flashDecodeFlag(flashDecodeFlag ? 1U : 0U);
         tiling_cpu_ptr->set_numSplits(num_splits > 0 ? static_cast<uint32_t>(num_splits) : 1U);
 

@@ -4,6 +4,7 @@
  */
 
 #include "aicpu_api.h"
+#include "fa_fd_enable.h"
 #include "fa_metadata_args.h"
 #include "fa_split.h"
 #include "tilingdata.h"
@@ -91,25 +92,13 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV4(void *args)
     tilingData->totalTaskNum = totalTaskNum;
 
     {
-        uint32_t maxQ = 0;
-        uint32_t minQ = 0xFFFFFFFFu;
-        for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
-            uint32_t qLen = metaArgs->maxQSeqlen;
-            if (metaArgs->isVarlen != 0) {
-                qLen = static_cast<uint32_t>(seqlensQ[batchIdx]);
-            }
-            if (qLen > maxQ) maxQ = qLen;
-            if (qLen < minQ) minQ = qLen;
-        }
         const uint32_t bd = metaArgs->blockDim;
-        const uint32_t numTasks = metaArgs->batch * metaArgs->numHeadsK;
-        const bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * bd) && (maxKvSeqlen >= bd * 512u);
-        const bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * bd) && (maxKvSeqlen >= 1024u);
-        // FD scheduling only depends on the logical attention shape. Paged vs.
-        // dense KV and TND vs. BSND affect address calculation in the forward
-        // kernel, not whether the KV sequence can be split across cores.
-        const bool fdFlag = (metaArgs->numSplits != 1u) && (maxQ * groupSize <= 128u) &&
-            (maxQ <= 16u) && (maxKvSeqlen >= 1024u) && (minQ > 0u) && (isLongSeq || isShortSeq);
+        // Same SplitCore decision as the host tiling path. Paged vs. dense KV
+        // and TND vs. BSND do not change whether one Q row's KV is split.
+        const int32_t *qLens = (metaArgs->isVarlen != 0) ? seqlensQ : nullptr;
+        const bool fdFlag = (metaArgs->numSplits != 1u) &&
+            fa_fd::EnableFlashDecodeBySplitCore(metaArgs->batch, metaArgs->numHeads, metaArgs->numHeadsK,
+                                                metaArgs->maxQSeqlen, bd, qLens, cacheSeqlens);
         tilingData->flashDecodeFlag = fdFlag ? 1u : 0u;
         if (fdFlag) {
             fa_split::SplitContext ctx;
