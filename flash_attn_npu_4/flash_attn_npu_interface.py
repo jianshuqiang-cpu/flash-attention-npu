@@ -1068,8 +1068,7 @@ def flash_attn_func(
             Defaults to 1 / sqrt(headdim + (headdim_v if qv is not None else 0)).
         causal: bool. Whether to apply causal attention mask.
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
-        learnable_sink [optional]: (num_heads,), dtype bfloat16. One sink logit per query head.
-            It contributes to the softmax denominator but has no value contribution.
+        learnable_sink [optional]: (Not supported on NPU)
         softcap: float. Anything > 0 activates softcapping attention.
         num_splits: int. If > 1, split the key/value into this many chunks along the sequence.
         pack_gqa: bool. If True, pack GQA for better performance. (Not supported on NPU)
@@ -1204,8 +1203,8 @@ def flash_attn_varlen_func(
             Default to 1 / sqrt(headdim + (headdim_v if qv is not None else 0)).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
-        learnable_sink [optional]: (num_heads,), dtype bfloat16. One sink logit per query head.
-            It contributes to the softmax denominator but has no value contribution.
+        learnable_sink [optional]: (num_heads,), dtype bfloat16. Learnable sink token.
+            (Not supported on NPU)
         softcap: float. Anything > 0 activates softcapping attention.
         num_splits: int. If > 1, split the key/value into this many chunks along the sequence.
             If num_splits == 0, use a heuristic to automatically determine the number of splits.
