@@ -395,16 +395,10 @@ class FAInferKernel {
         uint32_t issuedStackCount = 0;
         uint32_t taskStateSequence = 0;
 
-        // BBND / dense TND / dense BSND put adjacent heads next to each
-        // other within a token. Keep those heads on adjacent cores and at
-        // the same KV position. BNBD retains the legacy range partition.
-        // Workspace addresses above retain the original metadata offsets;
-        // only execution switches to complete, non-FD output tasks.
-        const bool tokenMajorStorage = headStrideK == embed && headStrideV == embedV &&
-            strideK == uint64_t(kvHeads) * embed && strideV == uint64_t(kvHeads) * embedV;
-        // One core owns one KV head and completes all of its Q-token/head tiles.
-        const bool useTokenMajorSchedule = fATilingData->tokenMajorCoreCount != 0U &&
-            fATilingData->tokenMajorCoreCount == coreNum && tokenMajorStorage;
+        // Host sets this from stride(S) >= stride(N) on Q, K, and V. Each core
+        // then owns a contiguous B-N-S1 range and finishes S2 itself. A BNSD or
+        // BNBD view keeps FlashDecode or the round-robin loop below.
+        const bool useTokenMajorSchedule = fARuntimeData->tokenMajorSchedule != 0U;
         if (useTokenMajorSchedule) {
             flashDecodeFlag = 0U;
         }
@@ -412,34 +406,56 @@ class FAInferKernel {
         const bool idleCoreFD =
             (flashDecodeFlag != 0U) && (fATilingData->needCoreNum != 0U) && (coreIdx >= fATilingData->needCoreNum);
         if (useTokenMajorSchedule) {
-            const uint32_t cohortCount = coreNum / kvHeads;
-            const uint32_t kvHead = coreIdx % kvHeads;
-            // core 2*c and core 2*c+1 (for two KV heads) visit batches
-            // c, c+cohortCount, ... together; S2 stays sequential per core.
-            for (uint32_t b = coreIdx / kvHeads; b < batch; b += cohortCount) {
-                uint32_t qLen = maxQSeqlen;
-                uint32_t kvLen = static_cast<uint32_t>(gActualKvseqlen.GetValue(b));
-                if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
-                    qLen = QSeqLenOf(b, gActualQseqlen, gSeqUsedQ);
-                    if constexpr (!PAGED_CACHE_FLAG) {
-                        kvLen = KvSeqLenOf(b, gActualKvseqlen, gSeqUsedKv);
+            const uint32_t splitFactor = (coreNum == 0U) ? 0U : (totalTaskNum + coreNum - 1U) / coreNum;
+            uint32_t taskEnd = coreIdx * splitFactor;
+            if (splitFactor > 0U && taskEnd < totalTaskNum) {
+                const uint32_t remain = totalTaskNum - taskEnd;
+                taskEnd += (splitFactor < remain) ? splitFactor : remain;
+            }
+            const uint32_t taskBegin = coreIdx * splitFactor;
+            uint32_t curBatchTmp = 0;
+            uint32_t preTotalTaskNumTmp = 0;
+            uint32_t curTotalTaskNumTmp = firstBatchTaskNum;
+            uint32_t cachedBatch = 0xFFFFFFFFU;
+            uint32_t qSeqlenCur = fATilingData->maxQSeqlen;
+            uint32_t kvSeqlenCur = 0;
+            if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
+                qSeqlenCur = QSeqLenOf(0, gActualQseqlen, gSeqUsedQ);
+            }
+            for (uint32_t taskIdx = taskBegin; taskIdx < taskEnd; ++taskIdx) {
+                while (taskIdx >= curTotalTaskNumTmp) {
+                    ++curBatchTmp;
+                    preTotalTaskNumTmp = curTotalTaskNumTmp;
+                    qSeqlenCur = fATilingData->maxQSeqlen;
+                    if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
+                        qSeqlenCur = QSeqLenOf(curBatchTmp, gActualQseqlen, gSeqUsedQ);
                     }
+                    const uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenCur, groupSize);
+                    const uint32_t qNBlockNumPerGroupTmp = CeilDiv(groupSize, curQNBlockTileTmp);
+                    const uint32_t curQNBlockNumTmp = qNBlockNumPerGroupTmp * kvHeads;
+                    const uint32_t curQSBlockNumTmp = CeilDiv(qSeqlenCur, GetQSBlockTile(kvSeqlenCur));
+                    curTotalTaskNumTmp += curQNBlockNumTmp * curQSBlockNumTmp;
                 }
-                const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, GetQNBlockTile(qLen, groupSize));
-                const uint32_t qSBlockNum = CeilDiv(qLen, GetQSBlockTile(kvLen));
-                for (uint32_t qSBlock = 0; qSBlock < qSBlockNum; ++qSBlock) {
-                    for (uint32_t qNBlock = 0; qNBlock < qNBlockNumPerGroup; ++qNBlock) {
-                        const bool lastTask = b + cohortCount >= batch && qSBlock + 1 == qSBlockNum &&
-                            qNBlock + 1 == qNBlockNumPerGroup;
-                        const uint32_t drain = lastTask ? PRE_LAUNCH : 0U;
-                        const uint32_t stateSlot = taskStateSequence % STACK_SLOTS;
-                        const uint32_t qNBlockIdx = kvHead * qNBlockNumPerGroup + qNBlock;
-                        const bool hasTaskWork = runMainLoop(
-                            coreIdx, b, qLen, kvLen, qNBlockIdx, qSBlock, false, 0, 0, 0, 0,
-                            globalTensors, descriptors, stateSlot, issuedStackCount, drain, softmaxPingPongFlag);
-                        taskStateSequence += static_cast<uint32_t>(hasTaskWork);
+                if (curBatchTmp != cachedBatch) {
+                    kvSeqlenCur = static_cast<uint32_t>(gActualKvseqlen.GetValue(curBatchTmp));
+                    if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
+                        if constexpr (!PAGED_CACHE_FLAG) {
+                            kvSeqlenCur = KvSeqLenOf(curBatchTmp, gActualKvseqlen, gSeqUsedKv);
+                        }
                     }
+                    cachedBatch = curBatchTmp;
                 }
+                const uint32_t curQSBlockNumCur = CeilDiv(qSeqlenCur, GetQSBlockTile(kvSeqlenCur));
+                const uint32_t taskIdxCurBatch = taskIdx - preTotalTaskNumTmp;
+                const uint32_t qNBlockIdxCur = taskIdxCurBatch / curQSBlockNumCur;
+                const uint32_t qSBlockIdxCur = taskIdxCurBatch - qNBlockIdxCur * curQSBlockNumCur;
+                const uint32_t pipelineDrain = (taskIdx + 1U == taskEnd) ? PRE_LAUNCH : 0U;
+                const uint32_t currentTaskStateSlot = taskStateSequence % STACK_SLOTS;
+                const bool hasTaskWork = runMainLoop(
+                    coreIdx, curBatchTmp, qSeqlenCur, kvSeqlenCur, qNBlockIdxCur, qSBlockIdxCur, false, 0, 0, 0, 0,
+                    globalTensors, descriptors, currentTaskStateSlot, issuedStackCount, pipelineDrain,
+                    softmaxPingPongFlag);
+                taskStateSequence += static_cast<uint32_t>(hasTaskWork);
             }
         } else if (flashDecodeFlag != 0U && !idleCoreFD) {
             uint32_t startBIdx = fATilingData->coreInfo[coreIdx].startBIdx;

@@ -270,6 +270,11 @@ struct FAInferRuntimeData {
     // reusable shape metadata would split KV. The host sets this to 0 for
     // sliding-window attention.
     uint32_t flashDecodeFlag = 0;
+    // 1 when Q, K, and V are token-major: stride(S) >= stride(N). A BNSD or
+    // paged BNBD tensor arrives as a BSND view with stride(S) < stride(N) and
+    // stays on the legacy schedule. Fills the tail padding so the runtime ABI
+    // stays 96 bytes.
+    uint32_t tokenMajorSchedule = 0;
 
     uint32_t get_numBlocks() const
     {

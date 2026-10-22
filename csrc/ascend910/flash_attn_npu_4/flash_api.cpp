@@ -33,7 +33,6 @@ using namespace KernelCommon;
 #include "device_triu_mask.h"
 #include "fa_fd_enable.h"
 #include "fa_split.h"
-#include "fa_token_major_schedule.h"
 #include "fwd_dispatch.hpp"
 #include "fag_tiling.cpp"
 #include "bwd_dispatch.hpp"
@@ -45,6 +44,16 @@ extern __global__ __aicpu__ uint32_t ComputeFAMetadataV4(void* args);
 extern __global__ __aicpu__ uint32_t WriteFARuntime(void* args);
 
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
+
+// Packed TND is [S, N, D]. BSND and the paged [page, S, N, D] view use dim 1
+// and dim 2. stride(S) >= stride(N) is token-major. A BNSD or BNBD transpose
+// view has stride(S) < stride(N).
+static bool TokenAxisOutsideHead(const at::Tensor& t, bool packedTokens)
+{
+    const int64_t strideS = packedTokens ? t.stride(0) : t.stride(1);
+    const int64_t strideN = packedTokens ? t.stride(1) : t.stride(2);
+    return strideS >= strideN;
+}
 
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& seqlensK,
                                            const std::optional<at::Tensor>& seqlensQ)
@@ -406,6 +415,10 @@ std::vector<at::Tensor> mha_fwd(
     // Reusable metadata decides FD from shape only. Sliding window is per-call,
     // so the host turns the schedule off here instead of inside the kernel.
     runtimeData.flashDecodeFlag = is_local ? 0U : 1U;
+    const bool kvPacked = !paged_KV && k.dim() == 3;
+    const bool tokenMajor = TokenAxisOutsideHead(q, is_varlen_q) && TokenAxisOutsideHead(k, kvPacked) &&
+                            TokenAxisOutsideHead(v, kvPacked);
+    runtimeData.tokenMajorSchedule = tokenMajor ? 1U : 0U;
     if (has_softcap) {
         runtimeData.set_scaleValue(softmax_scale / softcap);
     } else {
@@ -529,7 +542,9 @@ std::vector<at::Tensor> mha_fwd(
         // Sliding-window attention stays on the non-FD path. Causal and no-mask
         // cases follow SplitCore: FD is on when one Q row's KV blocks are split
         // across cores (numOfFdHead > 0). num_splits == 1 still forces FD off.
-        flashDecodeFlag = (num_splits != 1) && !is_local &&
+        // Token-major storage keeps S2 on the owning core, so it does not
+        // shrink launchBlockDim or fill coreInfo.
+        flashDecodeFlag = !tokenMajor && (num_splits != 1) && !is_local &&
                           fa_fd::EnableFlashDecodeBySplitCore(static_cast<uint32_t>(batch_size),
                                                               static_cast<uint32_t>(num_heads),
                                                               static_cast<uint32_t>(num_heads_k),
@@ -548,7 +563,6 @@ std::vector<at::Tensor> mha_fwd(
         splitCtx.seqlens_k_cpu = seqlens_k_cpu;
         splitCtx.blockDim = blockDim;
         splitCtx.num_splits = static_cast<int32_t>(num_splits);
-        tiling_cpu_ptr->tokenMajorCoreCount = fa_split::TokenMajorCoreCount(splitCtx);
         if (flashDecodeFlag) {
             fa_split::splitBN2S1GS2(tiling_cpu_ptr, splitCtx);
             auto needCoreNum = tiling_cpu_ptr->get_needCoreNum();
