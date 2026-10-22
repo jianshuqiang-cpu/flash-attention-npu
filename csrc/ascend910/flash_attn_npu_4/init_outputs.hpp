@@ -62,9 +62,10 @@ public:
         uint32_t qHeads = layoutLse.shape(0);
         uint32_t embedV = oHiddenSize / qHeads;
         uint32_t embedRoundV = RoundUp(embedV, HALF_ELEM_NUM_PER_BLK);
+        // Empty-task initialization is already fenced locally. EVENT_ID6/7 are
+        // reserved for delayed rescale task-state slots in the cross-task pipe.
         AscendC::PipeBarrier<PIPE_ALL>();
         // init attnOut with 0
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
         AscendC::Duplicate(attnOutUbTensor, static_cast<ElementAttnOut>(ATTN_OUT_INI), embedRoundV * qSThisSubBlock);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID6);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID6);
@@ -76,16 +77,13 @@ public:
                     qSThisSubBlock, embedV * sizeof(ElementAttnOut),
                     0, (oHiddenSize - embedV) * sizeof(ElementAttnOut), 0));
         }
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
         if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
             // init lseOut with inf
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID7);
             uint32_t count = qSThisSubBlock * qNThisSubBlock;
             AscendC::Duplicate(lseOutUbTensor, LSE_OUT_INI, count);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
             AscendC::DataCopyPad(gLse, lseOutUbTensor, AscendC::DataCopyExtParams(1, count * sizeof(float), 0, 0, 0));
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID7);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
     }
