@@ -438,13 +438,17 @@ std::vector<at::Tensor> mha_fwd(
         auto metaBase = static_cast<uint8_t*>(schedMd.data_ptr());
         tilingDevice = metaBase + fa_metadata::TilingOffset(false);
         int64_t wsBase = static_cast<int64_t>(fa_metadata::WorkSpaceSize(blockDim));
-        int64_t wsSplit = 0;
-        if (paged_KV && is_varlen_q) {
-            int64_t maxKvUpper = static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size;
-            int64_t kvSegUpper = maxKvUpper / 512 + 1;
-            int64_t lseTasksUpper = static_cast<int64_t>(num_heads) * seqlen_q * kvSegUpper * 2;
-            wsSplit = lseTasksUpper * 4 + lseTasksUpper * head_size_og * 4;
-        }
+        // The reusable metadata does not encode storage/layout. Reserve a
+        // conservative FD workspace from tensor-shape upper bounds so the same
+        // metadata schedule is valid for paged/dense KV and TND/BSND Q.
+        const int64_t maxKvUpper = paged_KV
+            ? static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size
+            : (is_varlen_kv ? k.size(0) : k.size(1));
+        const int64_t kvSegUpper = (maxKvUpper + fa_split::MAX_KV_STACK_LEN - 1) /
+            fa_split::MAX_KV_STACK_LEN;
+        const int64_t splitCopiesUpper = std::min<int64_t>(kvSegUpper, blockDim);
+        const int64_t lseTasksUpper = static_cast<int64_t>(batch_size) * num_heads * seqlen_q * splitCopiesUpper;
+        const int64_t wsSplit = lseTasksUpper * sizeof(float) * (1 + head_size_og);
         workspace_tensor = at::empty({wsBase + wsSplit}, at::device(at::kPrivateUse1).dtype(at::kByte));
         launchBlockDim = blockDim;
 
@@ -538,9 +542,7 @@ std::vector<at::Tensor> mha_fwd(
         bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * blockDim) &&
                          (maxKVSeqlenCalc >= static_cast<int64_t>(blockDim) * 512);
         bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * blockDim) && (maxKVSeqlenCalc >= 1024);
-        TORCH_CHECK(num_splits <= 1 || (paged_KV && is_varlen_q),
-                    "NPU FlashAttention num_splits>1 currently requires paged KV cache and varlen-q (TND) layout");
-        flashDecodeFlag = paged_KV && is_varlen_q && !is_local && (maxQSeqlenCalc * groupSize <= 128) &&
+        flashDecodeFlag = (num_splits != 1) && !is_local && (maxQSeqlenCalc * groupSize <= 128) &&
                           (maxQSeqlenCalc <= 16) && (maxKVSeqlenCalc >= 1024) && (minQSeqlenCalc > 0) &&
                           (isLongSeq || isShortSeq);
         tiling_cpu_ptr->set_flashDecodeFlag(flashDecodeFlag ? 1U : 0U);
@@ -716,8 +718,6 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     const uint32_t block_dim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(block_dim), "num_splits must be in [0, ",
                 block_dim, "]");
-    TORCH_CHECK(num_splits <= 1 || (cu_seqlens_q.has_value() || seqused_q.has_value()),
-                "NPU FlashAttention num_splits>1 currently requires varlen-q (TND) layout");
 
     const bool is_varlen_q = cu_seqlens_q.has_value() || seqused_q.has_value();
     // Per-batch Q lengths fed to the AICPU tile derivation: use the caller's
@@ -759,7 +759,6 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.blockDim = block_dim;
     args.isVarlen = is_varlen_q ? 1U : 0U;
     args.isVarlenKv = 0U; // cache_seqlens is always per-batch (python-normalized)
-    args.pagedKV = (num_splits != 1) ? 1U : 0U;
     args.numSplits = static_cast<uint32_t>(num_splits);
     return GetSchedulerMetadataImpl(args, cache_seqlens,
                                     seqlens_q.defined() ? std::optional<at::Tensor>(seqlens_q) : std::nullopt);
