@@ -295,6 +295,8 @@ class FAInferKernel {
         uint32_t L1_QK_SIZE = BlockMmadQK::L1TileShape::M * qL1DynNum * sizeof(ElementQ);
         blockMmadQK.SetPingPongState(&pingPongState);
         blockMmadPV.SetPingPongState(&pingPongState);
+        blockMmadQK.SetPageStride(fARuntimeData->keyPageStride);
+        blockMmadPV.SetPageStride(fARuntimeData->valuePageStride);
         blockMmadQK.init(resource, nDynNum, kDynNum, MAX_KV_STACK_LEN, 0, qL1DynNum);
         blockMmadPV.init(resource, nDynNum, kPVDynNum, MAX_KV_STACK_LEN, L1_QK_SIZE, vL1Stages, vSegLen, vSliceWidth);
 #endif
@@ -330,8 +332,10 @@ class FAInferKernel {
         uint32_t softmaxPingPongFlag = 0;
         strideQ = static_cast<uint64_t>(qHeads * embed);
         strideO = static_cast<uint64_t>(qHeads * embedV);
-        strideK = static_cast<uint64_t>(kvHeads * embed);
-        strideV = static_cast<uint64_t>(kvHeads * embedV);
+        strideK = PAGED_CACHE_FLAG ? fARuntimeData->keyTokenStride : static_cast<uint64_t>(kvHeads * embed);
+        strideV = PAGED_CACHE_FLAG ? fARuntimeData->valueTokenStride : static_cast<uint64_t>(kvHeads * embedV);
+        headStrideK = PAGED_CACHE_FLAG ? fARuntimeData->keyHeadStride : static_cast<uint64_t>(embed);
+        headStrideV = PAGED_CACHE_FLAG ? fARuntimeData->valueHeadStride : static_cast<uint64_t>(embedV);
         embedRound = RoundUp(embed, FaiKenel::BLOCK_SIZE);
         embedRoundV = RoundUp(embedV, FaiKenel::BLOCK_SIZE);
         groupSize = qHeads / kvHeads;
@@ -628,8 +632,8 @@ class FAInferKernel {
 
         uint64_t gmOffsetQ = qBOffset + static_cast<uint64_t>(qSBlockIdx * curQSBlockTile) * strideQ +
                              static_cast<uint64_t>(qNStartIdx * embed);
-        uint64_t gmOffsetK = kBOffset + static_cast<uint64_t>(kvNIdx * embed);
-        uint64_t gmOffsetV = vBOffset + static_cast<uint64_t>(kvNIdx * embedV);
+        uint64_t gmOffsetK = kBOffset + static_cast<uint64_t>(kvNIdx) * headStrideK;
+        uint64_t gmOffsetV = vBOffset + static_cast<uint64_t>(kvNIdx) * headStrideV;
         // newkv are (b, s_new, h_k, d); batch b starts at b * kvNewSeqlen tokens.
         uint64_t gmOffsetKNew =
             appendKVFlag ? static_cast<uint64_t>(BIdx) * kvNewSeqlen * strideK + static_cast<uint64_t>(kvNIdx * embed)
@@ -1063,6 +1067,8 @@ class FAInferKernel {
     uint64_t strideO;
     uint64_t strideK;
     uint64_t strideV;
+    uint64_t headStrideK;
+    uint64_t headStrideV;
     uint32_t embedRound;
     uint32_t embedRoundV;
     uint32_t groupSize;
