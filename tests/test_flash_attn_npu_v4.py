@@ -1272,3 +1272,115 @@ def test_fa4_paged_tnd_total_q_zero_fast_path():
     assert out.shape == query.shape
     assert lse.shape == (num_heads, 0)
     assert out.numel() == 0 and lse.numel() == 0
+
+
+@pytest.mark.skipif(
+    not torch_npu.npu.is_available() or "Ascend910" not in torch_npu.npu.get_device_name(),
+    reason="Ascend910 only",
+)
+@pytest.mark.parametrize("disable_scheduler_metadata", [False, True])
+@pytest.mark.parametrize(
+    "q_lengths,kv_lengths,extra_q,extra_kv,causal,paged",
+    [
+        ([4, 7, 1], [8, 9, 5], 6, 0, False, False),
+        ([4, 7, 1], [8, 9, 5], 6, 5, True, False),
+        ([0, 3, 6], [4, 0, 20], 9, 0, True, True),
+        ([2, 5], [16, 12], 4, 0, False, True),
+    ],
+)
+def test_fa4_tnd_total_exceeds_cu_seqlens_q(
+    q_lengths, kv_lengths, extra_q, extra_kv, causal, paged, disable_scheduler_metadata
+):
+    """Packed TND storage may be longer than cu_seqlens[-1]; the tail is unused."""
+    num_heads, kv_heads, head_size = 4, 2, 64
+    dtype = torch.float16
+    used_q = sum(q_lengths)
+    used_k = sum(kv_lengths)
+    cu_q = make_cu_seqlens(q_lengths).npu()
+    assert int(cu_q[-1]) == used_q
+
+    query = torch.randn((used_q, num_heads, head_size), dtype=dtype, device="npu")
+    query_padded = torch.cat(
+        [query, torch.randn((extra_q, num_heads, head_size), dtype=dtype, device="npu")],
+        dim=0,
+    )
+    assert query_padded.shape[0] > int(cu_q[-1])
+
+    kwargs = dict(
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=max(q_lengths),
+        causal=causal,
+        num_splits=1,
+        return_lse=True,
+        disable_scheduler_metadata=disable_scheduler_metadata,
+    )
+    if paged:
+        page_size = 128
+        num_pages = len(kv_lengths)
+        key = torch.randn((num_pages, page_size, kv_heads, head_size), dtype=dtype, device="npu")
+        value = torch.randn_like(key)
+        kwargs.update(
+            page_table=torch.arange(num_pages, dtype=torch.int32, device="npu").view(num_pages, 1),
+            seqused_k=torch.tensor(kv_lengths, dtype=torch.int32, device="npu"),
+        )
+        out_ref, lse_ref = flash_attn_varlen_func(query, key, value, **kwargs)
+        out_pad, lse_pad = flash_attn_varlen_func(query_padded, key, value, **kwargs)
+    else:
+        cu_k = make_cu_seqlens(kv_lengths).npu()
+        key = torch.randn((used_k, kv_heads, head_size), dtype=dtype, device="npu")
+        value = torch.randn_like(key)
+        if extra_kv:
+            key = torch.cat(
+                [key, torch.randn((extra_kv, kv_heads, head_size), dtype=dtype, device="npu")],
+                dim=0,
+            )
+            value = torch.cat(
+                [value, torch.randn((extra_kv, kv_heads, head_size), dtype=dtype, device="npu")],
+                dim=0,
+            )
+            assert key.shape[0] > int(cu_k[-1])
+        kwargs.update(cu_seqlens_k=cu_k, max_seqlen_k=max(kv_lengths))
+        out_ref, lse_ref = flash_attn_varlen_func(query, key, value, **kwargs)
+        out_pad, lse_pad = flash_attn_varlen_func(query_padded, key, value, **kwargs)
+
+    assert out_pad.shape[0] == used_q + extra_q
+    assert lse_pad.shape == (num_heads, used_q + extra_q)
+    torch.testing.assert_close(out_pad[:used_q], out_ref, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(lse_pad[:, :used_q], lse_ref, rtol=2e-3, atol=2e-3, equal_nan=True)
+
+
+@pytest.mark.skipif(
+    not torch_npu.npu.is_available() or "Ascend910" not in torch_npu.npu.get_device_name(),
+    reason="Ascend910 only",
+)
+@pytest.mark.parametrize("paged", [False, True])
+def test_fa4_tnd_total_shorter_than_cu_seqlens_q_errors(paged):
+    """Packed T smaller than cu_seqlens_q[-1] would read past q."""
+    num_heads, kv_heads, head_size = 4, 2, 64
+    dtype = torch.float16
+    q_lengths = [4, 7, 1]
+    kv_lengths = [8, 9, 5]
+    cu_q = make_cu_seqlens(q_lengths).npu()
+    used_q = int(cu_q[-1])
+    query = torch.randn((used_q - 1, num_heads, head_size), dtype=dtype, device="npu")
+    assert query.shape[0] < used_q
+    kwargs = dict(cu_seqlens_q=cu_q, max_seqlen_q=max(q_lengths), causal=True, num_splits=1)
+    if paged:
+        page_size = 128
+        num_pages = len(kv_lengths)
+        key = torch.randn((num_pages, page_size, kv_heads, head_size), dtype=dtype, device="npu")
+        value = torch.randn_like(key)
+        kwargs.update(
+            page_table=torch.arange(num_pages, dtype=torch.int32, device="npu").view(num_pages, 1),
+            seqused_k=torch.tensor(kv_lengths, dtype=torch.int32, device="npu"),
+        )
+    else:
+        used_k = sum(kv_lengths)
+        key = torch.randn((used_k, kv_heads, head_size), dtype=dtype, device="npu")
+        value = torch.randn_like(key)
+        kwargs.update(
+            cu_seqlens_k=make_cu_seqlens(kv_lengths).npu(),
+            max_seqlen_k=max(kv_lengths),
+        )
+    with pytest.raises(RuntimeError, match="cu_seqlens_q"):
+        flash_attn_varlen_func(query, key, value, **kwargs)
