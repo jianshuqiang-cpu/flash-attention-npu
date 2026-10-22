@@ -252,24 +252,26 @@ class FAInferKernel {
             // for Q/O and kvSeqlenAllocated*embed(V) apart for the KV cache.
             strideQ = static_cast<uint64_t>(embed);
             strideO = static_cast<uint64_t>(embedV);
-            strideK = static_cast<uint64_t>(embed);
-            strideV = static_cast<uint64_t>(embedV);
             qHeadStride = static_cast<uint64_t>(maxQSeqlen) * embed;
             oHeadStride = static_cast<uint64_t>(maxQSeqlen) * embedV;
-            kvHeadStrideK = static_cast<uint64_t>(kvSeqlenAllocated) * embed;
-            kvHeadStrideV = static_cast<uint64_t>(kvSeqlenAllocated) * embedV;
+            strideK = PAGED_CACHE_FLAG ? params.tiling.keyTokenStride : static_cast<uint64_t>(embed);
+            strideV = PAGED_CACHE_FLAG ? params.tiling.valueTokenStride : static_cast<uint64_t>(embedV);
+            kvHeadStrideK =
+                PAGED_CACHE_FLAG ? params.tiling.keyHeadStride : static_cast<uint64_t>(kvSeqlenAllocated) * embed;
+            kvHeadStrideV =
+                PAGED_CACHE_FLAG ? params.tiling.valueHeadStride : static_cast<uint64_t>(kvSeqlenAllocated) * embedV;
         } else {
             // BSND / TND: (batch|token, seq, head, dim). Adjacent heads are
             // `embed`/`embedV` apart; adjacent tokens are qHeads*embed(V) (Q/O) or
             // kvHeads*embed(V) (KV).
             strideQ = static_cast<uint64_t>(qHeads * embed);
             strideO = static_cast<uint64_t>(qHeads * embedV);
-            strideK = static_cast<uint64_t>(kvHeads * embed);
-            strideV = static_cast<uint64_t>(kvHeads * embedV);
             qHeadStride = static_cast<uint64_t>(embed);
             oHeadStride = static_cast<uint64_t>(embedV);
-            kvHeadStrideK = static_cast<uint64_t>(embed);
-            kvHeadStrideV = static_cast<uint64_t>(embedV);
+            strideK = PAGED_CACHE_FLAG ? params.tiling.keyTokenStride : static_cast<uint64_t>(kvHeads * embed);
+            strideV = PAGED_CACHE_FLAG ? params.tiling.valueTokenStride : static_cast<uint64_t>(kvHeads * embedV);
+            kvHeadStrideK = PAGED_CACHE_FLAG ? params.tiling.keyHeadStride : static_cast<uint64_t>(embed);
+            kvHeadStrideV = PAGED_CACHE_FLAG ? params.tiling.valueHeadStride : static_cast<uint64_t>(embedV);
         }
 
         uint32_t coreIdx = AscendC::GetBlockIdx();
@@ -333,6 +335,8 @@ class FAInferKernel {
 
         blockMmadQK.SetPingPongState(&pingPongState);
         blockMmadPV.SetPingPongState(&pingPongState);
+        blockMmadQK.SetPageStride(params.tiling.keyPageStride);
+        blockMmadPV.SetPageStride(params.tiling.valuePageStride);
 
         uint32_t L1_QK_SIZE = qL1Rows * qL1DynNum * sizeof(ElementQ);
         uint32_t qkKPoolSize = nDynNum * kDynNum * sizeof(ElementK) * DOUBLE_BUFFER;
