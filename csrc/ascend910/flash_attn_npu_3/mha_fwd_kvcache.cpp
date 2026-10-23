@@ -184,6 +184,9 @@ class FAInferKernel {
         flashDecodeFlag = fATilingData->flashDecodeFlag;
         kvNewSeqlen = fATilingData->kvNewSeqlen;
         kvCacheSeqlen = fATilingData->kvCacheSeqlen;
+        // Four 128-column base tiles form one S2 stage. Q remains resident in
+        // L1 while later stages update max/sum and the output accumulator.
+        kvStackLen = MAX_KV_STACK_LEN;
 
         // FD workspace sizing: reserve head of workspace for gLseFD/gOFD.
         uint64_t Lsesize = 0;
@@ -276,7 +279,6 @@ class FAInferKernel {
         groupSize = qHeads / kvHeads;
         const bool compactDecodeL1 = flashDecodeFlag == 0U && embed == 512U && embedV == 512U && kvNewSeqlen == 0U &&
                                      maxQSeqlen * groupSize <= 64U;
-        kvStackLen = MAX_KV_STACK_LEN;
         uint32_t kDynNum = NUM_256;
         uint32_t nDynNum = L1_D512_KV_TILE;
         uint32_t qL1DynNum = RoundUp(embed, FaiKenel::BLOCK_SIZE);
@@ -284,15 +286,14 @@ class FAInferKernel {
         uint32_t vL1Stages = DOUBLE_BUFFER;
         uint32_t vSegLen = NUM_256;
         uint32_t vSliceWidth = L1_HEAD_DIM_SLICE;
-        uint32_t qL1Rows = Q_TILE_CEIL;
+        uint32_t qL1Rows = ActiveQTile();
         uint32_t pL1Rows = BlockMmadPV::L1TileShape::M;
         uint32_t pL1Stages = DOUBLE_BUFFER;
         if (!headDimSplit) {
-            // Preserve the production <=256 layout.
             kDynNum = RoundUp(embed, NUM_128);
             kDynNum = kDynNum < NUM_256 ? NUM_256 : kDynNum;
             uint32_t maxQKPL1Size = L1_MAX_SIZE - embedV * kvStackLen * sizeof(ElementV);
-            uint32_t maxQL1Size = Q_TILE_CEIL * kDynNum * sizeof(ElementQ);
+            uint32_t maxQL1Size = qL1Rows * kDynNum * sizeof(ElementQ);
             uint32_t maxNDynNum =
                 ((maxQKPL1Size - maxQL1Size) / kDynNum / sizeof(ElementV) / DOUBLE_BUFFER) / NUM_32 * NUM_32;
             nDynNum = maxNDynNum < L1_MAX_N_NUM ? maxNDynNum : L1_MAX_N_NUM;
@@ -351,7 +352,7 @@ class FAInferKernel {
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
 
         epilogueOnlineSoftmax.init(resource, scaleValue, softcapValue);
-        epilogueRescaleO.init(resource);
+        epilogueRescaleO.init(resource, ActiveQTile());
 
         coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
 #endif
@@ -395,10 +396,10 @@ class FAInferKernel {
                 // Per batch KV length including the appended new KV, reused by every task
                 kvSeqlenCur += (kvNewSeqlen != 0U ? kvNewSeqlen : 0U);
 
-                uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenCur, groupSize);
+                uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenCur, groupSize, ActiveQTile());
                 uint32_t qNBlockNumPerGroupTmp = CeilDiv(groupSize, curQNBlockTileTmp);
                 uint32_t curQNBlockNumTmp = qNBlockNumPerGroupTmp * kvHeads;
-                uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenCur);
+                uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenCur, ActiveQTile());
                 uint32_t curQSBlockNumTmp = CeilDiv(qSeqlenCur, curQSBlockTileTmp);
                 uint32_t curKSBlockNumTmp = CeilDiv(kvSeqlenCur, kvStackLen);
                 if (kvNewSeqlen != 0U) {
@@ -476,10 +477,10 @@ class FAInferKernel {
                     // GetQSBlockTile is a constant independent of kvSeqlen so the kv
                     // length is resolved in the cachedBatch gate below, not here. If this
                     // function ever becomes kv dependent move the kv resolution back.
-                    uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenCur, groupSize);
+                    uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenCur, groupSize, ActiveQTile());
                     uint32_t qNBlockNumPerGroupTmp = CeilDiv(groupSize, curQNBlockTileTmp);
                     uint32_t curQNBlockNumTmp = qNBlockNumPerGroupTmp * kvHeads;
-                    uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenCur);
+                    uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenCur, ActiveQTile());
                     uint32_t curQSBlockNumTmp = CeilDiv(qSeqlenCur, curQSBlockTileTmp);
                     curTotalTaskNumTmp += curQNBlockNumTmp * curQSBlockNumTmp;
                 }
@@ -493,10 +494,10 @@ class FAInferKernel {
                     }
                     // Per batch KV length including the appended new KV, reused by every task
                     kvSeqlenCur += (kvNewSeqlen != 0U ? kvNewSeqlen : 0U);
-                    uint32_t curQNBlockTileCur = GetQNBlockTile(qSeqlenCur, groupSize);
+                    uint32_t curQNBlockTileCur = GetQNBlockTile(qSeqlenCur, groupSize, ActiveQTile());
                     uint32_t qNBlockNumPerGroupCur = CeilDiv(groupSize, curQNBlockTileCur);
                     curQNBlockNumCur = qNBlockNumPerGroupCur * kvHeads;
-                    curQSBlockNumCur = CeilDiv(qSeqlenCur, 128);
+                    curQSBlockNumCur = CeilDiv(qSeqlenCur, ActiveQTile());
                     cachedBatch = curBatchTmp;
                 }
 
@@ -651,9 +652,9 @@ class FAInferKernel {
             lseHeadStride = maxQSeqlen;
         }
 
-        uint32_t curQNBlockTile = GetQNBlockTile(qSeqlen, groupSize);
+        uint32_t curQNBlockTile = GetQNBlockTile(qSeqlen, groupSize, ActiveQTile());
         uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
-        uint32_t curQSBlockTile = GetQSBlockTile(kvSeqlen);
+        uint32_t curQSBlockTile = GetQSBlockTile(kvSeqlen, ActiveQTile());
         uint32_t curQSBlockNum = CeilDiv(qSeqlen, curQSBlockTile);
         uint32_t curKSBlockNum = CeilDiv(kvSeqlen, kvStackLen);
         if (appendKVFlag) {
@@ -1023,7 +1024,7 @@ class FAInferKernel {
                 // maxQSeqlen (BSND) or totalQTokens (TND) — the correct per-layout head
                 // stride, so rescale_o.hpp's gLse[qNIdx * layoutLse.stride(0)] lands right.
                 LayoutLse layoutLse(qHeads, (INPUT_LAYOUT == FaiKenel::inputLayout::TND) ? totalQTokens : maxQSeqlen);
-                uint64_t gmOffsetUpdate = (uint64_t)(coreIdx * WORKSPACE_BLOCK_SIZE_DB);
+                uint64_t gmOffsetUpdate = static_cast<uint64_t>(coreIdx * WORKSPACE_BLOCK_SIZE_DB);
 
                 if (flashDecodeFlag != 0U) {
                     LayoutLse layoutgmLse(pvDesc.qSBlockSize, pvDesc.qNBlockSize);
@@ -1055,6 +1056,11 @@ class FAInferKernel {
             ++taskStackCount;
         }
         return !isEmptyTask;
+    }
+
+    __aicore__ inline uint32_t ActiveQTile() const
+    {
+        return kvNewSeqlen != 0U ? Q_TILE_APPEND : Q_TILE_CEIL;
     }
 
   private:

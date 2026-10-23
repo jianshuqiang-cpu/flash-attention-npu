@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include "tilingdata.h"
+#include "fa_tile_config.h"
 
 namespace fa_metadata {
 constexpr uint32_t MASK_DIM = 2048;
@@ -24,7 +25,7 @@ inline uint64_t MetadataBytes(bool /*has_mask*/)
     return sizeof(FAInferTilingData);
 }
 
-constexpr uint64_t WORKSPACE_BLOCK_SIZE_DB = static_cast<uint64_t>(128) * 512;
+constexpr uint64_t WORKSPACE_BLOCK_SIZE_DB = fa_tile_config::WORKSPACE_ELEMENTS;
 constexpr uint64_t PRELAUNCH_NUM = 3;
 inline uint64_t Mm1OutSize(uint64_t blockDim)
 {

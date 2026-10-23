@@ -8,37 +8,33 @@
 
 #include <cstdint>
 #include "tilingdata.h"
+#include "fa_tile_config.h"
 
 namespace fa_split {
 
-constexpr uint32_t Q_TILE_CEIL = 128;
+constexpr uint32_t Q_TILE_CEIL = fa_tile_config::Q_ROWS;
+constexpr uint32_t Q_TILE_APPEND = fa_tile_config::APPEND_Q_ROWS;
 constexpr uint32_t N_SPLIT_HELPER = 2;
-constexpr uint32_t MAX_KV_STACK_LEN = 512;
+constexpr uint32_t MAX_KV_STACK_LEN = fa_tile_config::MAX_KV_COLUMNS;
 
 inline uint32_t FaMin(uint32_t a, uint32_t b) { return a < b ? a : b; }
 inline uint32_t FaMax(uint32_t a, uint32_t b) { return a > b ? a : b; }
 
-inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
+inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize, uint32_t qTileCeil = Q_TILE_CEIL)
 {
-    uint32_t qRowNumCeil = Q_TILE_CEIL;
     uint32_t qNBlockTile = (qSeqlen != 0) ?
-        (qRowNumCeil / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER : Q_TILE_CEIL;
+        (qTileCeil / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER : qTileCeil;
     qNBlockTile = FaMin(qNBlockTile, groupSize);
     qNBlockTile = FaMax(qNBlockTile, static_cast<uint32_t>(1));
     return qNBlockTile;
 }
 
-inline uint32_t GetQSBlockTile(int64_t kvSeqlen)
+inline uint32_t GetQSBlockTile(int64_t kvSeqlen, uint32_t qTileCeil = Q_TILE_CEIL)
 {
-    uint32_t qSBlockTile = Q_TILE_CEIL;
-    return qSBlockTile;
+    (void)kvSeqlen;
+    return qTileCeil;
 }
 
-inline uint32_t GetKSBlockTile(uint32_t kvSeqlen)
-{
-    uint32_t kSBlockTile = MAX_KV_STACK_LEN;
-    return kSBlockTile;
-}
 
 struct BatchParams {
     uint32_t qSeqlen;
@@ -64,6 +60,7 @@ struct SplitContext {
     uint32_t blockDim;
     int32_t num_splits;
     int32_t kvNewSeqlen;
+    uint32_t kvTile = MAX_KV_STACK_LEN;
 };
 
 inline BatchParams getBatchParams(uint32_t bIdx, uint32_t groupSize, const SplitContext& ctx)
@@ -75,12 +72,13 @@ inline BatchParams getBatchParams(uint32_t bIdx, uint32_t groupSize, const Split
         p.qSeqlen = static_cast<uint32_t>(ctx.seqlen_q);
     }
     p.kvSeqlen = static_cast<uint32_t>(ctx.seqlens_k_cpu[bIdx] + ctx.kvNewSeqlen);
-    p.curQNBlockTile = GetQNBlockTile(p.qSeqlen, groupSize);
+    const uint32_t qTileCeil = (ctx.kvNewSeqlen != 0) ? Q_TILE_APPEND : Q_TILE_CEIL;
+    p.curQNBlockTile = GetQNBlockTile(p.qSeqlen, groupSize, qTileCeil);
     p.qNBlockNumPerGroup = (groupSize + p.curQNBlockTile - 1) / p.curQNBlockTile;
     p.curQNBlockNum = p.qNBlockNumPerGroup * ctx.num_heads_k;
-    p.curQSBlockTile = GetQSBlockTile(p.kvSeqlen);
+    p.curQSBlockTile = GetQSBlockTile(p.kvSeqlen, qTileCeil);
     p.curQSBlockNum = (p.qSeqlen + p.curQSBlockTile - 1) / p.curQSBlockTile;
-    p.curKSBlockTile = GetKSBlockTile(p.kvSeqlen);
+    p.curKSBlockTile = ctx.kvTile;
     // Per-phase S2 block count: old blocks + new blocks
     uint32_t kvSeqlenOld = static_cast<uint32_t>(p.kvSeqlen - ctx.kvNewSeqlen);
     uint32_t kvSBlockNumOld = (kvSeqlenOld + p.curKSBlockTile - 1) / p.curKSBlockTile;

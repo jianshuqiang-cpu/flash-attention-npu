@@ -11,7 +11,8 @@
 #include <cstring>
 
 namespace {
-constexpr uint32_t Q_TILE_CEIL = 128;
+constexpr uint32_t Q_TILE_CEIL = fa_tile_config::Q_ROWS;
+constexpr uint32_t Q_TILE_APPEND = fa_tile_config::APPEND_Q_ROWS;
 constexpr uint32_t N_SPLIT_HELPER = 2;
 constexpr uint32_t MASK_TYPE_NO_MASK = 0;
 constexpr uint32_t MASK_TYPE_CAUSAL = 1;
@@ -24,14 +25,9 @@ inline uint32_t CeilDiv(uint32_t a, uint32_t b)
     return (b == 0) ? 0 : (a + b - 1) / b;
 }
 
-inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
+inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize, uint32_t qTileCeil)
 {
-    uint32_t qNBlockTile = (qSeqlen != 0)
-        ? (Q_TILE_CEIL / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER
-        : Q_TILE_CEIL;
-    qNBlockTile = qNBlockTile < groupSize ? qNBlockTile : groupSize;
-    qNBlockTile = qNBlockTile < 1u ? 1u : qNBlockTile;
-    return qNBlockTile;
+    return fa_split::GetQNBlockTile(qSeqlen, groupSize, qTileCeil);
 }
 }
 
@@ -125,15 +121,16 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
     uint32_t firstBatchTaskNum = 0;
     uint32_t maxQ = 0;
     uint32_t minQ = 0xFFFFFFFFu;
+    const uint32_t qTileCeil = metaArgs->kvNewSeqlen != 0U ? Q_TILE_APPEND : Q_TILE_CEIL;
     for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
         uint32_t qSeqlen = metaArgs->maxQSeqlen;
         if (seqlensQ != nullptr) {
             qSeqlen = static_cast<uint32_t>(seqlensQ[batchIdx]);
         }
-        const uint32_t curQNBlockTile = GetQNBlockTile(qSeqlen, groupSize);
+        const uint32_t curQNBlockTile = GetQNBlockTile(qSeqlen, groupSize, qTileCeil);
         const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
         const uint32_t curQNBlockNum = qNBlockNumPerGroup * metaArgs->numHeadsK;
-        const uint32_t curQSBlockNum = CeilDiv(qSeqlen, Q_TILE_CEIL);
+        const uint32_t curQSBlockNum = CeilDiv(qSeqlen, qTileCeil);
         const uint32_t curTaskNum = curQNBlockNum * curQSBlockNum;
         if (batchIdx == 0) {
             firstBatchTaskNum = curTaskNum;
@@ -149,31 +146,32 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
     tilingData->firstBatchTaskNum = firstBatchTaskNum;
     tilingData->totalTaskNum = totalTaskNum;
 
-        const uint32_t bd = metaArgs->blockDim;
-        const uint32_t numTasks = metaArgs->batch * metaArgs->numHeadsK;
-        const bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * bd) && (maxKvSeqlen >= bd * 512u);
-        const bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * bd) && (maxKvSeqlen >= 1024u);
-        const bool fdFlag = (metaArgs->pagedKV != 0) && (metaArgs->isVarlen != 0) &&
-            (metaArgs->maskType != MASK_TYPE_BAND) &&
-            (maxQ * groupSize <= 128u) && (maxQ <= 16u) &&
-            (maxKvSeqlen >= 1024u) && (minQ > 0u) && (isLongSeq || isShortSeq);
-        tilingData->flashDecodeFlag = fdFlag ? 1u : 0u;
-        if (fdFlag) {
-            fa_split::SplitContext ctx{};
-            ctx.batch_size = static_cast<int32_t>(metaArgs->batch);
-            ctx.num_heads = static_cast<int32_t>(metaArgs->numHeads);
-            ctx.num_heads_k = static_cast<int32_t>(metaArgs->numHeadsK);
-            ctx.seqlen_q = static_cast<int32_t>(metaArgs->maxQSeqlen);
-            ctx.head_size_v = static_cast<int32_t>(metaArgs->embeddingSizeV);
-            ctx.seqlens_q_cpu = seqlensQ;
-            ctx.seqlens_k_cpu = cacheSeqlens;
-            ctx.blockDim = bd;
-            ctx.num_splits = static_cast<int32_t>(metaArgs->numSplits);
-            ctx.kvNewSeqlen = static_cast<int32_t>(metaArgs->kvNewSeqlen);
-            fa_split::splitBN2S1GS2(tilingData, ctx);
-            tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(static_cast<uint64_t>(bd))
-                + tilingData->splitLseTotalSize + tilingData->splitOTotalSize;
-        }
+    const uint32_t bd = metaArgs->blockDim;
+    const uint32_t numTasks = metaArgs->batch * metaArgs->numHeadsK;
+    const bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * bd) && (maxKvSeqlen >= bd * 512u);
+    const bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * bd) && (maxKvSeqlen >= 1024u);
+    const bool fdFlag = (metaArgs->pagedKV != 0) && (metaArgs->isVarlen != 0) &&
+        (metaArgs->maskType != MASK_TYPE_BAND) &&
+        (maxQ * groupSize <= 128u) && (maxQ <= 16u) &&
+        (maxKvSeqlen >= 1024u) && (minQ > 0u) && (isLongSeq || isShortSeq);
+    tilingData->flashDecodeFlag = fdFlag ? 1u : 0u;
+    if (fdFlag) {
+        fa_split::SplitContext ctx{};
+        ctx.batch_size = static_cast<int32_t>(metaArgs->batch);
+        ctx.num_heads = static_cast<int32_t>(metaArgs->numHeads);
+        ctx.num_heads_k = static_cast<int32_t>(metaArgs->numHeadsK);
+        ctx.seqlen_q = static_cast<int32_t>(metaArgs->maxQSeqlen);
+        ctx.head_size_v = static_cast<int32_t>(metaArgs->embeddingSizeV);
+        ctx.seqlens_q_cpu = seqlensQ;
+        ctx.seqlens_k_cpu = cacheSeqlens;
+        ctx.blockDim = bd;
+        ctx.num_splits = static_cast<int32_t>(metaArgs->numSplits);
+        ctx.kvNewSeqlen = static_cast<int32_t>(metaArgs->kvNewSeqlen);
+        ctx.kvTile = fa_split::MAX_KV_STACK_LEN;
+        fa_split::splitBN2S1GS2(tilingData, ctx);
+        tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(static_cast<uint64_t>(bd))
+            + tilingData->splitLseTotalSize + tilingData->splitOTotalSize;
+    }
 
     AscendC::DataStoreBarrier();
     return 0;

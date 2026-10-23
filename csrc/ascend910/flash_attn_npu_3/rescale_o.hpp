@@ -14,6 +14,7 @@
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
 #include "fa_block.h"
+#include "kernel_common.hpp"
 
 namespace Catlass::Epilogue::Block {
 
@@ -67,10 +68,12 @@ public:
     static constexpr uint32_t MAX_ROW_NUM_SUB_CORE = 256;
     static constexpr uint32_t SIZE_OF_16BIT = 2;
 
-    // Scalar + broadcast LSE: [177920, 180224), between live DM rows and raw masks.
-    static constexpr uint32_t LSE_STAGING_ELEMENTS = FLOAT_VECTOR_SIZE * (1 + FLOAT_BLOCK_SIZE);
-    static constexpr uint32_t LSE_STAGING_UB_OFFSET =
-        11 * UB_UINT8_BLOCK_SIZE - LSE_STAGING_ELEMENTS * sizeof(float);
+    // One vector owns at most Q_TILE_CEIL/2 rows. Compact LSE is followed by the
+    // Brcb expansion (8 floats per row). The expansion used to start at row 64,
+    // which overwrites the second half when a vector owns 128 rows.
+    static constexpr uint32_t MAX_LSE_ROWS = 128;
+    static constexpr uint32_t LSE_STAGING_ELEMENTS = MAX_LSE_ROWS * (1 + FLOAT_BLOCK_SIZE);
+    static constexpr uint32_t LSE_STAGING_UB_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
 
     struct SplitKVParams {
         bool isSplitkv = false;
@@ -87,20 +90,19 @@ public:
     ~BlockEpilogue() {}
 
     __aicore__ inline
-    void init(Arch::Resource<ArchTag> &resource)
+    void init(Arch::Resource<ArchTag> &resource, uint32_t qSBlockTile_ = KernelCommon::Q_TILE_CEIL)
     {
+        qSBlockTile = qSBlockTile_ == 0U ? KernelCommon::Q_TILE_CEIL : qSBlockTile_;
         // Allocate UB space
         constexpr uint32_t LO_UB_TENSOR_OFFSET = 6 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t GO_UB_TENSOR_OFFSET = 8 * UB_UINT8_BLOCK_SIZE;
 
         constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
+        // Keep in sync with online_softmax.hpp. 128 rows per vector, 3 state slots.
         constexpr uint32_t HM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t GM_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 2 * REPEAT_SIZE_IN_BYTE;
-        constexpr uint32_t GL_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 5 * REPEAT_SIZE_IN_BYTE;
-        constexpr uint32_t DM_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 8 * REPEAT_SIZE_IN_BYTE;
+        constexpr uint32_t GM_UB_TENSOR_OFFSET = HM_UB_TENSOR_OFFSET + 2 * 128 * sizeof(float);
+        constexpr uint32_t GL_UB_TENSOR_OFFSET = GM_UB_TENSOR_OFFSET + 3 * 128 * sizeof(float);
+        constexpr uint32_t DM_UB_TENSOR_OFFSET = GL_UB_TENSOR_OFFSET + 3 * 128 * sizeof(float);
 
         loUbTensor = resource.ubBuf.template GetBufferByByte<float>(LO_UB_TENSOR_OFFSET);
         dmUbTensor = resource.ubBuf.template GetBufferByByte<float>(DM_UB_TENSOR_OFFSET);
@@ -112,6 +114,8 @@ public:
         gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
         static_assert(DM_UB_TENSOR_OFFSET + (2 * MAX_ROW_NUM_SUB_CORE + FLOAT_VECTOR_SIZE) * sizeof(float)
             <= LSE_STAGING_UB_OFFSET, "LSE staging overlaps live DM rows");
+        static_assert(LSE_STAGING_UB_OFFSET + LSE_STAGING_ELEMENTS * sizeof(float) <= 192 * 1024,
+            "LSE staging exceeds vector UB");
         lseStagingUbTensor = resource.ubBuf.template GetBufferByByte<float>(LSE_STAGING_UB_OFFSET);
     }
 
@@ -145,30 +149,47 @@ public:
         }
         const uint32_t headCount = qNThisSubBlock == 0U ? 1U : qNThisSubBlock;
         const uint32_t rowsPerHead = qNThisSubBlock == 0U ? totalRowNum : qSThisSubBlock;
-        const int64_t tokenStart = static_cast<int64_t>(qSBlockIdx) * VECTOR_SIZE +
-            (qNThisSubBlock == 0U ? inRowOffsetThisSubBlock : 0U);
-        uint64_t headMask = 0;
-        if (invalidPrefixEndRow >= 0 && invalidPrefixEndRow != qSeqlen && invalidPrefixEndRow > tokenStart) {
-            const uint32_t prefixRows = AscendC::Std::min(
-                static_cast<int64_t>(rowsPerHead), static_cast<int64_t>(invalidPrefixEndRow) - tokenStart);
-            headMask |= ~uint64_t{0} >> (FLOAT_VECTOR_SIZE - prefixRows);
-        }
-        if (invalidSuffixStartRow > 0 && invalidSuffixStartRow < tokenStart + rowsPerHead) {
-            const uint32_t suffixStart = invalidSuffixStartRow > tokenStart ? invalidSuffixStartRow - tokenStart : 0U;
-            const uint32_t suffixRows = rowsPerHead - suffixStart;
-            headMask |= (~uint64_t{0} >> (FLOAT_VECTOR_SIZE - suffixRows)) << suffixStart;
-        }
-        if (headMask == 0U) {
-            return;
-        }
-        uint64_t invalidMask = 0;
+        // Q blocks start on Q_TILE_CEIL. A 64-bit Duplicate mask only covers 64 rows,
+        // but one vector can own a whole head group (qS * qN/2), which is larger.
+        const int64_t tokenStart = static_cast<int64_t>(qSBlockIdx) * static_cast<int64_t>(qSBlockTile) +
+            (qNThisSubBlock == 0U ? static_cast<int64_t>(inRowOffsetThisSubBlock) : 0);
+        const int64_t tokenEnd = tokenStart + static_cast<int64_t>(rowsPerHead);
+        // A counted Duplicate needs a 32-byte-aligned address, and a masked Duplicate
+        // keeps a pointer to its mask. Head rows are not aligned, so write +inf per row.
+        bool anyInvalid = false;
         for (uint32_t headIdx = 0; headIdx < headCount; ++headIdx) {
-            invalidMask |= headMask << (headIdx * rowsPerHead);
+            const uint32_t rowBase = headIdx * rowsPerHead;
+            if (rowBase >= 128U) {
+                break;
+            }
+            uint32_t prefixRows = 0U;
+            if (invalidPrefixEndRow >= 0 && invalidPrefixEndRow != static_cast<int32_t>(qSeqlen) &&
+                static_cast<int64_t>(invalidPrefixEndRow) > tokenStart) {
+                prefixRows = static_cast<uint32_t>(AscendC::Std::min(
+                    static_cast<int64_t>(rowsPerHead),
+                    static_cast<int64_t>(invalidPrefixEndRow) - tokenStart));
+            }
+            uint32_t suffixStart = rowsPerHead;
+            if (invalidSuffixStartRow > 0 && static_cast<int64_t>(invalidSuffixStartRow) < tokenEnd) {
+                suffixStart = static_cast<int64_t>(invalidSuffixStartRow) > tokenStart
+                    ? static_cast<uint32_t>(static_cast<int64_t>(invalidSuffixStartRow) - tokenStart)
+                    : 0U;
+            }
+            const uint32_t rowLimit = rowsPerHead < (128U - rowBase) ? rowsPerHead : (128U - rowBase);
+            for (uint32_t row = 0; row < rowLimit; ++row) {
+                if (row >= prefixRows && row < suffixStart) {
+                    continue;
+                }
+                if (!anyInvalid) {
+                    AscendC::PipeBarrier<PIPE_V>();
+                    anyInvalid = true;
+                }
+                lseUbTensor.SetValue(rowBase + row, LSE_OUT_INI);
+            }
         }
-        // Each vector owns at most 64 rows; mask from the aligned base even for unaligned heads.
-        uint64_t mask[2] = {invalidMask, 0};
-        AscendC::Duplicate<float>(lseUbTensor, LSE_OUT_INI, mask, 1, 1, 8);
-        AscendC::PipeBarrier<PIPE_V>();
+        if (anyInvalid) {
+            AscendC::PipeBarrier<PIPE_ALL>();
+        }
     }
 
     __aicore__ inline
@@ -315,9 +336,9 @@ public:
         uint32_t oHiddenSize = layoutOutput.shape(1);
         uint32_t qHeads = layoutLse.shape(0);
         uint32_t dmUbOffsetCurStackTile = curStackTileMod * MAX_ROW_NUM_SUB_CORE + rowOffsetLoop;
-        uint32_t stateRowOffset = taskStateSlot * 64 + rowOffsetLoop;
+        uint32_t stateRowOffset = taskStateSlot * 128 + rowOffsetLoop;
         auto lseUbTensor = lseStagingUbTensor;
-        auto lseBroadcastUbTensor = lseUbTensor[FLOAT_VECTOR_SIZE];
+        auto lseBroadcastUbTensor = lseUbTensor[MAX_LSE_ROWS];
 
         // FD: read partial-O / partial-LSE hidden dims from splitParams layouts.
         uint32_t oHiddenSize_gmlo = 0;
@@ -443,7 +464,7 @@ public:
                         AscendC::UnaryRepeatParams(1, 1, 4, 8));
                 }
             }
-            uint32_t rowStart = qSBlockIdx * VECTOR_SIZE + rowOffsetCurLoop ;
+            uint32_t rowStart = qSBlockIdx * qSBlockTile + rowOffsetCurLoop;
             uint32_t subBlockStart = (qNThisSubBlock == 0U) ? rowStart  : (rowStart >= qSeqlen ? rowStart - rowStart / qSeqlen * qSeqlen : rowStart);
             if (!splitParams.isSplitkv) {
                 if (qNThisSubBlock == 0U) {
@@ -451,7 +472,7 @@ public:
                         0U, rowStart, curRowNum, invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen, embedRound);
                 } else {
                     uint32_t innerGOUbRowOffset = 0U;
-                    uint32_t qBlockStart = qSBlockIdx * VECTOR_SIZE;
+                    uint32_t qBlockStart = qSBlockIdx * qSBlockTile;
                     if (proTokenNum != 0U) {
                         ClearInvalidOutputRows(
                             innerGOUbRowOffset, subBlockStart, proTokenNum,
@@ -497,9 +518,10 @@ public:
             if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
                 if (isLastRowLoop) {
                     AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
                     AscendC::Ln<float, false>(
                         lseUbTensor,
-                        glUbTensor[taskStateSlot * 64],
+                        glUbTensor[taskStateSlot * 128],
                         (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                         AscendC::UnaryRepeatParams(1, 1, 8, 8));
 
@@ -507,7 +529,7 @@ public:
                     AscendC::Add<float, false>(
                         lseUbTensor,
                         lseUbTensor,
-                        gmUbTensor[taskStateSlot * 64],
+                        gmUbTensor[taskStateSlot * 128],
                         (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                         AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
                     AscendC::PipeBarrier<PIPE_V>();
@@ -586,9 +608,10 @@ public:
                 if (splitParams.isSplitkv) {
                     if (isLastRowLoop) {
                         AscendC::PipeBarrier<PIPE_V>();
+                        AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
                         AscendC::Ln<float, false>(
                             lseUbTensor,
-                            glUbTensor[taskStateSlot * 64],
+                            glUbTensor[taskStateSlot * 128],
                             (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                             AscendC::UnaryRepeatParams(1, 1, 8, 8));
 
@@ -596,7 +619,7 @@ public:
                         AscendC::Add<float, false>(
                             lseUbTensor,
                             lseUbTensor,
-                            gmUbTensor[taskStateSlot * 64],
+                            gmUbTensor[taskStateSlot * 128],
                             (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                             AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
                         AscendC::PipeBarrier<PIPE_V>();
@@ -751,9 +774,13 @@ public:
                 auto gInputCurLoop = gInput[offsetInput];
                 auto layoutInputCurLoop = layoutInput.GetTileLayout(MatrixCoord(rowActualCurLoop, embed));
 
-                // Fixed 64-row vector partitions prevent cross-task O-update overwrites.
+                // O-update storage is reused across tasks. Keep each vector's
+                // partition fixed: a 255-row tail starts vector 1's input at
+                // row 127, but its update storage must still start at row 128.
+                // Otherwise it can overwrite vector 0's preceding task while
+                // that vector is still reading its final accumulated row.
                 int64_t offsetUpdate = layoutUpdate.GetOffset(
-                    MatrixCoord(subBlockIdx * FLOAT_VECTOR_SIZE + rowOffsetLoop, 0));
+                    MatrixCoord(subBlockIdx * (qSBlockTile / subBlockNum) + rowOffsetLoop, 0));
                 auto gUpdateCurLoop = gUpdate[offsetUpdate];
                 auto layoutUpdateCurLoop = layoutUpdate.GetTileLayout(MatrixCoord(rowActualCurLoop, embed));
 
@@ -811,6 +838,7 @@ private:
     AscendC::LocalTensor<float> goUbTensor32;
     AscendC::LocalTensor<float> gmUbTensor;
     AscendC::LocalTensor<float> lseStagingUbTensor;
+    uint32_t qSBlockTile = KernelCommon::Q_TILE_CEIL;
 };
 
 }

@@ -491,16 +491,17 @@ std::vector<at::Tensor> mha_fwd(
 
         uint32_t totalTaskNum = 0;
         uint32_t groupSize = num_heads / num_heads_k;
+        const uint32_t qTileCeil = appendKV ? fa_split::Q_TILE_APPEND : fa_split::Q_TILE_CEIL;
         for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
             uint64_t qSeqlen = seqlen_q;
             if (seqlens_q_cpu != nullptr) {
                 qSeqlen = *(seqlens_q_cpu + batchIdx);
             }
             uint64_t kvSeqlen = *(seqlens_k_cpu + batchIdx);
-            uint64_t curQNBlockTile = fa_split::GetQNBlockTile(qSeqlen, groupSize);
+            uint64_t curQNBlockTile = fa_split::GetQNBlockTile(qSeqlen, groupSize, qTileCeil);
             uint64_t qNBlockNumPerGroup = (groupSize + curQNBlockTile - 1) / curQNBlockTile;
             uint64_t curQNBlockNum = qNBlockNumPerGroup * num_heads_k;
-            uint64_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen);
+            uint64_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen, qTileCeil);
             uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
             uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
             if (batchIdx == 0) {
@@ -549,6 +550,7 @@ std::vector<at::Tensor> mha_fwd(
         splitCtx.blockDim = blockDim;
         splitCtx.num_splits = static_cast<int32_t>(num_splits);
         splitCtx.kvNewSeqlen = appendKV ? static_cast<int32_t>(kvNewSeqlen) : 0;
+        splitCtx.kvTile = fa_split::MAX_KV_STACK_LEN;
         if (flashDecodeFlag) {
             fa_split::splitBN2S1GS2(tiling_cpu_ptr, splitCtx);
             auto needCoreNum = tiling_cpu_ptr->get_needCoreNum();
@@ -557,7 +559,7 @@ std::vector<at::Tensor> mha_fwd(
             }
         }
 
-        uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;
+        uint64_t WORKSPACE_BLOCK_SIZE_DB = fa_metadata::WORKSPACE_BLOCK_SIZE_DB;
         uint64_t PRELANCH_NUM = 3;
         uint64_t mm1OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB * 4 * PRELANCH_NUM;
         uint64_t smOnlineOutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB * 2 * PRELANCH_NUM;

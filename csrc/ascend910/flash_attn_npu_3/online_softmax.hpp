@@ -84,15 +84,13 @@ public:
         constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t SOFTCAP_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t LM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
+        // Q tile 256 splits into 128 rows per vector. HM/LL hold one value per row.
+        // GM/GL keep 3 ping-pong slots of 128 rows. DM stays below the mask at 11 blocks.
         constexpr uint32_t HM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t LL_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + REPEAT_SIZE_IN_BYTE;
-        constexpr uint32_t GM_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 2 * REPEAT_SIZE_IN_BYTE;
-        constexpr uint32_t GL_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 5 * REPEAT_SIZE_IN_BYTE;
-        constexpr uint32_t DM_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 8 * REPEAT_SIZE_IN_BYTE;
+        constexpr uint32_t LL_UB_TENSOR_OFFSET = HM_UB_TENSOR_OFFSET + 128 * sizeof(float);
+        constexpr uint32_t GM_UB_TENSOR_OFFSET = LL_UB_TENSOR_OFFSET + 128 * sizeof(float);
+        constexpr uint32_t GL_UB_TENSOR_OFFSET = GM_UB_TENSOR_OFFSET + 3 * 128 * sizeof(float);
+        constexpr uint32_t DM_UB_TENSOR_OFFSET = GL_UB_TENSOR_OFFSET + 3 * 128 * sizeof(float);
 
         scaleValue = scaleValue_;
         softcapValue = softcapValue_;
@@ -450,7 +448,12 @@ public:
         uint32_t proTokenIdx, uint32_t proTokenNum,
         uint32_t integralHeadNum, uint32_t epiTokenNum, bool /*isNextMask*/)
     {
-        // EVENT_ID6/4 serialize raw-mask reuse; 184 KiB is reserved for CANN Select scratch.
+        // Raw masks alias the rescale epilogue's LSE staging buffer. EVENT_ID4
+        // only fences softmax's vector reads; also wait for the previous LSE
+        // store before MTE2 overwrites that buffer. Return EVENT_ID6 so the
+        // next mask load or rescale row loop can acquire it again.
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
         uint32_t innerUbRowOffset = 0;
         if (proTokenNum != 0) {
             AscendC::DataCopyPad(
@@ -841,7 +844,7 @@ public:
         uint32_t columnNumPad = layoutOutput.stride(0);
         uint32_t sUbOffset = pingpongFlag * MAX_UB_S_ELEM_NUM;
         uint32_t dmUbOffsetCurCycle = curStackTileMod * MAX_ROW_NUM_SUB_CORE + rowOffset;
-        uint32_t stateRowOffset = taskStateSlot * 64 + rowOffset;
+        uint32_t stateRowOffset = taskStateSlot * 128 + rowOffset;
 
         if constexpr (!doTriUMask) {
             if (isLastNoMaskStackTile && isLastRowLoop) {
