@@ -489,6 +489,19 @@ std::vector<at::Tensor> mha_fwd(
             tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL));
         }
 
+        bool tinyBatch16 = is_varlen_q && is_varlen_kv && !paged_KV && !appendKV && is_causal &&
+                           num_heads == 16 && num_heads_k == 16 && head_size_og == 128;
+        if (tinyBatch16) {
+            for (int32_t batchIdx = 0; batchIdx < batch_size; ++batchIdx) {
+                const uint64_t qLen = seqlens_q_cpu != nullptr ? seqlens_q_cpu[batchIdx] : seqlen_q;
+                if (qLen != 3U || static_cast<uint64_t>(seqlens_k_cpu[batchIdx]) != 3U) {
+                    tinyBatch16 = false;
+                    break;
+                }
+            }
+        }
+        tiling_cpu_ptr->set_tinyBatch16Flag(tinyBatch16 ? 1U : 0U);
+
         uint32_t totalTaskNum = 0;
         uint32_t groupSize = num_heads / num_heads_k;
         const uint32_t qTileCeil = appendKV ? fa_split::Q_TILE_APPEND : fa_split::Q_TILE_CEIL;
@@ -503,7 +516,7 @@ std::vector<at::Tensor> mha_fwd(
             uint64_t curQNBlockNum = qNBlockNumPerGroup * num_heads_k;
             uint64_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen, qTileCeil);
             uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
-            uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
+            uint64_t curTaskNum = tinyBatch16 ? 1U : curQNBlockNum * curQSBlockNum;
             if (batchIdx == 0) {
                 tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);
             }

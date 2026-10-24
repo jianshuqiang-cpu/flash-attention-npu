@@ -89,6 +89,7 @@ class FAInferKernel {
         uint64_t gmOffsetLseFD;
         uint64_t gmOffsetOFD;
         bool isSplitKV;
+        bool batchHeads16;
         uint64_t blockBOffset;
         uint32_t rowNum;
         uint32_t stackSeqTile;
@@ -153,6 +154,165 @@ class FAInferKernel {
         AscendC::GlobalTensor<ElementK>& gVNew;
     };
 
+#ifdef __DAV_C220_VEC__
+    // For S=3, H=16, D=128 the two Cube launches and their cross-core
+    // handshakes cost substantially more than the six causal dot products per
+    // head.  Each vector sub-core owns eight heads and evaluates the complete
+    // attention directly.  P is rounded to ElementP before P*V, while the
+    // denominator remains fp32, matching the regular online-softmax/PV order.
+    __aicore__ inline void runTinyVectorAttention(AscendC::GlobalTensor<ElementQ> gQ,
+                                                  AscendC::GlobalTensor<ElementK> gK,
+                                                  AscendC::GlobalTensor<ElementV> gV,
+                                                  AscendC::GlobalTensor<ElementO> gO,
+                                                  AscendC::GlobalTensor<ElementLse> gLse)
+    {
+        constexpr uint32_t TOKENS = 3U;
+        constexpr uint32_t DIM = 128U;
+        constexpr uint32_t HEADS_PER_SUBBLOCK = 8U;
+        constexpr uint32_t VEC_WIDTH = 64U;
+        constexpr uint32_t DOTS = 6U;
+        constexpr uint32_t SCORE_PITCH = 8U;
+
+        auto q16 = resource.ubBuf.template GetBufferByByte<ElementQ>(0U);
+        auto k16 = resource.ubBuf.template GetBufferByByte<ElementK>(1024U);
+        auto v16 = resource.ubBuf.template GetBufferByByte<ElementV>(2048U);
+        auto p16 = resource.ubBuf.template GetBufferByByte<ElementP>(3072U);
+        auto q32 = resource.ubBuf.template GetBufferByByte<float>(4096U);
+        auto k32 = resource.ubBuf.template GetBufferByByte<float>(6144U);
+        auto v32 = resource.ubBuf.template GetBufferByByte<float>(8192U);
+        auto tmp32 = resource.ubBuf.template GetBufferByByte<float>(10240U);
+        auto dot32 = resource.ubBuf.template GetBufferByByte<float>(11264U);
+        auto score32 = resource.ubBuf.template GetBufferByByte<float>(12288U);
+        auto quantP32 = resource.ubBuf.template GetBufferByByte<float>(12800U);
+        auto out32 = resource.ubBuf.template GetBufferByByte<float>(13312U);
+        auto out16 = resource.ubBuf.template GetBufferByByte<ElementO>(15360U);
+        auto lse32 = resource.ubBuf.template GetBufferByByte<float>(16384U);
+
+        const uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
+        const uint32_t headStart = subBlockIdx * HEADS_PER_SUBBLOCK;
+        const uint32_t logicalCore = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
+        const uint32_t logicalCoreNum = AscendC::GetBlockNum();
+        const uint32_t totalTokens = batch * TOKENS;
+        const uint32_t inputGapBytes = (qHeads * DIM - DIM) * sizeof(ElementQ);
+        const uint32_t outputGapBytes = (qHeads * DIM - DIM) * sizeof(ElementO);
+        const AscendC::DataCopyPadExtParams<ElementQ> qPad(false, 0, 0, 0);
+        const AscendC::DataCopyPadExtParams<ElementK> kPad(false, 0, 0, 0);
+        const AscendC::DataCopyPadExtParams<ElementV> vPad(false, 0, 0, 0);
+
+        for (uint32_t batchIdx = logicalCore; batchIdx < batch; batchIdx += logicalCoreNum) {
+            const uint64_t tokenBase = static_cast<uint64_t>(batchIdx) * TOKENS;
+            for (uint32_t localHead = 0; localHead < HEADS_PER_SUBBLOCK; ++localHead) {
+                const uint32_t head = headStart + localHead;
+                const uint64_t inputOffset = tokenBase * qHeads * DIM + static_cast<uint64_t>(head) * DIM;
+
+                AscendC::DataCopyPad(q16, gQ[inputOffset],
+                                     AscendC::DataCopyExtParams(TOKENS, DIM * sizeof(ElementQ), inputGapBytes, 0, 0),
+                                     qPad);
+                AscendC::DataCopyPad(k16, gK[inputOffset],
+                                     AscendC::DataCopyExtParams(TOKENS, DIM * sizeof(ElementK), inputGapBytes, 0, 0),
+                                     kPad);
+                AscendC::DataCopyPad(v16, gV[inputOffset],
+                                     AscendC::DataCopyExtParams(TOKENS, DIM * sizeof(ElementV), inputGapBytes, 0, 0),
+                                     vPad);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+
+                AscendC::Cast<float, ElementQ>(q32, q16, AscendC::RoundMode::CAST_NONE, TOKENS * DIM);
+                AscendC::Cast<float, ElementK>(k32, k16, AscendC::RoundMode::CAST_NONE, TOKENS * DIM);
+                AscendC::Cast<float, ElementV>(v32, v16, AscendC::RoundMode::CAST_NONE, TOKENS * DIM);
+                AscendC::PipeBarrier<PIPE_V>();
+
+                uint32_t dotIdx = 0U;
+                for (uint32_t qRow = 0; qRow < TOKENS; ++qRow) {
+                    for (uint32_t kRow = 0; kRow <= qRow; ++kRow) {
+                        AscendC::Mul<float>(tmp32, q32[qRow * DIM], k32[kRow * DIM], DIM);
+                        AscendC::PipeBarrier<PIPE_V>();
+                        AscendC::Add<float>(tmp32, tmp32, tmp32[VEC_WIDTH], VEC_WIDTH);
+                        AscendC::PipeBarrier<PIPE_V>();
+                        AscendC::WholeReduceSum<float, false>(dot32[dotIdx], tmp32, VEC_WIDTH, 1, 1, 1, 8);
+                        ++dotIdx;
+                    }
+                }
+                AscendC::PipeBarrier<PIPE_V>();
+
+                const float d0 = dot32.GetValue(0U) * scaleValue;
+                const float d10 = dot32.GetValue(1U) * scaleValue;
+                const float d11 = dot32.GetValue(2U) * scaleValue;
+                const float d20 = dot32.GetValue(3U) * scaleValue;
+                const float d21 = dot32.GetValue(4U) * scaleValue;
+                const float d22 = dot32.GetValue(5U) * scaleValue;
+                const float m0 = d0;
+                const float m1 = d10 > d11 ? d10 : d11;
+                float m2 = d20 > d21 ? d20 : d21;
+                m2 = m2 > d22 ? m2 : d22;
+
+                AscendC::Duplicate<float>(score32, -80.0f, TOKENS * SCORE_PITCH);
+                AscendC::PipeBarrier<PIPE_V>();
+                score32.SetValue(0U, d0 - m0);
+                score32.SetValue(SCORE_PITCH, d10 - m1);
+                score32.SetValue(SCORE_PITCH + 1U, d11 - m1);
+                score32.SetValue(2U * SCORE_PITCH, d20 - m2);
+                score32.SetValue(2U * SCORE_PITCH + 1U, d21 - m2);
+                score32.SetValue(2U * SCORE_PITCH + 2U, d22 - m2);
+                AscendC::PipeBarrier<PIPE_ALL>();
+                AscendC::Exp<float>(score32, score32, TOKENS * SCORE_PITCH);
+                AscendC::PipeBarrier<PIPE_V>();
+
+                const float sum0 = score32.GetValue(0U);
+                const float sum1 = score32.GetValue(SCORE_PITCH) + score32.GetValue(SCORE_PITCH + 1U);
+                const float sum2 = score32.GetValue(2U * SCORE_PITCH) + score32.GetValue(2U * SCORE_PITCH + 1U) +
+                                   score32.GetValue(2U * SCORE_PITCH + 2U);
+
+                AscendC::Cast<ElementP, float>(p16, score32, AscendC::RoundMode::CAST_RINT,
+                                               TOKENS * SCORE_PITCH);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Cast<float, ElementP>(quantP32, p16, AscendC::RoundMode::CAST_NONE,
+                                               TOKENS * SCORE_PITCH);
+                AscendC::PipeBarrier<PIPE_V>();
+
+                for (uint32_t qRow = 0; qRow < TOKENS; ++qRow) {
+                    const float denom = qRow == 0U ? sum0 : (qRow == 1U ? sum1 : sum2);
+                    AscendC::Muls<float>(out32[qRow * DIM], v32,
+                                        quantP32.GetValue(qRow * SCORE_PITCH), DIM);
+                    for (uint32_t kRow = 1U; kRow <= qRow; ++kRow) {
+                        AscendC::Muls<float>(tmp32, v32[kRow * DIM],
+                                            quantP32.GetValue(qRow * SCORE_PITCH + kRow), DIM);
+                        AscendC::PipeBarrier<PIPE_V>();
+                        AscendC::Add<float>(out32[qRow * DIM], out32[qRow * DIM], tmp32, DIM);
+                    }
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Muls<float>(out32[qRow * DIM], out32[qRow * DIM], 1.0f / denom, DIM);
+                }
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Cast<ElementO, float>(out16, out32, AscendC::RoundMode::CAST_RINT, TOKENS * DIM);
+
+                lse32.SetValue(0U, sum0);
+                lse32.SetValue(1U, sum1);
+                lse32.SetValue(2U, sum2);
+                AscendC::PipeBarrier<PIPE_ALL>();
+                AscendC::Ln<float>(lse32, lse32, TOKENS);
+                AscendC::PipeBarrier<PIPE_V>();
+                lse32.SetValue(0U, lse32.GetValue(0U) + m0);
+                lse32.SetValue(1U, lse32.GetValue(1U) + m1);
+                lse32.SetValue(2U, lse32.GetValue(2U) + m2);
+                AscendC::PipeBarrier<PIPE_ALL>();
+
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+                AscendC::DataCopyPad(gO[inputOffset], out16,
+                                     AscendC::DataCopyExtParams(TOKENS, DIM * sizeof(ElementO), 0,
+                                                                outputGapBytes, 0));
+                if constexpr (LSE_MODE == Epilogue::LseModeT::OUT_ONLY) {
+                    AscendC::DataCopyPad(gLse[static_cast<uint64_t>(head) * totalTokens + tokenBase], lse32,
+                                         AscendC::DataCopyExtParams(1, TOKENS * sizeof(float), 0, 0, 0));
+                }
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+            }
+        }
+    }
+#endif
+
     __aicore__ inline FAInferKernel() {}
 
     __aicore__ inline void operator()(FAIKernelParams const& params)
@@ -184,6 +344,7 @@ class FAInferKernel {
         flashDecodeFlag = fATilingData->flashDecodeFlag;
         kvNewSeqlen = fATilingData->kvNewSeqlen;
         kvCacheSeqlen = fATilingData->kvCacheSeqlen;
+        tinyBatch16Flag = fATilingData->tinyBatch16Flag;
         // Four 128-column base tiles form one S2 stage. Q remains resident in
         // L1 while later stages update max/sum and the output accumulator.
         kvStackLen = MAX_KV_STACK_LEN;
@@ -252,6 +413,15 @@ class FAInferKernel {
         strideO = static_cast<uint64_t>(qHeads * embedV);
         strideK = static_cast<uint64_t>(kvHeads * embed);
         strideV = static_cast<uint64_t>(kvHeads * embedV);
+
+        // The vector-only implementation does not apply softcap.  Keep the
+        // batched Cube/Vector schedule for softcap specializations.
+        if (tinyBatch16Flag != 0U && softcapValue == 0.0f) {
+#ifdef __DAV_C220_VEC__
+            runTinyVectorAttention(gQ, gK, gV, gO, gLse);
+#endif
+            return;
+        }
 
         uint32_t coreIdx = AscendC::GetBlockIdx();
         uint32_t coreNum = AscendC::GetBlockNum();
@@ -479,7 +649,8 @@ class FAInferKernel {
                     // function ever becomes kv dependent move the kv resolution back.
                     uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenCur, groupSize, ActiveQTile());
                     uint32_t qNBlockNumPerGroupTmp = CeilDiv(groupSize, curQNBlockTileTmp);
-                    uint32_t curQNBlockNumTmp = qNBlockNumPerGroupTmp * kvHeads;
+                    uint32_t curQNBlockNumTmp =
+                        tinyBatch16Flag != 0U ? 1U : qNBlockNumPerGroupTmp * kvHeads;
                     uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenCur, ActiveQTile());
                     uint32_t curQSBlockNumTmp = CeilDiv(qSeqlenCur, curQSBlockTileTmp);
                     curTotalTaskNumTmp += curQNBlockNumTmp * curQSBlockNumTmp;
@@ -496,8 +667,8 @@ class FAInferKernel {
                     kvSeqlenCur += (kvNewSeqlen != 0U ? kvNewSeqlen : 0U);
                     uint32_t curQNBlockTileCur = GetQNBlockTile(qSeqlenCur, groupSize, ActiveQTile());
                     uint32_t qNBlockNumPerGroupCur = CeilDiv(groupSize, curQNBlockTileCur);
-                    curQNBlockNumCur = qNBlockNumPerGroupCur * kvHeads;
-                    curQSBlockNumCur = CeilDiv(qSeqlenCur, ActiveQTile());
+                    curQNBlockNumCur = tinyBatch16Flag != 0U ? 1U : qNBlockNumPerGroupCur * kvHeads;
+                    curQSBlockNumCur = tinyBatch16Flag != 0U ? 1U : CeilDiv(qSeqlenCur, ActiveQTile());
                     cachedBatch = curBatchTmp;
                 }
 
@@ -652,18 +823,19 @@ class FAInferKernel {
             lseHeadStride = maxQSeqlen;
         }
 
-        uint32_t curQNBlockTile = GetQNBlockTile(qSeqlen, groupSize, ActiveQTile());
-        uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
-        uint32_t curQSBlockTile = GetQSBlockTile(kvSeqlen, ActiveQTile());
+        const bool batchHeads16 = tinyBatch16Flag != 0U;
+        uint32_t curQNBlockTile = batchHeads16 ? 16U : GetQNBlockTile(qSeqlen, groupSize, ActiveQTile());
+        uint32_t qNBlockNumPerGroup = batchHeads16 ? 1U : CeilDiv(groupSize, curQNBlockTile);
+        uint32_t curQSBlockTile = batchHeads16 ? 3U : GetQSBlockTile(kvSeqlen, ActiveQTile());
         uint32_t curQSBlockNum = CeilDiv(qSeqlen, curQSBlockTile);
         uint32_t curKSBlockNum = CeilDiv(kvSeqlen, kvStackLen);
         if (appendKVFlag) {
             curKSBlockNum = CeilDiv(kvSeqlenOld, kvStackLen) + CeilDiv(kvNewSeqlen, kvStackLen);
         }
 
-        uint32_t qNBlockIdxCurGroup = qNBlockIdx % qNBlockNumPerGroup;
-        uint32_t kvNIdx = qNBlockIdx / qNBlockNumPerGroup;
-        uint32_t qNStartIdx = kvNIdx * groupSize + qNBlockIdxCurGroup * curQNBlockTile;
+        uint32_t qNBlockIdxCurGroup = batchHeads16 ? 0U : qNBlockIdx % qNBlockNumPerGroup;
+        uint32_t kvNIdx = batchHeads16 ? 0U : qNBlockIdx / qNBlockNumPerGroup;
+        uint32_t qNStartIdx = batchHeads16 ? 0U : kvNIdx * groupSize + qNBlockIdxCurGroup * curQNBlockTile;
         uint32_t lseTokenOffset = qSBlockIdx * curQSBlockTile;
 
         uint64_t gmOffsetQ = qBOffset + static_cast<uint64_t>(qSBlockIdx * curQSBlockTile) * strideQ +
@@ -685,9 +857,11 @@ class FAInferKernel {
 
         uint32_t qSBlockSize =
             (qSBlockIdx == (curQSBlockNum - 1U)) ? (qSeqlen - qSBlockIdx * curQSBlockTile) : curQSBlockTile;
-        uint32_t qNBlockSize = (qNBlockIdxCurGroup == (qNBlockNumPerGroup - 1U))
-                                   ? (groupSize - qNBlockIdxCurGroup * curQNBlockTile)
-                                   : curQNBlockTile;
+        uint32_t qNBlockSize = batchHeads16
+                                   ? 16U
+                                   : ((qNBlockIdxCurGroup == (qNBlockNumPerGroup - 1U))
+                                          ? (groupSize - qNBlockIdxCurGroup * curQNBlockTile)
+                                          : curQNBlockTile);
         uint32_t rowNum = qSBlockSize * qNBlockSize;
 
         uint32_t noSkipKvS = kvSeqlen;
@@ -814,7 +988,7 @@ class FAInferKernel {
         LayoutQ layoutQTemp(rowNum, embed);
         LayoutK layoutKTemp(strideK, stackSeqTile);
         LayoutV layoutVTemp(stackSeqTile, strideV);
-        if (!isEmptyTask) {
+        if (!isEmptyTask && !batchHeads16) {
             blockMmadQK.resetBlockStart(kvStart, pagedBlockSize);
             blockMmadQK.loadQGM(gQ[gmOffsetQ], layoutQTemp, rowNum, qNBlockSize, qHeads);
         }
@@ -846,6 +1020,7 @@ class FAInferKernel {
                 desc.gmOffsetLseFD = gmOffsetLseFD;
                 desc.gmOffsetOFD = gmOffsetOFD;
                 desc.isSplitKV = isSplitKV;
+                desc.batchHeads16 = batchHeads16;
                 desc.blockBOffset = blockBOffset;
                 desc.rowNum = rowNum;
                 desc.qSeqlen = qSeqlen;
@@ -870,7 +1045,24 @@ class FAInferKernel {
                 // Newkv blocks read the contiguous k_new tensor and write back
                 // into the cache (page-addressed when paged); old blocks read
                 // the cache via the page table.
-                if constexpr (PAGED_CACHE_FLAG) {
+                if (batchHeads16) {
+                    uint32_t oneHead = 1U;
+                    uint32_t allHeads = qHeads;
+                    GemmCoord headShapeQK{qSBlockSize, desc.stackSeqTile, embed};
+                    LayoutQ headLayoutQ(qSBlockSize, embed);
+                    LayoutS headLayoutS(qSBlockSize, desc.stackSeqTile, stackSeqTilePad);
+                    for (uint32_t headIdx = 0; headIdx < 16U; ++headIdx) {
+                        const uint64_t qHeadOffset = gmOffsetQ + static_cast<uint64_t>(headIdx) * embed;
+                        const uint64_t kHeadOffset = qkSrcOffset + static_cast<uint64_t>(headIdx) * embed;
+                        const uint64_t sHeadOffset =
+                            gmOffsetS + static_cast<uint64_t>(headIdx) * qSBlockSize * stackSeqTilePad;
+                        blockMmadQK.loadQGM(gQ[qHeadOffset], headLayoutQ, qSBlockSize, oneHead, allHeads);
+                        blockMmadQK(gQ[qHeadOffset], gQKSrc[kHeadOffset], gS[sHeadOffset], gBlockTable, headLayoutQ,
+                                    layoutKTemp, headLayoutS, headShapeQK, kvSIdxLocal, kvSLoopNumTotal,
+                                    pagedBlockSize, strideK);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
+                    }
+                } else if constexpr (PAGED_CACHE_FLAG) {
                     blockMmadQK(gQ[gmOffsetQ], gQKSrc[qkSrcOffset], gS[gmOffsetS],
                                 isAppendBlock ? gBlockTable : gBlockTable[blockBOffset], layoutQTemp, layoutKTemp,
                                 layOutS, actualBlockShapeQK, kvSIdxLocal, kvSLoopNumTotal, pagedBlockSize, strideK,
@@ -881,7 +1073,7 @@ class FAInferKernel {
                                 layoutKTemp, layOutS, actualBlockShapeQK, kvSIdxLocal, kvSLoopNumTotal, pagedBlockSize,
                                 strideK, doCopyback, gK[gmOffsetK], qkCacheOffset);
                 }
-                if (kvSIdx == kvEnd - 1) {
+                if (!batchHeads16 && kvSIdx == kvEnd - 1) {
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
                 }
                 Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(qkReady);
@@ -1000,20 +1192,39 @@ class FAInferKernel {
                 LayoutP layoutPTemp(pvDesc.rowNum, pvDesc.stackSeqTile, stackSeqTilePad);
                 uint64_t gmOffsetP =
                     coreIdx * WORKSPACE_BLOCK_SIZE_DB * STACK_SLOTS + pvDesc.slot * WORKSPACE_BLOCK_SIZE_DB;
-                if constexpr (PAGED_CACHE_FLAG) {
+                if (pvDesc.batchHeads16) {
+                    GemmCoord headShapePV{pvDesc.qSBlockSize, embedV, pvDesc.stackSeqTile};
+                    LayoutP headLayoutP(pvDesc.qSBlockSize, pvDesc.stackSeqTile, stackSeqTilePad);
+                    LayoutOTmp headLayoutOTmp(pvDesc.qSBlockSize, embedV, embedRoundV);
+                    for (uint32_t headIdx = 0; headIdx < 16U; ++headIdx) {
+                        uint32_t headKvSIdx = pvDesc.kvSIdx;
+                        uint32_t headKvLoopNum = pvDesc.kvSLoopNumTotal;
+                        uint32_t headBlockSize = pagedBlockSize;
+                        const uint64_t pHeadOffset =
+                            gmOffsetP + static_cast<uint64_t>(headIdx) * pvDesc.qSBlockSize * stackSeqTilePad;
+                        const uint64_t vHeadOffset =
+                            pvDesc.gmOffsetVSrc + static_cast<uint64_t>(headIdx) * embedV;
+                        const uint64_t oHeadOffset =
+                            gmOffsetOTmp + static_cast<uint64_t>(headIdx) * pvDesc.qSBlockSize * embedRoundV;
+                        blockMmadPV(gP[pHeadOffset], gPVSrc[vHeadOffset], gOTmp[oHeadOffset], gBlockTable,
+                                    headLayoutP, layoutVTemp, headLayoutOTmp, headShapePV, headKvSIdx, headKvLoopNum,
+                                    headBlockSize, pvDesc.noSkipKvS, strideV, blockStackNum, softmaxReady,
+                                    headIdx == 0U);
+                    }
+                } else if constexpr (PAGED_CACHE_FLAG) {
                     // Delayed PV derives its page cursor from its own stack, not the current QK task.
                     blockMmadPV.resetBlockStart(pvDesc.kvSIdx, pagedBlockSize);
                     blockMmadPV(gP[gmOffsetP], gPVSrc[pvDesc.gmOffsetVSrc], gOTmp[gmOffsetOTmp],
                                 pvDesc.isAppendBlock ? gBlockTable : gBlockTable[pvDesc.blockBOffset], layoutPTemp,
                                 layoutVTemp, layoutOTmp, actualBlockShapePV, pvDesc.kvSIdx, pvDesc.kvSLoopNumTotal,
-                                pagedBlockSize, pvDesc.noSkipKvS, strideV, blockStackNum, softmaxReady,
+                                pagedBlockSize, pvDesc.noSkipKvS, strideV, blockStackNum, softmaxReady, true,
                                 pvDesc.doCopyback, gV[pvDesc.gmOffsetV], pvDesc.pvCacheOffset, gBlockTable,
                                 pvDesc.isAppendBlock ? pagedBlockSize : 0U, static_cast<uint32_t>(pvDesc.blockBOffset));
                 } else {
                     blockMmadPV(gP[gmOffsetP], gPVSrc[pvDesc.gmOffsetVSrc], gOTmp[gmOffsetOTmp], gBlockTable,
                                 layoutPTemp, layoutVTemp, layoutOTmp, actualBlockShapePV, pvDesc.kvSIdx,
                                 pvDesc.kvSLoopNumTotal, pagedBlockSize, pvDesc.noSkipKvS, strideV, blockStackNum,
-                                softmaxReady, pvDesc.doCopyback, gV[pvDesc.gmOffsetV], pvDesc.pvCacheOffset);
+                                softmaxReady, true, pvDesc.doCopyback, gV[pvDesc.gmOffsetV], pvDesc.pvCacheOffset);
                 }
                 Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(pvReady);
 #endif
@@ -1090,6 +1301,7 @@ class FAInferKernel {
     // Append-KV: per-batch new length (0 = disabled) and cache capacity.
     uint32_t kvNewSeqlen;
     uint32_t kvCacheSeqlen;
+    uint32_t tinyBatch16Flag;
 
     uint64_t strideQ;
     uint64_t strideO;

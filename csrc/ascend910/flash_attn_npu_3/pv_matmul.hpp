@@ -187,6 +187,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                                       LayoutA layoutA, LayoutB layoutB, LayoutC layoutC, GemmCoord actualOriShape,
                                       uint32_t& nIdx, uint32_t& nLoop, uint32_t& blockSize, uint32_t kvSeqlen,
                                       uint32_t strideKV, uint32_t blockStackNum, Arch::CrossCoreFlag softmaxFlag,
+                                      bool waitSoftmaxFlag,
                                       bool doCopyback = false,
                                       AscendC::GlobalTensor<ElementB> gBCache = AscendC::GlobalTensor<ElementB>(),
                                       uint64_t cacheRowBase = 0,
@@ -212,7 +213,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
         if (embed > EMBED_SPLIT_SIZE * 2U) {
             headDimSplitPV(gA, gB, gC, gBlockTable, layoutA, layoutB, layoutC, actualOriShape, nIdx, nLoop, blockSize,
                            kvSeqlen, strideKV, blockStackNum, softmaxFlag, doCopyback, gBCache, cacheRowBase,
-                           gCacheTable, cachePageSize, cacheTableBase);
+                           gCacheTable, cachePageSize, cacheTableBase, waitSoftmaxFlag);
             return;
         }
         GemmCoord actualShape{rowNum, embed, 0};
@@ -278,7 +279,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                     auto layoutTileA = layoutA.GetTileLayout(MakeCoord(mL1Actual, kL1Actual));
                     LayoutAInL1 layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(mL1Actual, kL1Actual);
                     // Delay P-ready until the first GM -> L1 load to overlap scalar setup.
-                    if (nL1Idx == 0U && mL1Idx == 0U && kL1Idx == 0U) {
+                    if (waitSoftmaxFlag && nL1Idx == 0U && mL1Idx == 0U && kL1Idx == 0U) {
                         Arch::CrossCoreWaitFlag(softmaxFlag);
                     }
                     copyGmToL1A(l1ATensor[l1PPingPongFlag], gmTileA, layoutAInL1, layoutTileA);
@@ -446,7 +447,7 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                    uint32_t& blockSize, uint32_t kvSeqlen, uint32_t strideKV, uint32_t blockStackNum,
                    Arch::CrossCoreFlag softmaxFlag, bool doCopyback, AscendC::GlobalTensor<ElementB> gBCache,
                    uint64_t cacheRowBase, AscendC::GlobalTensor<int32_t> gCacheTable, uint32_t cachePageSize,
-                   uint32_t cacheTableBase)
+                   uint32_t cacheTableBase, bool waitSoftmaxFlag)
     {
         (void)nLoop;
         (void)kvSeqlen;
@@ -463,7 +464,9 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
             // Compact decode: P stays resident in its own L1 buffer while the
             // output head-dim slices reuse it. V keeps the normal two-stage,
             // 128-column slice stream so the KV stack length stays 512.
-            Arch::CrossCoreWaitFlag(softmaxFlag);
+            if (waitSoftmaxFlag) {
+                Arch::CrossCoreWaitFlag(softmaxFlag);
+            }
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(4U);
             const LayoutAInL1 layoutPInL1 = LayoutAInL1::template MakeLayout<ElementA>(rowNum, stackSeqTile);
             auto layoutPTile = layoutA.GetTileLayout(MakeCoord(rowNum, stackSeqTile));
@@ -541,7 +544,9 @@ struct BlockMmad<MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
             return;
         }
 
-        Arch::CrossCoreWaitFlag(softmaxFlag);
+        if (waitSoftmaxFlag) {
+            Arch::CrossCoreWaitFlag(softmaxFlag);
+        }
 
         // Mirror the <=256 PV schedule: the head-dim output slice is the outer
         // loop, and every P tile / L0 slot comes from the shared pingPongState

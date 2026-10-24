@@ -575,6 +575,24 @@ public:
                                 gLse, lseUbTensor,
                                 AscendC::DataCopyExtParams(
                                     1, totalRowNum * sizeof(float), 0, 0, 0));
+                        } else if (qSThisSubBlock == 3U && qNThisSubBlock == 8U && totalRowNum == 24U) {
+                            // Tiny 16-head causal path: Brcb already gives each
+                            // scalar an aligned 8-float row.  Gather the first
+                            // float of the three token rows directly to each
+                            // head's strided GM slice.  This avoids the legacy
+                            // GM staging write -> read -> strided write cycle.
+                            for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock; ++qNIdx) {
+                                AscendC::DataCopyPad(
+                                    gLse[qNIdx * lseHeadStrideGm],
+                                    lseBroadcastUbTensor[qNIdx * qSThisSubBlock * FLOAT_BLOCK_SIZE],
+                                    AscendC::DataCopyExtParams(
+                                        qSThisSubBlock, sizeof(float),
+                                        (FLOAT_BLOCK_SIZE - 1U) * sizeof(float), 0, 0));
+                            }
+                            // lseBroadcastUbTensor is shared by following
+                            // tasks; retire all strided stores before reuse.
+                            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+                            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
                         } else if (lseSeqLen % FLOAT_BLOCK_SIZE == 0U) {
                             AscendC::DataCopyPad(
                                 gLse, lseUbTensor,

@@ -54,7 +54,9 @@ struct FAInferTilingData {
     uint64_t workSpaceSize;
     uint64_t padding1;
     uint64_t padding2;
-    uint32_t padding3;
+    // Reuse the ABI padding slot for the narrow 3-token MHA schedule:
+    // one task owns all 16 independent heads of a sequence.
+    uint32_t tinyBatch16Flag;
     int64_t windowSizeLeft = 0;
     int64_t windowSizeRight = 0;
     uint64_t splitLseTotalSize;
@@ -149,9 +151,9 @@ struct FAInferTilingData {
     {
         return padding2;
     }
-    uint32_t get_padding3() const
+    uint32_t get_tinyBatch16Flag() const
     {
-        return padding3;
+        return tinyBatch16Flag;
     }
     uint64_t get_splitLseTotalSize() const
     {
@@ -275,9 +277,9 @@ struct FAInferTilingData {
     {
         padding2 = value;
     }
-    void set_padding3(uint32_t value)
+    void set_tinyBatch16Flag(uint32_t value)
     {
-        padding3 = value;
+        tinyBatch16Flag = value;
     }
     void set_splitLseTotalSize(uint64_t value)
     {

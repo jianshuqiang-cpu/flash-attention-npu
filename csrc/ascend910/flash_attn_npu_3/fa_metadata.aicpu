@@ -117,6 +117,22 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
     tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(blockDim);
 
     const uint32_t groupSize = (metaArgs->numHeadsK == 0) ? 1u : (metaArgs->numHeads / metaArgs->numHeadsK);
+    // cacheSeqlens carries the already-differenced lengths; isVarlenKv is the
+    // independent layout marker supplied by the varlen Python entry point.
+    bool tinyBatch16 = metaArgs->isVarlen != 0U && metaArgs->isVarlenKv != 0U && metaArgs->pagedKV == 0U &&
+                       metaArgs->kvNewSeqlen == 0U && metaArgs->maskType == MASK_TYPE_CAUSAL &&
+                       metaArgs->numHeads == 16U && metaArgs->numHeadsK == 16U &&
+                       metaArgs->embeddingSize == 128U && metaArgs->embeddingSizeV == 128U &&
+                       seqlensQ != nullptr && cacheSeqlens != nullptr;
+    if (tinyBatch16) {
+        for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
+            if (seqlensQ[batchIdx] != 3 || cacheSeqlens[batchIdx] != 3) {
+                tinyBatch16 = false;
+                break;
+            }
+        }
+    }
+    tilingData->tinyBatch16Flag = tinyBatch16 ? 1U : 0U;
     uint32_t totalTaskNum = 0;
     uint32_t firstBatchTaskNum = 0;
     uint32_t maxQ = 0;
@@ -131,7 +147,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
         const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
         const uint32_t curQNBlockNum = qNBlockNumPerGroup * metaArgs->numHeadsK;
         const uint32_t curQSBlockNum = CeilDiv(qSeqlen, qTileCeil);
-        const uint32_t curTaskNum = curQNBlockNum * curQSBlockNum;
+        const uint32_t curTaskNum = tinyBatch16 ? 1U : curQNBlockNum * curQSBlockNum;
         if (batchIdx == 0) {
             firstBatchTaskNum = curTaskNum;
         }

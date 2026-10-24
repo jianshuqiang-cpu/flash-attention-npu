@@ -836,7 +836,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             qkv_dtype=q.dtype,
             cache_seqlens=maybe_contiguous(cache_seqlens),
             seqlens_q=seqlens_q,
-            cu_seqlens_k=None,
+            # The scheduler consumes the already-differenced cache_seqlens,
+            # but still needs presence of cu_seqlens_k to distinguish TND KV
+            # from a fixed-length KV tensor.
+            cu_seqlens_k=cu_seqlens_k,
             cu_seqlens_k_new=None,
             cache_leftpad=None,
             page_size=None,
