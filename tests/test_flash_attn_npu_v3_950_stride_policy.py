@@ -7,6 +7,7 @@ import importlib.util
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 import pytest
 import torch
@@ -16,11 +17,34 @@ import torch_npu  # Register the npu device type before loading custom ops.
 @pytest.fixture(scope="module")
 def interface():
     # Avoid package __init__ dispatching to the local machine's 910 backend.
+    name = "flash_attn_npu_3.flash_attn_npu_interface_950"
+    if name in sys.modules:
+        return sys.modules[name]
     path = Path(__file__).resolve().parents[1] / "flash_attn_npu_3/flash_attn_npu_interface_950.py"
-    spec = importlib.util.spec_from_file_location("_fa3_950_stride_policy", path)
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_eager_forward_preserves_transforms(interface):
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.overrides import TorchFunctionMode
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    tensor = torch.empty(2)
+    assert interface._can_use_eager_forward((tensor, None))
+    assert not interface._can_use_eager_forward((tensor.requires_grad_(),))
+    tensor.requires_grad_(False)
+    with TorchDispatchMode():
+        assert not interface._can_use_eager_forward((tensor,))
+    with TorchFunctionMode():
+        assert not interface._can_use_eager_forward((tensor,))
+    with FakeTensorMode():
+        assert not interface._can_use_eager_forward((tensor,))
+    subclass = tensor.as_subclass(type('TensorSubclass', (torch.Tensor,), {}))
+    assert not interface._can_use_eager_forward((subclass,))
 
 
 @pytest.mark.parametrize("layout", ["BBND", "BNBD"])
@@ -120,3 +144,17 @@ def test_empty_query_only_allows_the_declared_zero_length_path(interface):
         interface._validate_varlen_query(q, cu_q, max_seqlen_q=1)
     with pytest.raises(RuntimeError, match="total_q must be positive"):
         interface._validate_varlen_query(q, cu_q)
+
+
+def test_forward_resource_bounds(tmp_path):
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("requires a host C++ compiler")
+    root = Path(__file__).resolve().parents[1]
+    binary = tmp_path / "resources"
+    subprocess.run([
+        compiler, "-std=c++17", "-O2", "-I", str(root / "csrc/ascend950/flash_attn_npu_3"),
+        str(Path(__file__).with_name("test_flash_attn_npu_v3_950_resource_plan.cpp")), "-o", str(binary),
+    ], check=True, capture_output=True, text=True)
+    result = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+    assert "resource bounds passed" in result.stdout
