@@ -454,6 +454,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
 
         // wait QK Fixpipe finsh
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
+        // Mask DMA and P-slot reuse are fenced by the specific waits below.
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(4);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
         if (isFirstKvSTile) {
@@ -646,6 +647,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         __ubuf__ ElementMask* maskNextUbAddr = (__ubuf__ ElementMask*)maskUbTensor[MASK_NEXT_ELEM_OFFSET].GetPhyAddr();
 
         WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
+        // Mask DMA and P-slot reuse are fenced by the specific waits below.
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(4);
         if (doTriUPreMask && doTriUNextMask) {
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(5);

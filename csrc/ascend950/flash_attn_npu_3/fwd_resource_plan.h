@@ -19,6 +19,7 @@ constexpr uint32_t PV_FLAG_BASE = SCORE_STAGES + P_STAGES;
 
 struct UbPlan {
     uint32_t s, p, lo, go, lm, gm, dm, ll, gl, mask, total;
+    uint32_t finalMax, finalSum;
     uint32_t sBytes, pBytes, loBytes, otmpStages;
 };
 
@@ -41,7 +42,9 @@ FA950_PLAN_INLINE constexpr UbPlan MakeUbPlan(uint32_t dv, uint32_t otmpStages)
     u.ll = u.dm + P_STAGES * 64U * 4U;
     u.gl = u.ll + 64U * 4U;
     u.mask = u.gl + 64U * 4U;
-    u.total = u.mask + 2U * 64U * 128U;
+    u.finalMax = u.mask + 2U * 64U * 128U;
+    u.finalSum = u.finalMax + P_STAGES * 64U * 4U;
+    u.total = u.finalSum + P_STAGES * 64U * 4U;
     return u;
 }
 
@@ -65,7 +68,9 @@ FA950_PLAN_INLINE constexpr UbPlan KernelUbPlan(uint32_t dv, uint32_t qTile)
     u.ll = u.dm + 768U;
     u.gl = u.ll + 256U;
     u.mask = u.gl + 256U;
-    u.total = u.mask + 16384U;
+    u.finalMax = u.mask + 16384U;
+    u.finalSum = u.finalMax + P_STAGES * 64U * 4U;
+    u.total = u.finalSum + P_STAGES * 64U * 4U;
     return u;
 }
 
@@ -93,9 +98,10 @@ FA950_PLAN_INLINE constexpr uint32_t QueryTileForTasks(uint32_t d, uint32_t dv, 
     return dv > 128U && fullQ128Tasks < uint64_t(cores) * 4U ? 64U : QueryTile(d, dv, maxQ);
 }
 
-static_assert(MakeUbPlan(160, 2).total == 239872U, "D160 dual-buffer layout");
-static_assert(MakeUbPlan(192, 1).total == 215296U, "D192 single-buffer layout");
-static_assert(MakeUbPlan(256, 1).total == 248064U, "D256 single-buffer layout");
+static_assert(MakeUbPlan(160, 2).total == 241408U, "D160 dual-buffer layout");
+static_assert(MakeUbPlan(192, 1).total == 216832U, "D192 single-buffer layout");
+static_assert(MakeUbPlan(256, 1).total == 249600U, "D256 single-buffer layout");
+static_assert(KernelUbPlan(128, 128).total <= UB_CAPACITY, "Small-query/DN UB capacity");
 static_assert(MakeUbPlan(256, 1).total <= UB_CAPACITY, "FP16/BF16 UB capacity");
 static_assert(L1Bytes(256, 256) <= L1_CAPACITY, "FP16/BF16 L1 capacity");
 } // namespace fa950_plan

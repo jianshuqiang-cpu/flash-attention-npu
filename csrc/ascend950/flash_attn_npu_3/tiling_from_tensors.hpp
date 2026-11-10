@@ -12,12 +12,65 @@
 #include <ATen/ATen.h>
 #include <c10/util/Optional.h>
 
-#include "tilingdata.h"
+#include "fwd_tiling_policy.h"
+#include "torch_npu/csrc/core/npu/NPUStream.h"
 
 namespace flash_attn_npu_950_v3 {
 struct SeqlenScratch {
     std::vector<int32_t> q;  // Q seqlen list (cumulative for TND, per-batch for BSND)
     std::vector<int32_t> kv; // KV seqlen list (per-batch for paged/BSND, cumulative for TND+non-paged)
+    std::vector<at::Tensor> cpu;
+
+    void CopySeqlensToCpu(const std::vector<at::Tensor>& tensors, const at::Device& device)
+    {
+        cpu.assign(tensors.size(), at::Tensor());
+        std::vector<size_t> pending;
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            const auto& tensor = tensors[i];
+            if (!tensor.defined()) {
+                continue;
+            }
+            size_t j = 0;
+            for (; j < i; ++j) {
+                if (tensor.is_same(tensors[j])) {
+                    cpu[i] = cpu[j];
+                    break;
+                }
+            }
+            if (j != i) {
+                continue;
+            }
+            if (tensor.device() != device || !tensor.is_contiguous() || tensor.numel() == 0) {
+                // Preserve the existing copy path for other devices and strided lengths.
+                cpu[i] = tensor.to(at::Device(at::kCPU)).to(at::kInt).contiguous();
+            } else {
+                cpu[i] = at::empty(tensor.sizes(), tensor.options().device(at::kCPU).pinned_memory(true));
+                pending.push_back(i);
+            }
+        }
+        if (pending.empty()) {
+            return;
+        }
+
+        // Allocate every destination before submitting DMA. Both source and
+        // destination tensors stay alive until all copies have completed.
+        const auto stream = c10_npu::getCurrentNPUStream(device.index());
+        try {
+            for (size_t i : pending) {
+                cpu[i].copy_(tensors[i], true);
+            }
+            stream.synchronize();
+        } catch (...) {
+            // A later copy may fail after earlier copies were queued. Drain
+            // those copies before unwinding; preserve the original exception.
+            try {
+                stream.synchronize();
+            } catch (...) {
+                // The pinned allocator also records in-flight copy events.
+            }
+            throw;
+        }
+    }
 };
 
 // Decumulate `cu` (size = batch + 1, int32) into per-batch seqlen

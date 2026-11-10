@@ -97,6 +97,19 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.gm);
         dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.dm);
         glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.gl);
+        finalMaxUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.finalMax);
+        finalSumUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.finalSum);
+    }
+
+    // The next Q task may reset the running softmax state before this task's
+    // final PV reaches rescale. Keep its final statistics with the P ring slot.
+    __aicore__ inline void SaveFinalStatistics(uint32_t pBufId)
+    {
+        AscendC::DataCopy(finalMaxUbTensor32[pBufId * DM_UB_GLOBAL_ELEM_NUM], gmUbTensor32,
+                         DM_UB_GLOBAL_ELEM_NUM);
+        AscendC::DataCopy(finalSumUbTensor32[pBufId * DM_UB_GLOBAL_ELEM_NUM], glUbTensor32,
+                         DM_UB_GLOBAL_ELEM_NUM);
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     template <uint32_t MODE, pipe_t PIPE>
@@ -722,8 +735,14 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
                int32_t delEndRow = 0, uint32_t qSeqlen = 0, uint32_t qSTileStart = 0,
                AscendC::GlobalTensor<float> gPartialO = {}, AscendC::GlobalTensor<float> gPartialLse = {},
                bool writePartial = false, uint32_t partialId = 0, uint32_t fdRowCapacity = 0,
-               uint32_t fdLseSubStride = 0, float vDequantScale = 1.0f)
+               uint32_t fdLseSubStride = 0, float vDequantScale = 1.0f, bool useFinalStatistics = false)
     {
+        auto runningMax = gmUbTensor32;
+        auto runningSum = glUbTensor32;
+        if (useFinalStatistics && isLastKvSTile) {
+            gmUbTensor32 = finalMaxUbTensor32[curTileMod * DM_UB_GLOBAL_ELEM_NUM];
+            glUbTensor32 = finalSumUbTensor32[curTileMod * DM_UB_GLOBAL_ELEM_NUM];
+        }
         if constexpr (FULL_QUANT_FP8) {
             vDequantScale_ = vDequantScale;
         }
@@ -832,6 +851,8 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
                 }
             }
         }
+        gmUbTensor32 = runningMax;
+        glUbTensor32 = runningSum;
     }
 
   private:
@@ -844,6 +865,8 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
     AscendC::LocalTensor<float> glUbTensor32;
     AscendC::LocalTensor<float> lmUbTensor32;
     AscendC::LocalTensor<float> gmUbTensor32;
+    AscendC::LocalTensor<float> finalMaxUbTensor32;
+    AscendC::LocalTensor<float> finalSumUbTensor32;
     AscendC::LocalTensor<ElementO> goUbTensor16;
     AscendC::LocalTensor<ElementOTmp> goUbTensor32;
 

@@ -654,8 +654,9 @@ def _training_forward(
                 dtype=torch.int32,
                 device=k.device,
             )
-        else:
-            seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+
+    # Packed TND already carries the physical KV lengths in cu_seqlens_k.
+    # An absent seqused_k means that the complete packed regions are used.
 
     return _flash_attn_forward(
         q,
