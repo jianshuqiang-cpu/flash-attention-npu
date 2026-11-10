@@ -23,7 +23,8 @@ extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args);
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& cacheSeqlens,
                                            const std::optional<at::Tensor>& seqlensQ)
 {
-    const int64_t bytes = static_cast<int64_t>(fa_metadata::MetadataBytesWithKv(args.maskType != 0, args.batch));
+    const int64_t bytes = static_cast<int64_t>(
+        fa_metadata::SchedulerMetadataBytes(args.maskType != 0, args.batch, args.numSplits));
     at::Tensor meta = at::empty({bytes}, at::device(at::kPrivateUse1).dtype(at::kByte));
     args.metaOutAddr = reinterpret_cast<uint64_t>(meta.data_ptr());
 
@@ -75,8 +76,8 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     TORCH_CHECK(cache_seqlens.is_contiguous(), "cache_seqlens must be contiguous");
     TORCH_CHECK(cache_seqlens.device().type() == at::kPrivateUse1, "cache_seqlens must be an NPU tensor");
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
+    TORCH_CHECK(num_heads_q > 0 && num_heads_kv > 0, "head counts must be positive");
     TORCH_CHECK(num_heads_q % num_heads_kv == 0, "Number of heads in key/value must divide number of heads in query");
-    TORCH_CHECK(num_splits == 0 || num_splits == 1, "950 backend (v3) only supports num_splits=0 or 1");
     TORCH_CHECK(quant_mode == 0 || quant_mode == 1, "unsupported quantization mode");
     TORCH_CHECK(quant_mode != 1 || (headdim == 128 && headdim_v == 128),
                 "950 V3 FP8 requires Q/K/V head dimensions of 128");
@@ -99,6 +100,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     }
 
     const uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
+    TORCH_CHECK(num_splits >= 0 && num_splits <= blockDim, "950 backend (v3) requires num_splits in [0, ", blockDim, "]");
     const uint32_t ps = page_size.has_value() ? static_cast<uint32_t>(page_size.value()) : 128;
 
     FAMetadataArgs args{};
@@ -125,6 +127,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.isVarlenKv = is_varlen_kv ? 1u : 0u;
     args.pagedKV = page_size.has_value() ? 1u : 0u;
     args.quantMode = quant_mode;
+    args.numSplits = static_cast<uint32_t>(num_splits);
     // Schedule is scale/softcap independent; hasSoftcap is API parity only.
     (void)hasSoftcap;
     return GetSchedulerMetadataImpl(args, cache_seqlens, seqlens_q);

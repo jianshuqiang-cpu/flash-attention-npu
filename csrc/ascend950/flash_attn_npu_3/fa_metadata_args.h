@@ -52,6 +52,19 @@ inline uint64_t MetadataBytesWithKv(bool hasMask, uint32_t batch)
     return KvSeqlenOffset(hasMask) + KvSeqlenBytes(batch);
 }
 
+// The tensor's host-visible byte extent carries the split-policy contract.
+// Keep tiling/kvCum offsets unchanged. A versioned trailer distinguishes new
+// metadata and makes the contract survive clone/copy_/graph input copies,
+// without a pointer registry or reading device contents back to the host.
+constexpr uint64_t SPLIT_CONTRACT_BYTES = 64;
+inline uint64_t SchedulerMetadataBytes(bool hasMask, uint32_t batch, uint32_t numSplits)
+{
+    // A 64-byte slot per batch keeps (batch, numSplits) pairs distinct for
+    // the supported <=32-core FD schedules. kvCum itself remains packed.
+    return (MetadataBytes(hasMask) + 63U) / 64U * 64U +
+           (static_cast<uint64_t>(batch) + 1U) * 64U + SPLIT_CONTRACT_BYTES + numSplits;
+}
+
 inline uint64_t Mm1OutSize(uint64_t blockDim)
 {
     return blockDim * WORKSPACE_BLOCK_SIZE_DB * SIZE_OF_32BIT * PRELAUNCH_NUM;
@@ -122,6 +135,7 @@ struct FAMetadataArgs {
     uint32_t isVarlenKv;
     uint32_t pagedKV;
     uint32_t quantMode;
+    uint32_t numSplits;
 };
 
 #endif

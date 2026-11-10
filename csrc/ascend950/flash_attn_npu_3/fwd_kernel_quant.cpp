@@ -140,9 +140,11 @@ class FAIKernel950 {
         AscendC::GlobalTensor<float> gLse;
         gLse.SetGlobalBuffer((__gm__ float*)params.lse);
         AscendC::GlobalTensor<float> gPartialLse;
-        gPartialLse.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialLseOffset));
         AscendC::GlobalTensor<float> gPartialO;
-        gPartialO.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialOOffset));
+        if (faiTilingData->flashDecodeFlag != 0U) {
+            gPartialLse.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialLseOffset));
+            gPartialO.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialOOffset));
+        }
 #ifdef __DAV_VEC__
         const bool hasQDescale = params.qDescale != nullptr;
         const bool hasKDescale = params.kDescale != nullptr;
@@ -283,13 +285,19 @@ class FAIKernel950 {
         int32_t fdFirstKvTileStart = -1;
         int32_t fdLastKvTileEnd = -1;
         if (flashDecodeFlag_ != 0U) {
-            fdBaseTaskStart = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskStart;
-            fdBaseTaskEnd = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskEnd;
-            fdFirstKvTileStart = faiTilingData->fdDecodeSchedules[coreIdx].firstKvTileStart;
-            fdLastKvTileEnd = faiTilingData->fdDecodeSchedules[coreIdx].lastKvTileEnd;
-            taskBegin = static_cast<uint32_t>(fdBaseTaskStart);
-            taskEnd = static_cast<uint32_t>(fdBaseTaskEnd);
+            taskBegin = 0U;
+            taskEnd = 0U;
             taskStep = 1U;
+            // Metadata launches all cores; only active FD cores have schedule entries.
+            // Idle cores still join the synchronization before combine.
+            if (coreIdx < faiTilingData->fdActiveCoreNum) {
+                fdBaseTaskStart = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskStart;
+                fdBaseTaskEnd = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskEnd;
+                fdFirstKvTileStart = faiTilingData->fdDecodeSchedules[coreIdx].firstKvTileStart;
+                fdLastKvTileEnd = faiTilingData->fdDecodeSchedules[coreIdx].lastKvTileEnd;
+                taskBegin = static_cast<uint32_t>(fdBaseTaskStart);
+                taskEnd = static_cast<uint32_t>(fdBaseTaskEnd);
+            }
         }
         uint32_t pipelineTileBase = 0U;
         uint64_t pipelineL0AStageBase = 0U;
@@ -626,14 +634,13 @@ class FAIKernel950 {
             pipelineL0BStageBase += static_cast<uint64_t>(kvSLoopCount) * (qkL0BTotalStages_ + pvL0BTotalStages_);
         }
         ReleaseSyncFlags<4, 4, 4>();
-        if constexpr (qFormat == Format::TND && kvcacheType == CacheMode::pagedCache &&
-                      maskCategory != SLIDING_WINDOW_MASK) {
+        if constexpr (maskCategory != SLIDING_WINDOW_MASK) {
             if (flashDecodeFlag_ != 0U) {
                 // Every producer joins before combine reuses the main kernel's UB.
                 AscendC::PipeBarrier<PIPE_ALL>();
                 AscendC::SyncAll<false>();
 #ifdef __DAV_VEC__
-                FlashDecodeCombine950<ElementO, LseMode, 1> combine(resource);
+                FlashDecodeCombine950<ElementO, LseMode, qFormat, 1> combine(resource);
                 combine(params);
 #endif
             }

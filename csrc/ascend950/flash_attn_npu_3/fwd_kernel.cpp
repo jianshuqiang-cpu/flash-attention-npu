@@ -143,9 +143,11 @@ class FAIKernel950 {
         AscendC::GlobalTensor<float> gLse;
         gLse.SetGlobalBuffer((__gm__ float*)params.lse);
         AscendC::GlobalTensor<float> gPartialLse;
-        gPartialLse.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialLseOffset));
         AscendC::GlobalTensor<float> gPartialO;
-        gPartialO.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialOOffset));
+        if (faiTilingData->flashDecodeFlag != 0U) {
+            gPartialLse.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialLseOffset));
+            gPartialO.SetGlobalBuffer((__gm__ float*)(params.workSpace + faiTilingData->fdPartialOOffset));
+        }
         AscendC::GlobalTensor<ElementMask> gMask;
         gMask.SetGlobalBuffer((__gm__ ElementMask*)params.mask);
         //tiling data
@@ -329,13 +331,19 @@ class FAIKernel950 {
         int32_t fdFirstKvTileStart = -1;
         int32_t fdLastKvTileEnd = -1;
         if (flashDecodeFlag_ != 0U) {
-            fdBaseTaskStart = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskStart;
-            fdBaseTaskEnd = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskEnd;
-            fdFirstKvTileStart = faiTilingData->fdDecodeSchedules[coreIdx].firstKvTileStart;
-            fdLastKvTileEnd = faiTilingData->fdDecodeSchedules[coreIdx].lastKvTileEnd;
-            taskBegin = static_cast<uint32_t>(fdBaseTaskStart);
-            taskEnd = static_cast<uint32_t>(fdBaseTaskEnd);
+            taskBegin = 0U;
+            taskEnd = 0U;
             taskStep = 1U;
+            // Metadata launches all cores; only active FD cores have schedule entries.
+            // Idle cores still join the synchronization before combine.
+            if (coreIdx < faiTilingData->fdActiveCoreNum) {
+                fdBaseTaskStart = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskStart;
+                fdBaseTaskEnd = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskEnd;
+                fdFirstKvTileStart = faiTilingData->fdDecodeSchedules[coreIdx].firstKvTileStart;
+                fdLastKvTileEnd = faiTilingData->fdDecodeSchedules[coreIdx].lastKvTileEnd;
+                taskBegin = static_cast<uint32_t>(fdBaseTaskStart);
+                taskEnd = static_cast<uint32_t>(fdBaseTaskEnd);
+            }
         }
         uint32_t pipelineTileBase = 0U;
         uint64_t pipelineL0AStageBase = 0U;
@@ -764,15 +772,14 @@ class FAIKernel950 {
             pipelineL0BStageBase += static_cast<uint64_t>(kvSLoopCount) * (qkL0BTotalStages_ + pvL0BTotalStages_);
         }
         ReleaseSyncFlags<4, 4, 4>();
-        if constexpr (!IsDN && qFormat == Format::TND && kvcacheType == CacheMode::pagedCache &&
-                      maskCategory != MaskCategory::MASK_SWA) {
+        if constexpr (!IsDN && maskCategory != MaskCategory::MASK_SWA) {
             if (flashDecodeFlag_ != 0U) {
                 // All launched AIC/AIV blocks join after their partial DMAs
                 // complete. Reuse the main kernel's UB only after this barrier.
                 AscendC::PipeBarrier<PIPE_ALL>();
                 AscendC::SyncAll<false>();
 #ifdef __DAV_VEC__
-                FlashDecodeCombine950<ElementO, LseMode> combine(resource);
+                FlashDecodeCombine950<ElementO, LseMode, qFormat> combine(resource);
                 combine(params);
 #endif
             }
@@ -971,7 +978,7 @@ class FAIKernel950 {
 
 template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
           MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
-CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
+__aicore__ inline void RunFAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
                             GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
                             GM_ADDR workspace, GM_ADDR tiling, float scaleValue, float softcapValue, uint32_t numBlocks,
                             uint32_t maxNumBlocksPerBatch, int64_t kvSeqlenAllocated, FwdStorageParams storage)
@@ -1060,7 +1067,7 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
 
 template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
           MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
-CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o,
+__aicore__ inline void RunFAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o,
                               GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ,
                               GM_ADDR seqUsedKv, GM_ADDR workspace, GM_ADDR tiling, float scaleValue,
                               float softcapValue, uint32_t numBlocks, uint32_t maxNumBlocksPerBatch,
@@ -1139,4 +1146,41 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
                            storage};
     Kernel faInfer;
     faInfer(params);
+}
+
+// Host and metadata producers launch the same entry. FD selection is a uniform
+// device-side branch, before resources/flags are initialized in either path.
+template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
+          MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
+CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
+                        GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
+                        GM_ADDR workspace, GM_ADDR tiling, float scaleValue, float softcapValue, uint32_t numBlocks,
+                        uint32_t maxNumBlocksPerBatch, int64_t kvSeqlenAllocated, FwdStorageParams storage)
+{
+        RunFAInfer<InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape,
+            maskCategory, cacheLayout, LseMode, HasSoftcap>(q, k, v, mask, blockTables, o, lse,
+            actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv, workspace, tiling, scaleValue,
+            softcapValue, numBlocks, maxNumBlocksPerBatch, kvSeqlenAllocated, storage);
+}
+
+// Host and metadata producers launch the same entry. FD selection is a uniform
+// device-side branch, before resources/flags are initialized in either path.
+template <class InDtype, class SMDtype, Format qFormat, Format kvFormat, CacheMode kvcacheType, PageShape kvcacheShape,
+          MaskCategory maskCategory, CacheLayout cacheLayout, bool LseMode, bool HasSoftcap>
+CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables, GM_ADDR o, GM_ADDR lse,
+                        GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen, GM_ADDR seqUsedQ, GM_ADDR seqUsedKv,
+                        GM_ADDR workspace, GM_ADDR tiling, float scaleValue, float softcapValue, uint32_t numBlocks,
+                        uint32_t maxNumBlocksPerBatch, int64_t kvSeqlenAllocated, FwdStorageParams storage)
+{
+    if (reinterpret_cast<__gm__ FAInferTilingData*>(tiling)->flashDecodeFlag != 0U) {
+        RunFAInfer<InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape,
+            maskCategory, cacheLayout, LseMode, HasSoftcap>(q, k, v, mask, blockTables, o, lse,
+            actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv, workspace, tiling, scaleValue,
+            softcapValue, numBlocks, maxNumBlocksPerBatch, kvSeqlenAllocated, storage);
+        return;
+    }
+    RunFAInferDn<InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape,
+        maskCategory, cacheLayout, LseMode, HasSoftcap>(q, k, v, mask, blockTables, o, lse,
+        actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv, workspace, tiling, scaleValue,
+        softcapValue, numBlocks, maxNumBlocksPerBatch, kvSeqlenAllocated, storage);
 }

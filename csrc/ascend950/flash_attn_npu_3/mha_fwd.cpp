@@ -10,8 +10,8 @@
  *   ✅ MQA / GQA
  *   ✅ Varlen Q (cu_seqlens_q + max_seqlen_q)
  *   ✅ return_softmax_lse
- *   ✅ num_splits (FlashDecode for paged KV + TND)
- *   ✅ scheduler_metadata for non-FD execution
+ *   ✅ num_splits (FlashDecode for fixed-length and varlen Q, paged and dense KV)
+ *   ✅ scheduler_metadata including automatic FlashDecode
  *   ❌ pack_gqa, leftpad_k
  */
 
@@ -95,10 +95,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     TORCH_CHECK(attention_chunk == 0, "950 backend (v3) does not support attention_chunk");
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
                 "950 backend (v3) requires num_splits in [0, ", blockDim, "]");
-    if (scheduler_metadata_.has_value()) {
-        TORCH_CHECK(num_splits <= 1, "950 backend (v3) scheduler_metadata does not support "
-                                     "explicit FlashDecode splits");
-    }
     TORCH_CHECK(!pack_gqa_.has_value() || !pack_gqa_.value(), "950 backend (v3) does not support pack_gqa");
 
     // ============================================================
@@ -112,10 +108,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     TORCH_CHECK(!k_new_.has_value() && !v_new_.has_value() && !q_v_.has_value() && !cu_seqlens_k_new_.has_value() &&
                     !kv_batch_idx_.has_value(),
                 "950 backend (v3) does not support KV-cache update inputs");
-    if (num_splits > 1) {
-        TORCH_CHECK(paged_KV && is_varlen_q, "950 backend (v3) num_splits>1 requires paged KV cache and "
-                                             "TND varlen query");
-    }
 
     at::Tensor cu_seqlens_q, cu_seqlens_k, page_table, seqlens_k;
 
@@ -308,6 +300,17 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         out = at::empty(output_sizes, q.options().dtype(out_dtype));
     }
 
+    if (scheduler_metadata_.has_value()) {
+        const auto& schedMd = *scheduler_metadata_;
+        TORCH_CHECK(schedMd.dtype() == at::kByte, "scheduler_metadata must be a byte tensor");
+        TORCH_CHECK(schedMd.is_contiguous(), "scheduler_metadata must be contiguous");
+        TORCH_CHECK(schedMd.device() == q.device(), "scheduler_metadata must be on the query device");
+        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) ==
+                        fa_metadata::SchedulerMetadataBytes(false, batch_size, static_cast<uint32_t>(num_splits)),
+                    "scheduler_metadata num_splits/layout mismatch: forward num_splits=", num_splits,
+                    "; recreate scheduler_metadata with the same num_splits and batch size");
+    }
+
     if (empty_query) {
         auto lse = at::empty(return_softmax_lse ? std::vector<int64_t>{num_heads, 0} : std::vector<int64_t>{0},
                              q.options().dtype(at::kFloat));
@@ -331,13 +334,11 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     at::Tensor mask_npu_tensor;
     bool is_local = false;
     bool flashDecodeEnabled = false;
-    uint32_t launchBlockDim = blockDim;
+    bool metadataDecodeCandidate = false;
+    const uint32_t launchBlockDim = blockDim;
 
     if (scheduler_metadata_.has_value()) {
         auto schedMd = scheduler_metadata_.value();
-        TORCH_CHECK(schedMd.dtype() == at::kByte, "scheduler_metadata must be a byte tensor");
-        TORCH_CHECK(schedMd.is_contiguous(), "scheduler_metadata must be contiguous");
-        TORCH_CHECK(schedMd.device().type() == at::kPrivateUse1, "scheduler_metadata must be an NPU tensor");
         // Derive the mask axes from this call's arguments the same way
         // get_scheduler_metadata did when producing the buffer, so the
         // template selection matches the AICPU-written tiling. The compressed
@@ -360,10 +361,11 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         const auto maskDer = DeriveFwdMask(is_causal, window_size_left, window_size_right, seqlen_q, kvSeqlenBound);
         is_causal = maskDer.is_causal;
         is_local = maskDer.is_local;
+        // FD eligibility uses actual lengths on AICPU, including loose declared
+        // bounds. Reserve for every structurally eligible call; never infer the
+        // stored FD flag from max_seqlen_q or KV capacity, nor read it on host.
+        metadataDecodeCandidate = !is_local && num_splits != 1;
         const bool hasMask = maskDer.maskType != 0u;
-        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) == fa_metadata::MetadataBytesWithKv(hasMask, batch_size),
-                    "scheduler_metadata buffer size must exactly match this call's "
-                    "causal/window-derived layout");
 
         metaBase = static_cast<uint8_t*>(schedMd.data_ptr());
         tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
@@ -426,7 +428,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
             max_q_seqlen = std::max(max_q_seqlen, q_len);
         }
         const bool fd_shape_supported =
-            !is_local && paged_KV && is_varlen_q && min_q_seqlen > 0 && max_q_seqlen <= 16 && max_kv_seqlen >= 1024;
+            !is_local && min_q_seqlen > 0 && max_q_seqlen <= 16 && max_kv_seqlen >= 1024;
         // The tiler applies the small-task gate after building the same merged
         // Q-head tasks as the normal FA path.  Do not pre-gate with num_heads,
         // which would over-count GQA/MQA tasks and incorrectly disable FD.
@@ -449,9 +451,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
             tiler.DoTiling(tilingData);
         }
         flashDecodeEnabled = tilingData.flashDecodeFlag != 0U;
-        if (flashDecodeEnabled) {
-            launchBlockDim = tilingData.fdActiveCoreNum;
-        }
 
         at::Tensor tiling_cpu =
             at::empty({static_cast<int64_t>(sizeof(FAInferTilingData))}, at::device(c10::kCPU).dtype(at::kByte));
@@ -478,9 +477,11 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         softmaxlse.fill_(std::numeric_limits<float>::infinity());
     }
     at::Tensor workspace;
-    if (flashDecodeEnabled) {
+    if (flashDecodeEnabled || metadataDecodeCandidate) {
         workspace =
-            at::empty({static_cast<int64_t>(tilingData.workSpaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
+            at::empty({static_cast<int64_t>(metadataDecodeCandidate
+                           ? optiling::FlashDecodeWorkSpaceSize(blockDim, head_size_v) : tilingData.workSpaceSize)},
+                      at::device(at::kPrivateUse1).dtype(at::kByte));
     }
 
     // ============================================================
@@ -500,7 +501,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     // pointer is used only by specializations that return softmax LSE.
     auto lseDev = return_softmax_lse ? static_cast<uint8_t*>(softmaxlse.data_ptr()) : oDev;
     uint8_t* wsDev = nullptr;
-    if (flashDecodeEnabled) {
+    if (workspace.defined()) {
         wsDev = static_cast<uint8_t*>(workspace.data_ptr());
     }
     auto tilDev = tilingDevice;
@@ -531,8 +532,9 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     auto seqUsedQDev = seqused_q_.has_value() ? static_cast<uint8_t*>(seqused_q_.value().data_ptr()) : nullptr;
     auto seqUsedKvDev = seqused_k_.has_value() ? static_cast<uint8_t*>(seqused_k_.value().data_ptr()) : nullptr;
     auto blockTableDev = paged_KV ? static_cast<uint8_t*>(page_table.data_ptr()) : nullptr;
-    const bool enableDN =
-        !flashDecodeEnabled && (!is_causal) && (!is_local) && (head_size_q <= 256) && (head_size_v <= 256);
+    // The unmasked entry selects DN vs FD on device from the actual schedule.
+    // Both producers therefore use the same route, including when FD falls back.
+    const bool enableDN = (!is_causal) && (!is_local) && (head_size_q <= 256) && (head_size_v <= 256);
 
     const float softmax_scale = softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q)));
     const float scale_value = is_softcap ? softmax_scale / softcap : softmax_scale;

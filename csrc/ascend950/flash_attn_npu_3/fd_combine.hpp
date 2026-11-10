@@ -16,7 +16,7 @@
 #include "tilingdata.h"
 #include "kernel_common.hpp"
 
-template <class ElementO, bool OutputLse, uint32_t quantMode = 0>
+template <class ElementO, bool OutputLse, Format qFormat, uint32_t quantMode = 0>
 class FlashDecodeCombine950 {
   public:
     static constexpr bool FULL_QUANT_FP8 = quantMode == 1;
@@ -80,12 +80,15 @@ class FlashDecodeCombine950 {
             outputLse.SetGlobalBuffer((__gm__ float*)params.lse);
         }
         AscendC::GlobalTensor<int32_t> actualQ;
-        actualQ.SetGlobalBuffer((__gm__ int32_t*)params.actualQseqlen);
+        if constexpr (qFormat == Format::TND) {
+            actualQ.SetGlobalBuffer((__gm__ int32_t*)params.actualQseqlen);
+        }
         const uint32_t headDim = tiling->embeddingSizeV;
         const uint32_t inputStride = RoundUp(headDim, FLOATS_PER_BLOCK);
         // Keep the accumulator padded for the final low-precision output DMA.
         const uint32_t dRound = RoundUp(headDim, 32U / sizeof(ElementO));
-        const uint32_t totalQ = OutputLse ? static_cast<uint32_t>(params.storage.totalQTokens) : 0U;
+        const uint32_t totalQ = qFormat == Format::TND ? static_cast<uint32_t>(params.storage.totalQTokens)
+                                                     : static_cast<uint32_t>(tiling->maxQSeqlen);
         const uint32_t combineIdx = tiling->fdCombineCoreSchedules[aivIdx].combineTaskIdx;
         const uint32_t sourceSubBlock = tiling->fdCombineCoreSchedules[aivIdx].sourceSubBlock;
         const uint32_t assignedStart = tiling->fdCombineCoreSchedules[aivIdx].sourceLocalRow;
@@ -96,9 +99,17 @@ class FlashDecodeCombine950 {
         const uint32_t groupRows = tiling->fdCombineTaskInfo[combineIdx].rowNum;
         const uint32_t sourceRowSplit =
             Min(groupRows, RoundUp(groupRows, PARTIAL_ROW_SPLIT_ALIGN) / FD_SOURCE_SUB_BLOCK_NUM);
-        // Host task geometry uses seqused_q, but packed storage follows cu-Q.
-        const uint32_t qTokenBase =
-            static_cast<uint32_t>(actualQ.GetValue(batchIdx)) + tiling->fdCombineTaskInfo[combineIdx].qStart;
+        const uint32_t qStart = tiling->fdCombineTaskInfo[combineIdx].qStart;
+        uint32_t qTokenBase = batchIdx * static_cast<uint32_t>(tiling->maxQSeqlen) + qStart;
+        uint32_t qLseBase = qStart;
+        if constexpr (qFormat == Format::TND) {
+            // Used lengths select tasks; cu-Q still describes physical storage.
+            qTokenBase = static_cast<uint32_t>(actualQ.GetValue(batchIdx)) + qStart;
+            qLseBase = qTokenBase;
+        } else if constexpr (OutputLse) {
+            outputLse.SetGlobalBuffer((__gm__ float*)params.lse +
+                                     static_cast<uint64_t>(batchIdx) * tiling->numHeads * totalQ);
+        }
         const uint32_t partialCount = static_cast<uint32_t>(tiling->fdCombineSchedules[combineIdx].partialCount);
         const uint32_t firstPartial = static_cast<uint32_t>(tiling->fdCombineSchedules[combineIdx].partialStart);
         const uint32_t partialCountAlign = RoundUp(partialCount, FLOATS_PER_BLOCK);
@@ -113,7 +124,7 @@ class FlashDecodeCombine950 {
             if constexpr (OutputLse) {
                 // LSE is ready before O reduction. Its separate UB buffers
                 // remain live until the end of this row tile.
-                StoreLse(outputLse, rowStart, rowCount, qRows, qHeadStart, qTokenBase, totalQ);
+                StoreLse(outputLse, rowStart, rowCount, qRows, qHeadStart, qLseBase, totalQ);
             }
             const uint32_t tileElems = rowCount * dRound;
             AscendC::Duplicate(oAccUb_, 0.0F, tileElems);
@@ -162,7 +173,11 @@ class FlashDecodeCombine950 {
         __gm__ FAInferTilingData* tiling = reinterpret_cast<__gm__ FAInferTilingData*>(params.tiling);
         const uint32_t subBlockNum = AscendC::GetSubBlockNum();
         const uint32_t aivIdx = AscendC::GetBlockIdx();
-        const uint32_t aivNum = AscendC::GetBlockNum() * subBlockNum;
+        const uint32_t aivNum = tiling->fdActiveCoreNum * subBlockNum;
+        // All launched blocks have already joined the kernel's SyncAll.
+        if (aivIdx >= aivNum) {
+            return;
+        }
         const uint32_t rowTile = Min(MAX_ROW_TILE, Max(1U, CeilDiv(tiling->fdCombineRowNum, aivNum)));
 
         AscendC::GlobalTensor<float> partialLse;
@@ -176,16 +191,19 @@ class FlashDecodeCombine950 {
             outputLse.SetGlobalBuffer((__gm__ float*)params.lse);
         }
         AscendC::GlobalTensor<int32_t> actualQ;
-        actualQ.SetGlobalBuffer((__gm__ int32_t*)params.actualQseqlen);
         AscendC::GlobalTensor<int32_t> seqUsedQ;
-        seqUsedQ.SetGlobalBuffer((__gm__ int32_t*)params.seqUsedQ);
+        if constexpr (qFormat == Format::TND) {
+            actualQ.SetGlobalBuffer((__gm__ int32_t*)params.actualQseqlen);
+            seqUsedQ.SetGlobalBuffer((__gm__ int32_t*)params.seqUsedQ);
+        }
 
         const uint32_t groupSize = tiling->numHeads / tiling->kvHeads;
         const uint32_t headDim = tiling->embeddingSizeV;
         const uint32_t inputStride = RoundUp(headDim, FLOATS_PER_BLOCK);
         // Keep the accumulator padded for the final low-precision output DMA.
         const uint32_t dRound = RoundUp(headDim, 32U / sizeof(ElementO));
-        const uint32_t totalQ = OutputLse ? static_cast<uint32_t>(params.storage.totalQTokens) : 0U;
+        const uint32_t totalQ = qFormat == Format::TND ? static_cast<uint32_t>(params.storage.totalQTokens)
+                                                     : static_cast<uint32_t>(tiling->maxQSeqlen);
         uint32_t workBase = 0U;
         for (uint32_t combineIdx = 0U; combineIdx < tiling->fdCombineTaskNum; ++combineIdx) {
             const uint32_t baseTask = static_cast<uint32_t>(tiling->fdCombineSchedules[combineIdx].baseTask);
@@ -196,10 +214,13 @@ class FlashDecodeCombine950 {
             uint32_t qNBlockNumPerGroup = 1U;
             uint32_t qNTaskNum = 0U;
             while (batchIdx < tiling->batch) {
-                // Used lengths select tasks; cu_seqlens_q defines storage offsets.
-                qLen = params.seqUsedQ != nullptr
-                           ? static_cast<uint32_t>(seqUsedQ.GetValue(batchIdx))
-                           : static_cast<uint32_t>(actualQ.GetValue(batchIdx + 1U) - actualQ.GetValue(batchIdx));
+                qLen = static_cast<uint32_t>(tiling->maxQSeqlen);
+                if constexpr (qFormat == Format::TND) {
+                    // Used lengths select tasks; cu_seqlens_q defines storage offsets.
+                    qLen = params.seqUsedQ != nullptr
+                               ? static_cast<uint32_t>(seqUsedQ.GetValue(batchIdx))
+                               : static_cast<uint32_t>(actualQ.GetValue(batchIdx + 1U) - actualQ.GetValue(batchIdx));
+                }
                 qNBlockTile = GetQNBlockTile(qLen, groupSize, headDim > 128U);
                 qNBlockNumPerGroup = CeilDiv(groupSize, qNBlockTile);
                 qNTaskNum = qNBlockNumPerGroup * tiling->kvHeads;
@@ -227,7 +248,15 @@ class FlashDecodeCombine950 {
             const uint32_t sourceRowSplit = Min(groupRows, RoundUp(groupRows, PARTIAL_ROW_SPLIT_ALIGN) / subBlockNum);
             const uint32_t sub0Tiles = CeilDiv(sourceRowSplit, rowTile);
             const uint32_t tilesPerTask = sub0Tiles + CeilDiv(groupRows - sourceRowSplit, rowTile);
-            const uint32_t qTokenBase = static_cast<uint32_t>(actualQ.GetValue(batchIdx)) + qStart;
+            uint32_t qTokenBase = batchIdx * static_cast<uint32_t>(tiling->maxQSeqlen) + qStart;
+            uint32_t qLseBase = qStart;
+            if constexpr (qFormat == Format::TND) {
+                qTokenBase = static_cast<uint32_t>(actualQ.GetValue(batchIdx)) + qStart;
+                qLseBase = qTokenBase;
+            } else if constexpr (OutputLse) {
+                outputLse.SetGlobalBuffer((__gm__ float*)params.lse +
+                                         static_cast<uint64_t>(batchIdx) * tiling->numHeads * totalQ);
+            }
             const uint32_t partialCount = static_cast<uint32_t>(tiling->fdCombineSchedules[combineIdx].partialCount);
             const uint32_t firstPartial = static_cast<uint32_t>(tiling->fdCombineSchedules[combineIdx].partialStart);
             const uint32_t partialCountAlign = RoundUp(partialCount, FLOATS_PER_BLOCK);
@@ -245,7 +274,7 @@ class FlashDecodeCombine950 {
                 PrepareWeights(partialLse, firstPartial, partialCount, partialCountAlign, sourceSubBlock,
                                sourceLocalRow, rowCount, rowCountAlign, tiling->fdLseSubStride);
                 if constexpr (OutputLse) {
-                    StoreLse(outputLse, rowStart, rowCount, qRows, qHeadStart, qTokenBase, totalQ);
+                    StoreLse(outputLse, rowStart, rowCount, qRows, qHeadStart, qLseBase, totalQ);
                 }
                 const uint32_t tileElems = rowCount * dRound;
                 AscendC::Duplicate(oAccUb_, 0.0F, tileElems);
@@ -416,7 +445,7 @@ class FlashDecodeCombine950 {
             AscendC::DataCopyPad(output[offset], src,
                                  AscendC::DataCopyExtParams(rowCount, headDim * sizeof(ElementO), 0, 0, 0));
         } else {
-            // Partial rows are head-major; output is TND. Copy each head's
+            // Partial rows are head-major; output is token-major (TND/BSND). Copy each head's
             // token run with a destination stride, including tiles crossing heads.
             for (uint32_t row = 0U; row < rowCount;) {
                 const uint32_t flatRow = rowStart + row;
@@ -450,7 +479,8 @@ class FlashDecodeCombine950 {
         }
 
         // Pad each scalar to one UB block so strided DMA can scatter LSE to
-        // [head, total_q]. GM scalar stores cannot be used by every AIV on arch35.
+        // [head, sequence] within this batch (or packed TND). GM scalar stores
+        // cannot be used by every AIV on arch35.
         AscendC::Brcb(lseStoreUb_.template ReinterpretCast<uint32_t>(),
                       globalLseUb_.template ReinterpretCast<uint32_t>(), CeilDiv(rowCount, FLOATS_PER_BLOCK),
                       AscendC::BrcbRepeatParams(1, 8));
