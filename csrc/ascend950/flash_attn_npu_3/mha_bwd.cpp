@@ -18,8 +18,11 @@
 #include <torch/extension.h>
 
 #include "acl/acl.h"
+// fag_kernel.cpp (FlashAttentionV3Bwd950) is compiled separately in the autogen
+// bwd_dispatch_<dtype>_<layout>.cpp TUs; mha_bwd.cpp only needs the FAG host
+// tiling (fag_tiling.cpp -> fag_common.h) and the lightweight launch entry.
 #include "fag_tiling.cpp"
-#include "fag_kernel.cpp"
+#include "bwd_dispatch.hpp"
 #include "tiling/platform/platform_ascendc.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
@@ -423,65 +426,41 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                                       ? fag_tiling_data.usedCoreNum
                                       : aic_num;
 
-#define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP)                                \
-    FlashAttentionV3Bwd950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP>     \
-        <<<launch_cores, nullptr, stream>>>(ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask, ptr(softmax_lse), cu_q, \
-                                            cu_k, seq_used_q, seq_used_k, ptr(dq), ptr(dk), ptr(dv), ptr(workspace),   \
-                                            ptr(tiling_device))
-
-#define DISPATCH_BWD950_FLAGS(DTYPE, INPUT_LAYOUT)                                                                     \
-    do {                                                                                                               \
-        if (has_attn_mask) {                                                                                           \
-            if (deterministic) {                                                                                       \
-                if (has_softcap) {                                                                                     \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, true);                                              \
-                } else {                                                                                               \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, false);                                             \
-                }                                                                                                      \
-            } else {                                                                                                   \
-                if (has_softcap) {                                                                                     \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, false, true);                                             \
-                } else {                                                                                               \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, false, false);                                            \
-                }                                                                                                      \
-            }                                                                                                          \
-        } else {                                                                                                       \
-            if (deterministic) {                                                                                       \
-                if (has_softcap) {                                                                                     \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, true, true);                                             \
-                } else {                                                                                               \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, true, false);                                            \
-                }                                                                                                      \
-            } else {                                                                                                   \
-                if (has_softcap) {                                                                                     \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, false, true);                                            \
-                } else {                                                                                               \
-                    LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, false, false, false);                                           \
-                }                                                                                                      \
-            }                                                                                                          \
-        }                                                                                                              \
-    } while (0)
-
-    if (q.dtype() == at::kBFloat16) {
-        if (is_varlen) {
-            DISPATCH_BWD950_FLAGS(bfloat16_t, TND);
-        } else if (is_bnsd) {
-            DISPATCH_BWD950_FLAGS(bfloat16_t, BNSD);
-        } else {
-            DISPATCH_BWD950_FLAGS(bfloat16_t, BSND);
-        }
+    // Backward FlashAttentionV3Bwd950 kernel launches live in the autogen
+    // bwd_dispatch_<dtype>_<layout>.cpp TUs (8 instantiations each: mask x
+    // deterministic x softcap). Layout is selected at the call site
+    // (compile time); dtype, mask, deterministic and softcap are resolved
+    // inside the dispatch.
+    BwdLaunchArgs bwd_args{};
+    bwd_args.blockDim = launch_cores;
+    bwd_args.aclStream = stream;
+    bwd_args.is_bf16 = q.dtype() == at::kBFloat16;
+    bwd_args.is_softcap = has_softcap;
+    bwd_args.has_attn_mask = has_attn_mask;
+    bwd_args.deterministic = deterministic;
+    bwd_args.dOutDevice = ptr(dout);
+    bwd_args.qDevice = ptr(q);
+    bwd_args.kDevice = ptr(k);
+    bwd_args.vDevice = ptr(v);
+    bwd_args.outDevice = ptr(out);
+    bwd_args.attenMaskDevice = mask;
+    bwd_args.softMaxLseDevice = ptr(softmax_lse);
+    bwd_args.cuSeqQlenDevice = cu_q;
+    bwd_args.cuSeqKvlenDevice = cu_k;
+    bwd_args.seqUsedQDevice = seq_used_q;
+    bwd_args.seqUsedKvDevice = seq_used_k;
+    bwd_args.dqDevice = ptr(dq);
+    bwd_args.dkDevice = ptr(dk);
+    bwd_args.dvDevice = ptr(dv);
+    bwd_args.workspaceDevice = ptr(workspace);
+    bwd_args.tilingDevice = ptr(tiling_device);
+    if (is_varlen) {
+        launch_bwd<TND>(bwd_args);
+    } else if (is_bnsd) {
+        launch_bwd<BNSD>(bwd_args);
     } else {
-        if (is_varlen) {
-            DISPATCH_BWD950_FLAGS(half, TND);
-        } else if (is_bnsd) {
-            DISPATCH_BWD950_FLAGS(half, BNSD);
-        } else {
-            DISPATCH_BWD950_FLAGS(half, BSND);
-        }
+        launch_bwd<BSND>(bwd_args);
     }
-
-#undef DISPATCH_BWD950_FLAGS
-#undef LAUNCH_BWD950
 
     at::Tensor softmax_d = is_varlen ? at::empty({num_heads, q.size(0)}, q.options().dtype(at::kFloat))
                                      : at::empty({batch_size, num_heads, q_seqlen}, q.options().dtype(at::kFloat));

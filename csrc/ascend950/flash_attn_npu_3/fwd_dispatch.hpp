@@ -45,9 +45,9 @@ struct FwdLaunchArgs {
     FwdStorageParams storage;
 };
 
-// Per-(dtype, layout) implementation, defined in fwd_dispatch_impl.hpp and
-// explicitly instantiated per (dtype, Format) in
-// autogen/fwd_dispatch_<dtype>_<layout>.cpp.
+// Per-(dtype, layout) entry, explicitly instantiated by the autogen TUs.
+// FP16/BF16 use lightweight routers into per-path/softcap leaf launchers;
+// FP8 has its own implementation and does not include the FP16/BF16 kernels.
 template <typename DType, Format kLayout>
 void launch_fwd_impl(const FwdLaunchArgs& a);
 
