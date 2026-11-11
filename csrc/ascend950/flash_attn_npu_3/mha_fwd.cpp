@@ -37,6 +37,7 @@
 #include "torch_npu/csrc/framework/OpCommand.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling_from_tensors.hpp"
+#include "fwd_tiling_cache.hpp"
 
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
@@ -332,6 +333,9 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     SeqlenScratch scratch;
     optiling::FAInferContext ctx;
     FAInferTilingData tilingData{};
+    // Cache keys include the complete byte representation, including padding.
+    std::memset(&tilingData, 0, sizeof(tilingData));
+    tilingData.globalWindowSize = 4U;
     static_assert(std::is_trivially_copyable<FAInferTilingData>::value,
                   "FAInferTilingData must remain a trivially-copyable Device ABI");
     at::Tensor tiling_dev;
@@ -473,15 +477,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         }
         flashDecodeEnabled = tilingData.flashDecodeFlag != 0U;
 
-        // Pinned eager copies are retained by the host allocator until DMA completes.
-        // Keep the original upload behavior during graph capture.
-        const bool async_tiling_copy =
-            c10_npu::currentStreamCaptureStatusMayInitCtx() == c10_npu::CaptureStatus::None;
-        at::Tensor tiling_cpu = at::empty(
-            {static_cast<int64_t>(sizeof(FAInferTilingData))},
-            at::device(c10::kCPU).dtype(at::kByte).pinned_memory(async_tiling_copy));
-        std::memcpy(tiling_cpu.data_ptr<uint8_t>(), &tilingData, sizeof(FAInferTilingData));
-        tiling_dev = tiling_cpu.to(at::Device(at::kPrivateUse1), at::kByte, async_tiling_copy);
+        tiling_dev = flash_attn_npu_950_v3::UploadFwdTiling(tilingData, q.device());
         tilingDevice = static_cast<uint8_t*>(tiling_dev.data_ptr());
 
         if ((is_causal || is_local) && quantMode == 0) {

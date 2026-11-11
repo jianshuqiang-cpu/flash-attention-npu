@@ -2,6 +2,7 @@
 #ifndef FA950_FWD_TILING_POLICY_H
 #define FA950_FWD_TILING_POLICY_H
 #include "fwd_resource_plan.h"
+#include "fused_task.h"
 #include "tilingdata.h"
 #include <algorithm>
 #include <cstddef>
@@ -91,19 +92,7 @@ struct FAInferContext {
 
 inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize, uint32_t qBaseTile)
 {
-    uint32_t qRowNumCeil = Q_TILE_CEIL;
-    uint32_t qNBlockTile = (qSeqlen != 0) ? (qRowNumCeil / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER : Q_TILE_CEIL;
-    if (qBaseTile < Q_TILE_CEIL && qSeqlen != 0) {
-        constexpr uint32_t MAX_M_FOR_LARGE_D = Q_TILE_CEIL / 2U;
-        uint32_t maxQNBlockTile = std::max(MAX_M_FOR_LARGE_D / qSeqlen, 1U);
-        qNBlockTile = std::min(qNBlockTile, maxQNBlockTile);
-    }
-    qNBlockTile = std::min(qNBlockTile, groupSize);
-    if (qNBlockTile > N_SPLIT_HELPER) {
-        qNBlockTile = qNBlockTile / N_SPLIT_HELPER * N_SPLIT_HELPER;
-    }
-    qNBlockTile = std::max(qNBlockTile, static_cast<uint32_t>(1));
-    return qNBlockTile;
+    return fa950_task::LegacyHeadTile(qSeqlen, groupSize, qBaseTile);
 }
 
 struct FdBaseTaskHost {
@@ -247,21 +236,16 @@ inline void FillFlashDecodeTilingData(FAInferTilingData& tiling, const FAInferCo
                 kvLen = static_cast<uint32_t>(faInfo_.kvSeqlenList[batchIdx + 1] - faInfo_.kvSeqlenList[batchIdx]);
             }
         }
-        const uint32_t qTile = tiling.qBaseTile;
-        const uint32_t qTileNum = (qLen + qTile - 1U) / qTile;
         const uint32_t kvTileNum = (kvLen + tiling.kvBaseTile - 1U) / tiling.kvBaseTile;
-        const uint32_t qNBlockTile = GetQNBlockTile(qLen, groupSize, tiling.qBaseTile);
-        const uint32_t qNBlockNumPerGroup = (groupSize + qNBlockTile - 1U) / qNBlockTile;
-        const uint32_t qNTaskNum = qNBlockNumPerGroup * faInfo_.kvHeads;
-        for (uint32_t qTileIdx = 0; qTileIdx < qTileNum; ++qTileIdx) {
-            const uint32_t qRows = std::min(qTile, qLen - qTileIdx * qTile);
-            for (uint32_t qNTask = 0; qNTask < qNTaskNum; ++qNTask) {
-                const uint32_t qNBlockIdxInGroup = qNTask % qNBlockNumPerGroup;
-                const uint32_t qNBlockSize = std::min(qNBlockTile, groupSize - qNBlockIdxInGroup * qNBlockTile);
-                const uint32_t kvHeadIdx = qNTask / qNBlockNumPerGroup;
-                bases.push_back({kvTileNum, qRows * qNBlockSize, static_cast<uint32_t>(batchIdx), qTileIdx * qTile,
-                                 qRows, kvHeadIdx * groupSize + qNBlockIdxInGroup * qNBlockTile});
-            }
+        const auto shape = fa950_task::MakeShape(qLen, faInfo_.numHeads, faInfo_.kvHeads,
+            tiling.qBaseTile, faInfo_.batch, blockNum_, faInfo_.layout != FwdLayout::TND,
+            tiling.quantMode != 0U,
+            faInfo_.maskType != MaskType::NO_MASK || faInfo_.maxKvSeqlen <= 128U);
+        for (uint32_t task = 0; task < shape.totalTasks; ++task) {
+            const auto t = fa950_task::Decode(shape, task, qLen, faInfo_.numHeads,
+                                             faInfo_.kvHeads, tiling.qBaseTile);
+            bases.push_back({kvTileNum, t.qRows * t.heads, static_cast<uint32_t>(batchIdx),
+                             t.qStart, t.qRows, t.headStart});
         }
     }
 
