@@ -37,6 +37,27 @@ struct Shape {
     uint32_t tailRows, tailHeadTile, tailHeadTasks, totalTasks;
 };
 
+// With one query head per KV head and no cross-group fusion, every Q tile
+// contributes exactly `heads` tasks, including a short final tile.
+FA950_TASK_INLINE Shape MakeMhaShape(uint32_t q, uint32_t heads, uint32_t qTile)
+{
+    Shape s{};
+    s.fullBlocks = q / qTile;
+    s.fullHeadTile = s.tailHeadTile = 1U;
+    s.fullHeadTasks = heads;
+    s.fullTasks = s.fullBlocks * heads;
+    s.tailRows = q % qTile;
+    s.tailHeadTasks = s.tailRows ? heads : 0U;
+    s.totalTasks = s.fullTasks + s.tailHeadTasks;
+    return s;
+}
+
+FA950_TASK_INLINE Task DecodeMha(uint32_t index, uint32_t q, uint32_t heads, uint32_t qTile)
+{
+    const uint32_t qStart = index / heads * qTile;
+    return {qStart, Min(qTile, q - qStart), index % heads, 1U};
+}
+
 FA950_TASK_INLINE uint32_t HeadTasks(uint32_t heads, uint32_t group, uint32_t tile)
 {
     return tile > group ? CeilDiv(heads, tile) : (heads / group) * CeilDiv(group, tile);

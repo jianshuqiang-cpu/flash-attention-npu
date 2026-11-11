@@ -367,6 +367,20 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         }
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
         AscendC::PipeBarrier<PIPE_V>();
+        if (qNBlockSize == 1U && fullyMaskedRowsPerHead == 0U &&
+            (qSeqlen == 0U || (delStartRow == 0 && delEndRow == static_cast<int32_t>(qSeqlen)))) {
+            // A single head's LSE rows are contiguous in GM. Use the output
+            // scratch protected by MTE3_V(4), not LM, which the next softmax
+            // may overwrite before this DMA completes.
+            ComputeLse((__ubuf__ float*)glUbTensor32.GetPhyAddr(), (__ubuf__ float*)gmUbTensor32.GetPhyAddr(),
+                       (__ubuf__ float*)goUbTensor32.GetPhyAddr(), rowCount);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
+            AscendC::DataCopyPad(gLse[rowStart], goUbTensor32,
+                                 AscendC::DataCopyExtParams(1, rowCount * sizeof(float), 0, 0, 0));
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+            return;
+        }
         ComputeLse((__ubuf__ float*)glUbTensor32.GetPhyAddr(), (__ubuf__ float*)gmUbTensor32.GetPhyAddr(),
                    (__ubuf__ float*)lmUbTensor32.GetPhyAddr(), rowCount);
         AscendC::PipeBarrier<PIPE_V>();
@@ -724,6 +738,67 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
                 StoreAlign<T, StoreDist::DIST_NORM_B32>(go + VL_ELEM_NUM * 3, out3, p3);
             }
         }
+    }
+
+    // Normal-cache DN MHA with D=128: each Q task owns one head, so O has
+    // affine rows and LSE is contiguous. Keep final statistics local instead
+    // of replacing the generic epilogue's running-state tensor handles.
+    template <bool LseMode>
+    __aicore__ inline void RescaleDnMha128(
+        AscendC::GlobalTensor<ElementO> gO, AscendC::GlobalTensor<float> gLse,
+        uint32_t rows, uint32_t outputStride, uint32_t pSlot, uint32_t oSlot,
+        bool first, bool last, Arch::CrossCoreFlag pvReadyFlag)
+    {
+        const uint32_t split = RoundUp(rows, 32U) / 2U;
+        const uint32_t firstRows = AscendC::Std::min(split, rows);
+        const uint32_t rowStart = AscendC::GetSubBlockIdx() == 0U ? 0U : firstRows;
+        const uint32_t rowCount = AscendC::GetSubBlockIdx() == 0U ? firstRows : rows - firstRows;
+        WaitCrossCoreSync<4, PIPE_V>(pvReadyFlag);
+        if (rowCount == 0U) {
+            SetCrossCoreSync<4, PIPE_V>(pvReadyFlag);
+            return;
+        }
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+        auto sum = finalSumUbTensor32[pSlot * DM_UB_GLOBAL_ELEM_NUM];
+        auto max = finalMaxUbTensor32[pSlot * DM_UB_GLOBAL_ELEM_NUM];
+        auto* go = (__ubuf__ ElementOTmp*)goUbTensor32.GetPhyAddr();
+        auto* lo = (__ubuf__ ElementOTmp*)loUbTensor[oSlot].GetPhyAddr();
+        auto* gl = (__ubuf__ ElementOTmp*)sum.GetPhyAddr();
+        auto* dm = (__ubuf__ ElementOTmp*)dmUbTensor32[pSlot * DM_UB_GLOBAL_ELEM_NUM].GetPhyAddr();
+        if (first && !last) {
+            AscendC::DataCopy(goUbTensor32, loUbTensor[oSlot], rowCount * 128U);
+            AscendC::PipeBarrier<PIPE_V>();
+        } else if (first) {
+            DivFuncLastAndFirst<ElementOTmp, 128, true>(go, lo, gl, rowCount, 128U, 128U, 64U, 1.0f);
+        } else if (!last) {
+            RescaleFunc<ElementOTmp, 128, true>(go, lo, dm, rowCount, 128U, 128U, 64U);
+        } else {
+            RescaleFuncLastNotFirst<ElementOTmp, 128, true>(go, lo, dm, gl, rowCount, 128U, 128U, 64U, 1.0f);
+        }
+        SetCrossCoreSync<4, PIPE_V>(pvReadyFlag);
+        if (last) {
+            AscendC::PipeBarrier<PIPE_V>();
+            constexpr auto roundMode = std::is_same_v<ElementO, bfloat16_t>
+                                           ? AscendC::RoundMode::CAST_RINT : AscendC::RoundMode::CAST_NONE;
+            AscendC::Cast(goUbTensor16, goUbTensor32, roundMode, rowCount * 128U);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+            AscendC::DataCopyPad(gO[rowStart * outputStride], goUbTensor16,
+                AscendC::DataCopyExtParams(rowCount, 128U * sizeof(ElementO), 0,
+                                           (outputStride - 128U) * sizeof(ElementO), 0));
+            if constexpr (LseMode) {
+                // GO is shared by output and LSE; finish O's DMA before reuse.
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+                ComputeLse((__ubuf__ float*)sum.GetPhyAddr(), (__ubuf__ float*)max.GetPhyAddr(),
+                           (__ubuf__ float*)goUbTensor32.GetPhyAddr(), rowCount);
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
+                AscendC::DataCopyPad(gLse[rowStart], goUbTensor32,
+                    AscendC::DataCopyExtParams(1, rowCount * sizeof(float), 0, 0, 0));
+            }
+        }
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
     }
 
     template <bool LseMode, class TensorDst>

@@ -31,7 +31,6 @@
 #include "tiling.cpp"
 #include "tilingdata.h"
 #include "fa_metadata_args.h"
-#include "device_triu_mask.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/core/npu/NPUGraphsUtils.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
@@ -339,7 +338,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     static_assert(std::is_trivially_copyable<FAInferTilingData>::value,
                   "FAInferTilingData must remain a trivially-copyable Device ABI");
     at::Tensor tiling_dev;
-    at::Tensor mask_npu_tensor;
     bool is_local = false;
     bool flashDecodeEnabled = false;
     bool metadataDecodeCandidate = false;
@@ -350,9 +348,8 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         auto schedMd = scheduler_metadata_.value();
         // Derive the mask axes from this call's arguments the same way
         // get_scheduler_metadata did when producing the buffer, so the
-        // template selection matches the AICPU-written tiling. The compressed
-        // triu mask is generated locally on the device and is not packed into
-        // metadata.
+        // template selection matches the AICPU-written tiling. Causal and SWA
+        // both use Q/K positions; no device mask matrix is needed.
         int64_t kvSeqlenBound = 0;
         if (is_varlen_kv) {
             kvSeqlenBound = max_seqlen_k_.has_value() ? max_seqlen_k_.value() : 0;
@@ -378,10 +375,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
 
         metaBase = static_cast<uint8_t*>(schedMd.data_ptr());
         tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
-        if (hasMask && quantMode == 0) {
-            mask_npu_tensor = MakeDeviceTriuMask();
-            maskDevice = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
-        }
     } else {
         scratch.CopySeqlensToCpu(
             {is_varlen_q ? cu_seqlens_q : at::Tensor(),
@@ -480,10 +473,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         tiling_dev = flash_attn_npu_950_v3::UploadFwdTiling(tilingData, q.device());
         tilingDevice = static_cast<uint8_t*>(tiling_dev.data_ptr());
 
-        if ((is_causal || is_local) && quantMode == 0) {
-            mask_npu_tensor = MakeDeviceTriuMask();
-            maskDevice = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
-        }
     }
 
     // ============================================================
