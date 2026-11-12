@@ -71,7 +71,7 @@ FA950_TASK_INLINE Shape MakeShape(uint32_t q, uint32_t heads, uint32_t kvHeads,
     Shape s{};
     s.fullBlocks = quantized ? CeilDiv(q, qTile) : q / qTile;
     s.fullHeadTile = quantized ? LegacyHeadTile(q, group, qTile) : 1U;
-    s.fullHeadTasks = HeadTasks(heads, group, s.fullHeadTile);
+    s.fullHeadTasks = quantized ? HeadTasks(heads, group, s.fullHeadTile) : heads;
     s.fullTasks = s.fullBlocks * s.fullHeadTasks;
     s.tailRows = quantized ? 0U : q % qTile;
     s.tailHeadTile = s.tailRows ? LegacyHeadTile(s.tailRows, group, qTile) : 1U;
@@ -107,7 +107,12 @@ FA950_TASK_INLINE Task Decode(const Shape& s, uint32_t index, uint32_t q,
     Task t{};
     t.qStart = (tail ? s.fullBlocks : index / s.fullHeadTasks) * qTile;
     t.qRows = Min(qTile, q - t.qStart);
-    if (tile > group) {
+    if (tile == 1U) {
+        // One head per task is independent of GQA grouping. Avoid dividing
+        // and reconstructing the same head index on every full Q tile.
+        t.headStart = headTask;
+        t.heads = 1U;
+    } else if (tile > group) {
         t.headStart = headTask * tile;
         t.heads = Min(tile, heads - t.headStart);
     } else {

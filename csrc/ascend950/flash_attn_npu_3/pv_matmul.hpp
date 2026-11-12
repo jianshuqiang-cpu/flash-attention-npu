@@ -14,6 +14,7 @@
 #ifndef GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_PV_HPP_T
 #define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_PV_HPP_T
 
+#include "fwd_resource_plan.h"
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/coord.hpp"
@@ -157,8 +158,6 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         l1BTileN = pvL1TileHelper.pvL1TileN;
         l1ATileK = pvL1TileHelper.pvL1TileKLeft;
         l1BTileK = pvL1TileHelper.pvL1TileKRight;
-        l1ABufNum = pvL1TileHelper.pL1BufNum;
-        l1BBufNum = pvL1TileHelper.vL1BufNum;
         for (uint32_t i = 0; i < l1ABufNum; i++) {
             l1ATensor[i] = resource.l1Buf.template GetBufferByByte<ElementA>(l1BufAddrStart + l1ATileM * l1ATileK *
                                                                                                   sizeof(ElementA) * i);
@@ -421,9 +420,10 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         // fwd crossCoreSync from online sm to pv
         if (firstSegment) WaitCrossCoreSync<4, PIPE_MTE1>(softmaxReadyFlag);
         // P full base tile already on L1
-        uint32_t mL0LoopNum = CeilDiv(rowNum, L0_TILE_M);
+        static_assert(L0_TILE_M >= fa950_plan::MAX_Q_ROWS && L0_TILE_K >= fa950_plan::KV_TILE);
+        const uint32_t mL0LoopNum = FULL_QUANT_FP8 ? CeilDiv(rowNum, L0_TILE_M) : 1U;
         uint32_t nL0LoopNum = CeilDiv(embed, L0_TILE_N);
-        uint32_t kL0LoopNum = CeilDiv(curBaseTileSize, L0_TILE_K);
+        const uint32_t kL0LoopNum = FULL_QUANT_FP8 ? CeilDiv(curBaseTileSize, L0_TILE_K) : 1U;
         // while splitting the base tile OTmp to 2 AIVs,
         // the order of the elements in each column is expected to be preserved,
         // which means a column in l0C cannot be chunked and processed by dualMode FixPipe seperately.
@@ -561,8 +561,8 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     uint32_t l1BTileN;
     uint32_t l1ATileK;
     uint32_t l1BTileK;
-    uint32_t l1ABufNum;
-    uint32_t l1BBufNum;
+    static constexpr uint32_t l1ABufNum = fa950_plan::P_STAGES;
+    static constexpr uint32_t l1BBufNum = fa950_plan::V_STAGES;
 };
 ////////////////////////////////////////////////////////////////////
 

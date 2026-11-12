@@ -14,6 +14,7 @@
 #ifndef GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_HPP_T
 #define GEMM_BLOCK_BLOCK_MMAD_FLASH_ATTENTION_QK_HPP_T
 
+#include "fwd_resource_plan.h"
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/coord.hpp"
@@ -156,8 +157,6 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         l1BTileN = BlockMmadQKTileHelper.qkL1TileN;
         l1ATileK = BlockMmadQKTileHelper.qkL1TileKLeft;
         l1BTileK = BlockMmadQKTileHelper.qkL1TileKRight;
-        l1ABufNum = BlockMmadQKTileHelper.qL1BufNum;
-        l1BBufNum = BlockMmadQKTileHelper.kL1BufNum;
 
         for (uint32_t i = 0; i < l1ABufNum; i++) {
             l1ATensor[i] =
@@ -176,6 +175,12 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
 
     // Destructor
     __aicore__ inline ~BlockMmadTla() {}
+
+    __aicore__ inline uint32_t QEvent() const { return qL1BufId == 0U ? 0U : 5U; }
+    __aicore__ inline void ReleaseQ()
+    {
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(QEvent());
+    }
 
     __aicore__ inline auto MakeCustomLayout(uint32_t rowNum, uint32_t embedPhysical, uint32_t qSBlockSize)
     {
@@ -202,15 +207,16 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                                    uint32_t qNBlockSize, int64_t qHeadStride,
                                    uint32_t qL1Offset = 0U, bool firstSegment = true, bool lastSegment = true)
     {
+        if (firstSegment) qL1BufId ^= 1U;
         using CopyGmToL1A = typename TileCopy_::template CopyGmToL1A<TensorA>;
         CopyGmToL1A copyGmToL1A;
         uint32_t embed = actualOriShape[1];
         uint32_t embedPhysical = RoundUp(embed, C0_ELEMS);
         uint32_t rowNum = actualOriShape[0];
         auto l1ALayoutTla = MakeCustomLayout(rowNum, embedPhysical, qSBlockSize);
-        auto l1ATensorTla = tla::MakeTensor(l1ATensor[0][qL1Offset], l1ALayoutTla, Arch::PositionL1{});
+        auto l1ATensorTla = tla::MakeTensor(l1ATensor[qL1BufId][qL1Offset], l1ALayoutTla, Arch::PositionL1{});
 
-        if (firstSegment) AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+        if (firstSegment) AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(QEvent());
         if (qNBlockSize == 1U) {
             // A single head is one strided [S, D] matrix. Loading S separate
             // one-row matrices adds ND2NZ overhead without changing the layout.
@@ -218,7 +224,7 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                                                tla::MakeStride(tla::get<0>(gATensor.stride()), tla::Int<1>{}));
             auto gmQTensorTla = tla::MakeTensor(gATensor.data(), gmQLayoutTla, Arch::PositionGM{});
             auto l1QLayoutTla = MakeCustomLayout(rowNum, embedPhysical, 1U);
-            auto l1QTensorTla = tla::MakeTensor(l1ATensor[0][qL1Offset], l1QLayoutTla, Arch::PositionL1{});
+            auto l1QTensorTla = tla::MakeTensor(l1ATensor[qL1BufId][qL1Offset], l1QLayoutTla, Arch::PositionL1{});
             auto l1QTile = GetTile(l1QTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(qSBlockSize, embed));
             copyGmToL1A(l1QTile, gmQTensorTla);
         } else {
@@ -230,8 +236,8 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         }
 
         if (lastSegment) {
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(QEvent());
+            qReadyPending = true;
         }
     }
 
@@ -320,11 +326,14 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         // Must match loadQGM: the multi-ND copy stores adjacent Q heads
         // qSBlockSize rows apart in L1.
         auto l1ALayoutTla = MakeCustomLayout(rowNum, embedPhysical, qSBlockSize);
-        auto l1ATensorTla = tla::MakeTensor(l1ATensor[0][qL1Offset], l1ALayoutTla, Arch::PositionL1{});
+        auto l1ATensorTla = tla::MakeTensor(l1ATensor[qL1BufId][qL1Offset], l1ALayoutTla, Arch::PositionL1{});
 
-        // P full base tile already on L1
-        uint32_t mL0LoopNum = CeilDiv(rowNum, L0_TILE_M);
-        uint32_t nL0LoopNum = CeilDiv(curBaseTileSize, L0_TILE_N);
+        // Q remains resident across KV tiles.
+        // Every valid FP16/BF16 base tile fits one M/N L0 tile, including
+        // fused-head tails. Only the D reduction can require multiple tiles.
+        static_assert(L0_TILE_M >= fa950_plan::MAX_Q_ROWS && L0_TILE_N >= fa950_plan::KV_TILE);
+        constexpr uint32_t mL0LoopNum = 1U;
+        constexpr uint32_t nL0LoopNum = 1U;
         uint32_t kL0LoopNum = CeilDiv(embed, L0_TILE_K);
 
         // while splitting the base tile S to 2 AIVs,
@@ -469,6 +478,7 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                 }
             }
             AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
+
             for (uint32_t mL0Itr = 0; mL0Itr < mL0LoopNum; mL0Itr++) {
                 uint32_t l0TileMAct = (mL0Itr == mL0LoopNum - 1) ? (rowNum - mL0Itr * L0_TILE_M) : L0_TILE_M;
                 // different m chunks will be concated in the same piece of l0C buffer
@@ -495,6 +505,12 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                     auto l0ALayoutTla = tla::MakeLayout<ElementA, LayoutTagL0A>(l0TileMAct, l0TileKAct);
                     auto l0ATensorTla = tla::MakeTensor(l0ATensor[l0ABufId], l0ALayoutTla, Arch::PositionL0A{});
 
+                    // Enqueue K DMA before waiting for Q. Q remains resident
+                    // for subsequent KV tiles and fused-head segments.
+                    if (qReadyPending) {
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(QEvent());
+                        qReadyPending = false;
+                    }
                     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0AEventId);
                     copyL1ToL0A(l0ATensorTla, l1ATensorTlaTile);
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0AEventId);
@@ -564,6 +580,8 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
 
   protected:
     // Data members
+    bool qReadyPending = false;
+    uint32_t qL1BufId = 1U;
     AscendC::LocalTensor<ElementA> l1ATensor[MAX_L1_STAGES];
     AscendC::LocalTensor<ElementB> l1BTensor[MAX_L1_STAGES];
     AscendC::LocalTensor<ElementA> l0ATensor[L0_STAGES];
@@ -578,8 +596,8 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     uint32_t l1BTileN;
     uint32_t l1ATileK;
     uint32_t l1BTileK;
-    uint32_t l1ABufNum;
-    uint32_t l1BBufNum;
+    static constexpr uint32_t l1ABufNum = fa950_plan::NORMAL_Q_STAGES;
+    static constexpr uint32_t l1BBufNum = fa950_plan::K_STAGES;
 
     uint32_t l1PPingPongFlag = 0;
     uint32_t l0CPingPongFlag = 0;

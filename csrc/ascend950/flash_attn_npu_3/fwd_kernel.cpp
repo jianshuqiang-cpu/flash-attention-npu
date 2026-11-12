@@ -207,7 +207,7 @@ class FAIKernel950 {
                                     uint32_t kvNumTokens, uint64_t& l0AStage, uint64_t& l0BStage)
     {
         const uint32_t pBufId = tileSeq % pL1BufNum_;
-        const uint32_t oBufId = tileSeq % otmpStages_;
+        const uint32_t oBufId = tileSeq & (otmpStages_ - 1U);
         Arch::CrossCoreFlag softmaxReadyFlag(pBufId + UB_S_OTMP_BUF_STAGES);
         Arch::CrossCoreFlag pvReadyFlag(oBufId + UB_S_OTMP_BUF_STAGES + pL1BufNum_);
         const uint32_t rows = FusedGroups ? task.segmentRows : task.rowNum;
@@ -236,7 +236,7 @@ class FAIKernel950 {
                                     uint32_t oHeadStride)
     {
         const uint32_t pBufId = tileSeq % pL1BufNum_;
-        const uint32_t oBufId = tileSeq % otmpStages_;
+        const uint32_t oBufId = tileSeq & (otmpStages_ - 1U);
         Arch::CrossCoreFlag pvReadyFlag(oBufId + UB_S_OTMP_BUF_STAGES + pL1BufNum_);
         GemmCoord shape{task.rowNum, embedV_, task.kvTileSize};
         auto gmOLayout = tla::MakeLayout<ElementO, LayoutO>(qBaseTile_, strideO);
@@ -312,10 +312,6 @@ class FAIKernel950 {
         pvL1TileN_ = faiTilingData->pvL1TileN;
         pvL1TileKLeft_ = faiTilingData->pvL1TileKLeft;
         pvL1TileKRight_ = faiTilingData->pvL1TileKRight;
-        qL1BufNum_ = faiTilingData->qL1BufNum;
-        kL1BufNum_ = faiTilingData->kL1BufNum;
-        vL1BufNum_ = faiTilingData->vL1BufNum;
-        pL1BufNum_ = faiTilingData->pL1BufNum;
         windowSizeLeft_ = faiTilingData->windowSizeLeft;
         windowSizeRight_ = faiTilingData->windowSizeRight;
         fdCombineTaskNum_ = faiTilingData->fdCombineTaskNum;
@@ -338,12 +334,15 @@ class FAIKernel950 {
             pvL1TileN_ = 128U;
             pvL1TileKLeft_ = 128U;
             pvL1TileKRight_ = 128U;
-            qL1BufNum_ = 1U;
-            kL1BufNum_ = 2U;
-            vL1BufNum_ = 2U;
-            pL1BufNum_ = 3U;
         }
 
+        if constexpr (!IsDN) {
+            // The ordinary QK copies one complete [128, aligned D] K tile.
+            // Compact the old 256x192 reservation to fund a second Q slot.
+            // For D<=256 this never exceeds the existing host L1 upper bound.
+            qkL1TileN_ = fa950_plan::KV_TILE;
+            qkL1TileKRight_ = RoundUp(embed_, 16U);
+        }
         AscendC::LocalTensor<ElementP> l1PTensor[MAX_CROSS_CORE_BUF_STAGES];
         AscendC::LocalTensor<ElementS> ubSTensor[UB_S_BUF_STAGES];
         AscendC::LocalTensor<ElementOTmp> ubOTmpTensor[UB_S_OTMP_BUF_STAGES];
@@ -483,6 +482,9 @@ class FAIKernel950 {
         uint32_t taskBegin = coreIdx;
         uint32_t taskEnd = totalTaskNum_;
         uint32_t taskStep = coreNum;
+        if constexpr (!IsFlashDecode && !IsDN && !FusedGroups) {
+            taskStep = 2U * coreIdx + 1U;
+        }
         int32_t fdBaseTaskStart = -1;
         int32_t fdBaseTaskEnd = -1;
         int32_t fdFirstKvTileStart = -1;
@@ -512,6 +514,11 @@ class FAIKernel950 {
         uint64_t pipelineL0AStageBase = 0U;
         uint64_t pipelineL0BStageBase = 0U;
         for (uint32_t taskIdx = taskBegin; taskIdx < taskEnd; taskIdx += taskStep) {
+            if constexpr (!IsFlashDecode && !IsDN && !FusedGroups) {
+                // Alternate forward/reverse core assignment, keeping each
+                // core's task indices monotonic for packed batch traversal.
+                taskStep = 2U * coreNum - taskStep;
+            }
             while (taskIdx >= curTotalTaskNum) {
                 ++curBatch;
                 preTotalTaskNum = curTotalTaskNum;
@@ -546,6 +553,7 @@ class FAIKernel950 {
                 }
                 oBOffset += oBatchStride;
 
+                const auto previousQSeqlen = qSeqlen;
                 qSeqlen = GetQSeqLen(curBatch, faiTilingData->maxQSeqlen, gActualQseqlen, gSeqUsedQ);
                 qPhysicalSeqlen = faiTilingData->maxQSeqlen;
                 kvPhysicalSeqlen = gActualKvseqlen.GetValue(curBatch);
@@ -562,9 +570,14 @@ class FAIKernel950 {
                 // GetQSBlockTile is a constant independent of kvSeqlen so the kv
                 // length is resolved in the cachedBatch gate below, not here. If this
                 // function ever becomes kv dependent move the kv resolution back.
+                // All other task-shape inputs are constant for this launch.
+                // Reuse geometry for equal actual lengths, including seqused;
+                // ragged transitions still take the shared shape constructor.
+                if (qSeqlen != previousQSeqlen) {
                 taskShape = StaticDnMha128 ? fa950_task::MakeMhaShape(qSeqlen, qHeads_, qBaseTile_) :
                     fa950_task::MakeShape(qSeqlen, qHeads_, kvHeads_, qBaseTile_,
                     batchCount, coreNum, qFormat != Format::TND, false, FusedGroups);
+                }
                 curTotalTaskNum += taskShape.totalTasks;
             }
             if (curBatch != cachedBatch) {
@@ -572,10 +585,24 @@ class FAIKernel950 {
                 cachedBatch = curBatch;
             }
             uint32_t taskIdxCurBatch = taskIdx - preTotalTaskNum;
-            const auto geometry = StaticDnMha128 ?
+            fa950_task::Task geometry;
+            if constexpr (!IsFlashDecode && !IsDN && !FusedGroups) {
+                if (taskShape.fullHeadTile == 1U &&
+                    (taskShape.tailRows == 0U || taskShape.tailHeadTile == 1U)) {
+                    const uint32_t qTiles = taskShape.fullBlocks + (taskShape.tailRows != 0U);
+                    const uint32_t qStart = (taskIdxCurBatch % qTiles) * qBaseTile_;
+                    geometry = {qStart, fa950_task::Min(qBaseTile_, qSeqlen - qStart),
+                                taskIdxCurBatch / qTiles, 1U};
+                } else {
+                    geometry = fa950_task::Decode(taskShape, taskIdxCurBatch, qSeqlen,
+                                                  qHeads_, kvHeads_, qBaseTile_);
+                }
+            } else {
+                geometry = StaticDnMha128 ?
                 fa950_task::DecodeMha(taskIdxCurBatch, qSeqlen, qHeads_, qBaseTile_) :
                 fa950_task::Decode(taskShape, taskIdxCurBatch, qSeqlen,
                                                       qHeads_, kvHeads_, qBaseTile_);
+            }
             const uint32_t qSTileIdx = geometry.qStart / qBaseTile_;
             const uint32_t qNStartIdx = geometry.headStart;
             const uint32_t qNBlockSize = geometry.heads;
@@ -860,7 +887,11 @@ class FAIKernel950 {
                         pipelineL0BStageBase += qkL0BTotalStages_ * segmentCount;
                     }
                     if (kvSTileRelIdx == kvSLoopCount - 1U) {
-                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+                        if constexpr (IsDN) {
+                            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+                        } else {
+                            blockMmadQK.ReleaseQ();
+                        }
                     }
 #endif
                     uint32_t l1PBufId = pipelineTileSeq % pL1BufNum_;
@@ -978,7 +1009,7 @@ class FAIKernel950 {
                             kvSTileSizeAct = kvBaseTile_;
                         }
                         GemmCoord actualBlockShapePV{rowNum, embedV_, kvSTileSizeAct};
-                        uint32_t ubOTmpBufId = pipelineTileSeqNow % otmpStages_;
+                        uint32_t ubOTmpBufId = pipelineTileSeqNow & (otmpStages_ - 1U);
                         uint32_t pvReadyFlagId = ubOTmpBufId + UB_S_OTMP_BUF_STAGES + pL1BufNum_;
 #ifdef __DAV_CUBE__
                         uint32_t l1PBufId = pipelineTileSeqNow % pL1BufNum_;
@@ -1071,8 +1102,9 @@ class FAIKernel950 {
     {
 #ifdef __DAV_CUBE__
         // same core sync between pipes
-        // Query
+        // Query slots use event 0 and event 5; K/V retain events 1..4.
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+        if constexpr (!IsDN) AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID5);
         // Key
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID1);
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID2);
@@ -1136,6 +1168,7 @@ class FAIKernel950 {
 #ifdef __DAV_CUBE__
         // same core sync between pipes
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+        if constexpr (!IsDN) AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID1);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID2);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
@@ -1236,10 +1269,10 @@ class FAIKernel950 {
     uint32_t pvL1TileN_;
     uint32_t pvL1TileKLeft_;
     uint32_t pvL1TileKRight_;
-    uint32_t qL1BufNum_;
-    uint32_t kL1BufNum_;
-    uint32_t vL1BufNum_;
-    uint32_t pL1BufNum_;
+    static constexpr uint32_t qL1BufNum_ = IsDN ? fa950_plan::Q_STAGES : fa950_plan::NORMAL_Q_STAGES;
+    static constexpr uint32_t kL1BufNum_ = fa950_plan::K_STAGES;
+    static constexpr uint32_t vL1BufNum_ = fa950_plan::V_STAGES;
+    static constexpr uint32_t pL1BufNum_ = fa950_plan::P_STAGES;
 
     int64_t windowSizeLeft_ = 0;
     int64_t windowSizeRight_ = 0;

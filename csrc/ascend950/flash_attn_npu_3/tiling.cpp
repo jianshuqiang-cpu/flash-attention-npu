@@ -27,7 +27,8 @@ const uint32_t SIZE_OF_16BIT = 2;
 const uint32_t SIZE_OF_32BIT = 4;
 const uint32_t MAX_KV_STACK_LEN = 512;
 const uint32_t WORKSPACE_BLOCK_SIZE_DB = Q_TILE_CEIL * MAX_KV_STACK_LEN;
-const uint32_t BASE_KV_SIZE = 128;
+const uint32_t BASE_KV_SIZE = fa950_plan::KV_TILE;
+static_assert(Q_TILE_CEIL == fa950_plan::MAX_Q_ROWS, "Update device tile bounds with host geometry");
 const uint32_t PRELANCH_NUM = 3;
 const uint64_t ASCEND950_L1_SIZE = 512ULL * 1024ULL;
 const uint64_t RESCALE_OTMP_STAGE_SIZE = 32ULL * 1024ULL;
@@ -128,20 +129,20 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
     auto embeddingSizeVAligned16_ = (static_cast<uint32_t>(faInfo_.embeddingSizeV) + 15U) / 16U * 16U;
     auto qkL1TileM_ = Q_TILE_CEIL;
     auto qkL1TileKLeft_ = embeddingSizeAligned16_;
-    auto qL1BufNum_ = 1;
+    auto qL1BufNum_ = fa950_plan::Q_STAGES;
     // K矩阵开启2buf，D按128分割，S2按256分割
     auto qkL1TileN_ = 256;
     auto qkL1TileKRight_ = quantMode == 1 ? 128 : 192;
-    auto kL1BufNum_ = 2;
+    auto kL1BufNum_ = fa950_plan::K_STAGES;
     // V矩阵开启db，D按128分割，kvBaseTile_不分割，指令同样提前于核间同步下发
     // 如果kvBaseTile_进一步增大，考虑关闭db，使得kvBaseTile_不分割
     auto pvL1TileN_ = embeddingSizeVAligned16_;
     auto pvL1TileKLeft_ = kvBaseTile_;
-    auto vL1BufNum_ = 2;
+    auto vL1BufNum_ = fa950_plan::V_STAGES;
     // P矩阵在950上会常驻L1，由于基块的prelaunch为2，因此最好有3 buf，以免基块间流水阻塞
     auto pvL1TileM_ = Q_TILE_CEIL;
     auto pvL1TileKRight_ = kvBaseTile_;
-    auto pL1BufNum_ = 3;
+    auto pL1BufNum_ = fa950_plan::P_STAGES;
 
     faTilingData.set_innerPrec(0);
     faTilingData.set_actSeqAval(0);

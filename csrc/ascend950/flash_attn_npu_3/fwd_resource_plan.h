@@ -15,11 +15,20 @@ constexpr uint32_t UB_CAPACITY = 248U * 1024U;
 constexpr uint32_t L1_CAPACITY = 512U * 1024U;
 constexpr uint32_t SCORE_STAGES = 2;
 constexpr uint32_t P_STAGES = 3;
+// The tiling payload retains the conservative DN/FP8 Q/K reservation.
+// Ordinary FP16/BF16 kernels compact K and use two Q slots within that bound.
+constexpr uint32_t Q_STAGES = 1;
+constexpr uint32_t NORMAL_Q_STAGES = 2;
+constexpr uint32_t K_STAGES = 2;
+constexpr uint32_t V_STAGES = 2;
+// FP16/BF16 task geometry caps total (sequence * merged heads) rows at 128.
+constexpr uint32_t MAX_Q_ROWS = 128;
+constexpr uint32_t KV_TILE = 128;
 constexpr uint32_t PV_FLAG_BASE = SCORE_STAGES + P_STAGES;
 
 struct UbPlan {
     uint32_t s, p, lo, go, lm, gm, dm, ll, gl, total;
-    uint32_t finalMax, finalSum;
+    uint32_t finalMax, finalSum, lse;
     uint32_t sBytes, pBytes, loBytes, otmpStages;
 };
 
@@ -45,7 +54,8 @@ FA950_PLAN_INLINE constexpr UbPlan MakeUbPlan(uint32_t dv, uint32_t otmpStages)
     // UB mask matrix; place the live final-stat snapshots directly after GL.
     u.finalMax = u.gl + 64U * 4U;
     u.finalSum = u.finalMax + P_STAGES * 64U * 4U;
-    u.total = u.finalSum + P_STAGES * 64U * 4U;
+    u.lse = u.finalSum + P_STAGES * 64U * 4U;
+    u.total = u.lse + 64U * 4U;
     return u;
 }
 
@@ -70,7 +80,8 @@ FA950_PLAN_INLINE constexpr UbPlan KernelUbPlan(uint32_t dv, uint32_t qTile)
     u.gl = u.ll + 256U;
     u.finalMax = u.gl + 256U;
     u.finalSum = u.finalMax + P_STAGES * 64U * 4U;
-    u.total = u.finalSum + P_STAGES * 64U * 4U;
+    u.lse = u.finalSum + P_STAGES * 64U * 4U;
+    u.total = u.lse + 64U * 4U;
     return u;
 }
 
@@ -79,6 +90,20 @@ FA950_PLAN_INLINE constexpr uint32_t L1Bytes(uint32_t d, uint32_t dv)
     return 128U * ((d + 15U) / 16U * 16U) * 2U + 192U * 256U * 2U * 2U + 128U * 128U * 2U * P_STAGES +
            128U * ((dv + 15U) / 16U * 16U) * 2U * 2U;
 }
+
+// Actual ordinary FP16/BF16 L1 footprint. DN retains L1Bytes above.
+FA950_PLAN_INLINE constexpr uint32_t NormalL1Bytes(uint32_t d, uint32_t dv)
+{
+    const uint32_t alignedD = (d + 15U) / 16U * 16U;
+    const uint32_t alignedDv = (dv + 15U) / 16U * 16U;
+    return MAX_Q_ROWS * alignedD * 2U * NORMAL_Q_STAGES +
+           KV_TILE * alignedD * 2U * K_STAGES +
+           MAX_Q_ROWS * KV_TILE * 2U * P_STAGES +
+           KV_TILE * alignedDv * 2U * V_STAGES;
+}
+
+static_assert(NORMAL_Q_STAGES == 2U, "Q rotation and events 0/5 require two slots");
+static_assert(NormalL1Bytes(256U, 256U) <= L1Bytes(256U, 256U), "Normal L1 upper bound");
 
 FA950_PLAN_INLINE constexpr uint32_t QueryTile(uint32_t d, uint32_t dv, uint32_t maxQ)
 {
@@ -98,9 +123,9 @@ FA950_PLAN_INLINE constexpr uint32_t QueryTileForTasks(uint32_t d, uint32_t dv, 
     return dv > 128U && fullQ128Tasks < uint64_t(cores) * 4U ? 64U : QueryTile(d, dv, maxQ);
 }
 
-static_assert(MakeUbPlan(160, 2).total == 225024U, "D160 dual-buffer layout");
-static_assert(MakeUbPlan(192, 2).total == 249600U, "D192 dual-buffer layout");
-static_assert(MakeUbPlan(256, 1).total == 233216U, "D256 single-buffer layout");
+static_assert(MakeUbPlan(160, 2).total == 225280U, "D160 dual-buffer layout");
+static_assert(MakeUbPlan(192, 2).total == 249856U, "D192 dual-buffer layout");
+static_assert(MakeUbPlan(256, 1).total == 233472U, "D256 single-buffer layout");
 static_assert(OTmpStages(192) == 2U && OTmpStages(208) == 1U, "PV stage capacity boundary");
 static_assert(KernelUbPlan(128, 128).total <= UB_CAPACITY, "Small-query/DN UB capacity");
 static_assert(MakeUbPlan(256, 1).total <= UB_CAPACITY, "FP16/BF16 UB capacity");
