@@ -219,13 +219,13 @@ DN softmax 中 `m` 表示当前 KV tile 的长度。新增 `m == 128` 分支，�
 
 ## 7. 正确性、同步和复现依据
 
-正式构建已通过 **233 项测试**，日志见 [precision.log](JD/20261111/scalar_opt/precision.log)。
+当时的正式构建已通过 **233 项测试**，日志见 [precision.log](JD/20261111/scalar_opt/precision.log)。下表记录历史验证范围；Q128 专项测试已随重复提交清理。
 
 | 测试文件 | 用例数 | 主要覆盖 |
 |---|---:|---|
 | [JD forward](tests/test_flash_attn_npu_v3_950_jd_forward.py) | 5 | 五个真实 JD 场景，对照独立数值参考 |
 | [Causal positions](tests/test_flash_attn_npu_v3_950_causal_positions.py) | 76 | FP16/BF16、布局、GQA、不同 Q/K 长度、softcap，以及 4 项冷启动无 triu 检查 |
-| [Q128](tests/test_flash_attn_npu_v3_950_q128.py) | 128 | Paged/GQA、不同维度、mask 与 metadata/FD 等回退路径 |
+| Q128（历史专项测试） | 128 | Paged/GQA、不同维度、mask 与 metadata/FD 等回退路径 |
 | [DN MHA](tests/test_flash_attn_npu_v3_950_dn_mha.py) | 24 | 两种 dtype × 三种布局 × LSE 开关 × softcap 开关；空 KV、尾块、多任务波次和重复调用 |
 
 另有 [Host 任务映射测试](tests/test_flash_attn_npu_v3_950_mha_tasks.cpp)，穷举 head 数 1～32、Q 长度 0～1025，比较新增 MHA 映射与通用非融合映射。
@@ -350,3 +350,56 @@ BF16/FP16 分别回退 2.54%/2.50%**；Qwen3_4b 耗时下降 1.22%/0.75%，T5 �
 
 本次基线二进制 SHA256：`7efc520a1636dc54220c03e721cc08b244bf86d8c3b2e17411237be56ff01bf6`；
 候选：`d06f4eb438cdf5bae0c3301a6f5836f2e8fb220c82ab9cf6023f01a3f0b251ed`。
+
+
+## 12. 追加：950 FA3 autogen 编译优化
+
+继续使用 autogen 显式实例化，将 FP16/BF16 的每个 dtype/layout 重编译单元按
+mask/执行路径和 softcap 拆为八个叶子，每个只包含四种 LSE/cache 组合。
+六个原入口变为轻量 host 路由；FP8 的三个单元只包含自身实现。兼容同步写入的 backward
+拆分后，生成器统一输出 111 个单元，加 API/combine 共 113 个 ASC 单元，AICPU metadata
+继续单独编译。kernel 叶子移除 torch/extension.h；计算、tiling 和设备侧流水保持不变。
+
+生成器仅更新内容变化的文件，避免重复运行破坏增量缓存。setup.py 增加 --parallel/MAX_JOBS
+并发控制，自动识别 affinity 与继承的 cgroup-v2 CPU 配额；本机显示 256 个逻辑 CPU，但
+当前用户配额为 16 核，默认因此使用 16 个 worker。日志按单元记录编译耗时，输出加锁。
+
+| 构建 | 实测耗时 |
+|---|---:|
+| 原始 11 个 ASC 单元，全量 | 1361.98s，约 22 分 42 秒 |
+| 最终 113 个 ASC 单元，全量 | 406.59s，约 6 分 47 秒 |
+| 最终代码，无改动增量 | 5.20s，113 个对象全部复用 |
+
+原始测量期间与中间构建存在 CPU 配额争用，最终轮在本任务其他编译结束后执行；这些是
+共享机观测值，不作为严格受控的加速倍率。全量均不复用对象文件，不清空操作系统页缓存。
+
+验证：5 项 CPU 测试通过，包含 384 组 forward 与 48 组 backward 路由；353 项 NPU 回归
+通过，覆盖 FP16/BF16、FP8 与全部 backward 模板的梯度参考。最后全量重建后又通过
+64 项 NPU 冒烟及 5 项 CPU 检查。两版 312 个 kernel 入口集合完全一致；数值计算源码未变。
+
+构建方法见 [autogen 说明](csrc/ascend950/flash_attn_npu_3/autogen/README.md)，完整耗时、
+验证记录与测量边界见 [编译优化报告](JD/20261111/compile_autogen/analysis.md)。
+
+
+## 13. 追加：供给流水、PV/LSE与任务遍历优化（2026-11-12）
+
+当前为候选47，完整设计、各阶段对照和验证范围见[供给流水优化说明](supply_pipeline_optimization_20261112.md)。相对前一完整版本25，本轮新增：
+
+- `rescale_o.hpp`：FP16/BF16双OTmp槽首块结果保留到第二块融合读取，消除LO→GO复制；需要立即清零、单槽、单KV块、FP8和DN专用helper保留旧流程。消费后才释放两个PV槽，保持GO复用保护。
+- `fwd_resource_plan.h`、`rescale_o.hpp`：增加256 B独立LSE scratch，单头有效行的LSE计算不再等待O DMA读取GO结束；MTE3_V(6)保护scratch复用。No mask/causal/SWA共享布局，所有FP16/BF16布局相对第11节多0.25 KiB，单双PV槽和QueryTile边界不变。Dv192/Q128总占用244 KiB、尾部剩余4 KiB。
+- `fwd_kernel.cpp`：实际Q长度相同时复用任务几何；非FD/非DN/非跨组融合路径使用单调snake分核，矩形单头任务按head-major解码。任务集合与AIC/AIV顺序一致，物理/实际长度与地址推进仍独立处理，无模型或固定shape分支。
+- 保留先前阶段的单头解码化简、普通Q双buffer/紧凑K、Q-ready等待下移、固定L0单轮维度、OTmp索引化简和最终Rescale/Cast融合；未保留无收益的额外K/V预取或P四槽方案。
+
+设备5最终交错测量的hot两轮均值如下（μs）：
+
+| JD 场景 | 最初基线（μs） | 上一阶段25（μs） | 当前47（μs） | FAScore（μs） | 相对最初基线 |
+|---|---:|---:|---:|---:|---:|
+| qwen3_3b | 54.623 | 50.633 | 45.368 | 47.841 | -16.94% |
+| qwen3_4b | 78.151 | 74.679 | 63.192 | 81.785 | -19.14% |
+| t5_decoder | 221.376 | 159.706 | 137.928 | 255.774 | -37.70% |
+| t5_encoder | 958.354 | 未测 | 955.385 | 1046.003 | -0.31% |
+| t5_cross | 738.910 | 未测 | 735.382 | 761.864 | -0.48% |
+
+3B相对上一版本25降低10.40%；追加独立进程首调中位数当前107.694 μs（n=6）、FAScore107.782 μs（n=5），按持平处理。encoder/cross不足0.5%的自身变化按基本持平处理。所有采集前后快照clean，但设备不独占、不锁频，不能排除间隙内干扰。
+
+52个受影响TU完整构建通过；1113项前向回归通过、48项backward排除；新增资源容量/对齐/非重叠检查通过。racecheck/memcheck各4目标launch、4clean、0结构化错误、exit0且应用正常退出，仅覆盖BF16/TND/causal/block0多波。完整库与动态检查目标device ELF一致。当前扩展SHA256为`781cf108cbe04eabfd7d2f5caf166a02c764f65897fdd9fe6fffdb8db0b94e94`。

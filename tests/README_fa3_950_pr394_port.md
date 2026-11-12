@@ -48,13 +48,11 @@
 - 新增 57 项包括输出/LSE 与直接 tiling/metadata 一致性 36 项，BSND/BNSD、分页 BBND/BNBD、独立 K/V page stride 16 项，缓存原地长度修改/双 stream/容量淘汰 1 项，ragged/空 Q/空 KV 4 项。
 - 原生编译成功，`git diff --check` 通过。测试日志见 `batchtest/pr394_950/regression-final.log`、`cpu-final.log`。
 
-完整 NPU 回归命令：
+当前保留的 NPU 回归入口如下。上面的 764 项是历史验证结果，其中 migration、Q128 专项测试已随重复提交清理，不包含在下面的命令中。
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=5 python -m pytest -q -x \
   tests/test_flash_attn_npu_v3_950_fused_tasks.py \
-  tests/test_flash_attn_npu_v3_950_migration.py \
-  tests/test_flash_attn_npu_v3_950_q128.py \
   tests/test_flash_attn_npu_v3_950_pipeline.py \
   tests/test_flash_attn_npu_v3_950_fd_consistency.py \
   tests/test_flash_attn_npu_v3_950_fd_layout.py \
