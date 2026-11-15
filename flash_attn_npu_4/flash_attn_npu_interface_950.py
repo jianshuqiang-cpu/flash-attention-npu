@@ -1,7 +1,7 @@
 # Copyright (c) 2023, Tri Dao.
 # Modified by Minghua Shen, 2026.
 
-from typing import Any, Callable, NamedTuple, Optional, Tuple
+from typing import Union, Any, Callable, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -67,6 +67,7 @@ def _transposed_bnsd_view(t):
     return None
 
 
+
 def _detect_layout(q, k, v, page_table, cu_seqlens_k):
     """Return ``(layout, q, k, v, out_transposed)``: the layout code shared with the C++
     host, the operands to hand the kernel, and whether ``out`` must be transposed back to
@@ -77,7 +78,7 @@ def _detect_layout(q, k, v, page_table, cu_seqlens_k):
     """
     if k is not None and v is not None and v.dim() != k.dim():
         raise RuntimeError(
-            "flash_attn_npu_4_950: key and value must have the same rank for layout detection"
+            "flash_attn_npu_3_950: key and value must have the same rank for layout detection"
         )
 
     if q.dim() != 4 or k.dim() != 4 or page_table is not None or cu_seqlens_k is not None:
@@ -101,11 +102,56 @@ def _detect_layout(q, k, v, page_table, cu_seqlens_k):
     return _LAYOUT_BSND, q, k, v, False
 
 
+
 # Ascend950 FA4 metadata contains only serialized FAInferStaticTilingData. Keep
 # this in sync with fa_metadata::MetadataBytes(false) in
 # csrc/ascend950/flash_attn_npu_4/fa_metadata_args.h.  Unlike the FA3
 # metadata, its size does not depend on the input sequence lengths or mask.
 _SCHEDULER_METADATA_TILING_BYTES = 5216
+
+
+def _paged_kv_inner_layout(x):
+    """Return the packed inner layout of a logical [page, token, head, dim] cache."""
+    if x is None or x.dim() != 4:
+        return None
+    page_size, num_heads, head_dim = x.shape[1:]
+    if x.stride(1) == num_heads * head_dim and x.stride(2) == head_dim and x.stride(3) == 1:
+        return "BBND"
+    if x.stride(1) == head_dim and x.stride(2) == page_size * head_dim and x.stride(3) == 1:
+        return "BNBD"
+    return None
+
+
+def _prepare_forward_qkv(q, k, v, page_table, *, append_kv):
+    """Apply the same forward stride policy as FA4 and FIA.
+
+    Dense operands use fixed packed kernel strides and are materialized. Paged
+    K/V remain zero-copy when both caches have the same packed BBND or BNBD
+    inner layout; dimension 0 may still be strided. Other paged views fall
+    back to packed BBND storage. FP8 caches always use packed BBND storage.
+
+    Append-KV is the exception: replacing a cache with a temporary contiguous
+    copy would lose the API's in-place cache update, so an unsupported cache
+    view is rejected instead of copied.
+    """
+    q = q.contiguous()
+    # The FP8 kernel still uses packed page addressing.
+    if page_table is None or q.dtype == torch.float8_e4m3fn:
+        if append_kv and (not k.is_contiguous() or not v.is_contiguous()):
+            raise RuntimeError(
+                "FA3 append-KV requires contiguous dense K/V caches because the caches are updated in place"
+            )
+        return q, k.contiguous(), v.contiguous()
+
+    key_layout = _paged_kv_inner_layout(k)
+    value_layout = _paged_kv_inner_layout(v)
+    if key_layout is not None and key_layout == value_layout:
+        return q, k, v
+    if append_kv:
+        raise RuntimeError(
+            "FA3 append-KV requires paged K/V caches with the same packed BBND or BNBD inner layout"
+        )
+    return q, k.contiguous(), v.contiguous()
 
 
 @_torch_custom_op_wrapper(
@@ -303,8 +349,9 @@ def _flash_attn_forward(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k = (_maybe_contiguous(x) for x in (q, k))
-    v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+    if qv is not None:
+        raise NotImplementedError("Ascend950 FA4 forward does not support qv")
+    q, k, v = _prepare_forward_qkv(q, k, v, page_table, append_kv=False)
     cu_seqlens_q, cu_seqlens_k = (_maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k))
     seqused_q, seqused_k = (_maybe_contiguous(x) for x in (seqused_q, seqused_k))
     page_table = _maybe_contiguous(page_table)
@@ -1493,3 +1540,60 @@ def flash_attn_varlen_func_with_quant(
         disable_scheduler_metadata=disable_scheduler_metadata,
         scales=scales,
     )
+
+
+@torch.no_grad()
+def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, qv=None, rotary_cos=None, rotary_sin=None, cache_seqlens: Optional[Union[int, torch.Tensor]]=None, cache_batch_idx: Optional[torch.Tensor]=None, cache_leftpad: Optional[torch.Tensor]=None, page_table: Optional[torch.Tensor]=None, cu_seqlens_q: Optional[torch.Tensor]=None, cu_seqlens_k_new: Optional[torch.Tensor]=None, max_seqlen_q: Optional[int]=None, rotary_seqlens: Optional[torch.Tensor]=None, q_descale: Optional[torch.Tensor]=None, k_descale: Optional[torch.Tensor]=None, v_descale: Optional[torch.Tensor]=None, softmax_scale=None, causal=False, window_size=(-1, -1), attention_chunk=0, softcap=0.0, rotary_interleaved=True, scheduler_metadata=None, num_splits=0, pack_gqa=None, sm_margin=0, return_softmax_lse=False):
+    """Ascend950 FA4 inference with dense or paged KV caches.
+
+    The cache API mirrors the FA3 forward subset. Append/rotary/cache-index
+    updates remain unsupported. Explicit scheduler metadata uses FA4's native
+    static/runtime split; omitted metadata selects Host tiling.
+    """
+    unsupported = {"k": k, "v": v, "qv": qv, "rotary_cos": rotary_cos,
+                   "rotary_sin": rotary_sin, "cache_batch_idx": cache_batch_idx,
+                   "cache_leftpad": cache_leftpad, "cu_seqlens_k_new": cu_seqlens_k_new,
+                   "rotary_seqlens": rotary_seqlens}
+    for name, value in unsupported.items():
+        if value is not None:
+            raise NotImplementedError(f"Ascend950 FA4 cache forward does not support {name}")
+    if attention_chunk != 0 or pack_gqa:
+        raise NotImplementedError("Ascend950 FA4 cache forward does not support attention_chunk or pack_gqa")
+    if sm_margin != 0:
+        raise NotImplementedError("Ascend950 FA4 cache forward does not support sm_margin")
+    q, k_cache, v_cache = _prepare_forward_qkv(q, k_cache, v_cache, page_table, append_kv=False)
+    is_tnd = cu_seqlens_q is not None
+    batch = cu_seqlens_q.numel() - 1 if is_tnd else q.shape[0]
+    if is_tnd:
+        if max_seqlen_q is None:
+            raise ValueError("max_seqlen_q must be provided with cu_seqlens_q")
+        cu_seqlens_q = cu_seqlens_q.to(device=q.device, dtype=torch.int32).contiguous()
+    if is_tnd:
+        layout, q_kernel, k_kernel, v_kernel, was_bnsd = _LAYOUT_TND, q, k_cache, v_cache, False
+    else:
+        layout, q_kernel, k_kernel, v_kernel, was_bnsd = _detect_layout(q, k_cache, v_cache, page_table, None)
+    if page_table is not None:
+        capacity = page_table.shape[1] * k_cache.shape[1]
+    elif was_bnsd:
+        capacity = k_kernel.shape[2]
+    else:
+        capacity = k_cache.shape[1]
+    if cache_seqlens is None or isinstance(cache_seqlens, int):
+        length = capacity if cache_seqlens is None else cache_seqlens
+        cache_seqlens = torch.full((batch,), length, dtype=torch.int32, device=q.device)
+    else:
+        cache_seqlens = cache_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
+    result = _flash_attn_forward(
+        q_kernel, k_kernel, v_kernel,
+        cu_seqlens_q=cu_seqlens_q, max_seqlen_q=max_seqlen_q if is_tnd else None,
+        max_seqlen_k=capacity, seqused_k=cache_seqlens,
+        page_table=page_table, softmax_scale=softmax_scale, causal=causal,
+        window_size_left=_window_to_npu(window_size[0]),
+        window_size_right=_window_to_npu(window_size[1]), softcap=softcap,
+        num_splits=num_splits, pack_gqa=pack_gqa, return_lse=return_softmax_lse,
+        scheduler_metadata=scheduler_metadata, layout=layout,
+        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
+    out, lse, out_accum, lse_accum = result
+    if was_bnsd:
+        out = out.transpose(1, 2)
+    return (out, lse, out_accum, lse_accum) if return_softmax_lse else out
