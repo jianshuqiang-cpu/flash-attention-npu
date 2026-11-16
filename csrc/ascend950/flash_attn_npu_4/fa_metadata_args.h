@@ -15,9 +15,8 @@ static_assert(sizeof(FAInferRuntimeData) == 48, "runtime tiling ABI changed");
 namespace fa_metadata {
 constexpr uint32_t MASK_DIM = 2048;
 constexpr uint64_t MASK_BYTES = uint64_t(MASK_DIM) * MASK_DIM;
-// Scheduler metadata is tiling-only. The fixed triangular mask is generated
-// once on each visible NPU by MakeDeviceTriuMask instead of being serialized
-// into every metadata tensor by AICPU.
+// Scheduler metadata is tiling-only. Causal/SWA visibility is computed
+// from positions in the kernel; no mask matrix is allocated or serialized.
 inline uint64_t TilingOffset(bool /*has_mask*/)
 {
     return 0;

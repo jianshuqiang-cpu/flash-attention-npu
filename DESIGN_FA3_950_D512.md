@@ -2,6 +2,11 @@
 
 更新：2026-11-15。目标项目：`JY_Perf/Jy_ATK_TEST/flash-attention-npu`。
 
+> 2026-11-16 补充：普通 FP16/BF16 的 D≤256 也改用位置式 causal/SWA，
+> 不再创建/读取 mask 矩阵，回收每 AIV 16 KiB mask UB。
+> 原 P 双槽、PV 槽数、Q tile 和任务几何保持不变；D512 继续 P 单槽。
+> 详见 [全维度位置式 mask 方案](DESIGN_POSITIONAL_MASK_950.md)。下文分支对比中的旧资源数值保留为历史基线。
+
 > 当前取舍：按用户决定移除 GQA/MQA 长 Q 尾块合并。Host、AICPU、kernel 和 FD
 > 恢复整段 Q 长度决定 head 合并数的原有几何，删除新增 `fused_task.h`；原有短 Q
 > 合并保留。单项回退性能记录见 `batchtest/tail_merge_ablation_d512_20261114_233832/REPORT.md`，

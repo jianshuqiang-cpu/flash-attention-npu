@@ -77,15 +77,17 @@ FA950_PLAN_INLINE constexpr UbPlan MakeUbPlan(uint32_t dv, uint32_t otmpStages)
     u.dm = u.gm + 64U * 4U;
     u.ll = u.dm + P_STAGES * 64U * 4U;
     u.gl = u.ll + 64U * 4U;
-    u.mask = u.gl + 64U * 4U;
+    u.mask = 0U;  // Reserved field; positional masking has no UB allocation.
     u.lse = 0U;
-    u.total = u.mask + 2U * 64U * 128U;
+    u.total = u.gl + 64U * 4U;
     return u;
 }
 
 FA950_PLAN_INLINE constexpr uint32_t OTmpStages(uint32_t dv)
 {
-    return MakeUbPlan(dv, 2U).total <= UB_CAPACITY ? 2U : 1U;
+    // Preserve the existing pipeline choice, including D192, while
+    // reclaiming the former 16 KiB mask allocation.
+    return MakeUbPlan(dv, 2U).total + 16384U <= UB_CAPACITY ? 2U : 1U;
 }
 
 FA950_PLAN_INLINE constexpr bool IsD512(uint32_t d, uint32_t dv)
@@ -110,8 +112,8 @@ FA950_PLAN_INLINE constexpr UbPlan KernelUbPlan(uint32_t dv, uint32_t qTile)
     u.dm = u.gm + 256U;
     u.ll = u.dm + 768U;
     u.gl = u.ll + 256U;
-    u.mask = u.gl + 256U;
-    u.total = u.mask + 16384U;
+    u.mask = 0U;
+    u.total = u.gl + 256U;
     return u;
 }
 
@@ -166,9 +168,9 @@ static_assert(MakeUbPlanD512().total <= UB_CAPACITY, "D512 UB capacity");
 static_assert(MakeUbPlanD512().loBytes == 32768U && MakeUbPlanD512().goBytes == 131072U, "D512 LO/GO capacities");
 static_assert(MakeUbPlanD512().pStages == 1U && MakeUbPlanD512().otmpStages == 1U, "D512 single-slot stages");
 static_assert(D512L1Bytes() == 491520U && D512L1Bytes() <= L1_CAPACITY, "D512 L1 capacity");
-static_assert(MakeUbPlan(160, 2).total == 239872U, "D160 dual-buffer layout");
-static_assert(MakeUbPlan(192, 1).total == 215296U, "D192 single-buffer layout");
-static_assert(MakeUbPlan(256, 1).total == 248064U, "D256 single-buffer layout");
+static_assert(MakeUbPlan(160, 2).total == 223488U, "D160 dual-buffer layout");
+static_assert(MakeUbPlan(192, 1).total == 198912U, "D192 single-buffer layout");
+static_assert(MakeUbPlan(256, 1).total == 231680U, "D256 single-buffer layout");
 static_assert(MakeUbPlan(256, 1).total <= UB_CAPACITY, "FP16/BF16 UB capacity");
 static_assert(L1Bytes(256, 256) <= L1_CAPACITY, "FP16/BF16 L1 capacity");
 } // namespace fa950_plan

@@ -25,8 +25,8 @@ constexpr uint32_t SIZE_OF_32BIT = 4;
 constexpr uint32_t PRELAUNCH_NUM = 3;
 constexpr uint64_t WS_FLOOR = uint64_t(1024) * 1024 * 32 * 4; // 128 MiB
 
-// scheduler_metadata is tiling + kvCum. The 2048x2048 compressed triu(1) mask
-// is generated locally on the device by MakeDeviceTriuMask when required.
+// scheduler_metadata is tiling + kvCum. Causal/SWA visibility is
+// computed from positions in the kernel; no mask matrix is allocated.
 inline uint64_t TilingOffset(bool /*hasMask*/)
 {
     return 0;

@@ -1549,6 +1549,8 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, qv=None, rotary
     The cache API mirrors the FA3 forward subset. Append/rotary/cache-index
     updates remain unsupported. Explicit scheduler metadata uses FA4's native
     static/runtime split; omitted metadata selects Host tiling.
+    Non-paged TND K/V are packed (total_tokens, kv_heads, head_dim).
+    Multiple sequences require explicit cache_seqlens to delimit that storage.
     """
     unsupported = {"k": k, "v": v, "qv": qv, "rotary_cos": rotary_cos,
                    "rotary_sin": rotary_sin, "cache_batch_idx": cache_batch_idx,
@@ -1574,6 +1576,13 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, qv=None, rotary
         layout, q_kernel, k_kernel, v_kernel, was_bnsd = _detect_layout(q, k_cache, v_cache, page_table, None)
     if page_table is not None:
         capacity = page_table.shape[1] * k_cache.shape[1]
+    elif is_tnd:
+        # Axis 1 is KV heads, not tokens. This bound also drives SWA
+        # normalization, so using it can silently turn a finite left window
+        # into an unlimited one. Packed T is a safe per-sequence upper bound.
+        capacity = k_cache.shape[0]
+        if batch > 1 and cache_seqlens is None:
+            raise ValueError("cache_seqlens is required for non-paged TND caches with multiple sequences")
     elif was_bnsd:
         capacity = k_kernel.shape[2]
     else:

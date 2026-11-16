@@ -2,6 +2,10 @@
 
 日期：2026-11-15。实现目录：`csrc/ascend950/flash_attn_npu_4`。
 
+2026-11-16 补充：位置式 causal/SWA 已扩展到普通 FP16/BF16 的 D≤256；
+不再依赖 mask 矩阵，P 双槽与原流水深度保持不变。
+详见 [全维度位置式 mask 方案](DESIGN_POSITIONAL_MASK_950.md)。
+
 ## 范围与接口
 
 将当前工作区 FA3 的 forward 资源规划、搬运、mask、输出和 FlashDecode 实现迁入 FA4。FA3 参考库 SHA256 为 `f9b310b778f16657fbd67ed97486d1742893419dfd406ef915496bf16bef1edc`；迁移没有修改 FA3 源码或库。没有重新加入用户已放弃的长 Q GQA/MQA 尾块合并。
