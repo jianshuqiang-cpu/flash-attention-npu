@@ -1,5 +1,7 @@
 # 950 FA3 → FA4 实施与验证结果
 
+> 2026-11-16 接口修订：本文性能数据采集于 FA4 cache wrapper 移除之前，属于历史结果。当前脚本已改用原生 `flash_attn_func` / `flash_attn_varlen_func`；原生入口内部计算 LSE，旧入口可跳过，计时口径存在差异。本次接口修改的功能验证见 [接口回归报告](../fa4_public_api_20261116/REPORT.md)。
+
 > 版本说明：本报告保留 `7f9081d` 阶段的实现与数据。2026-11-16 后续将 D≤256 的
 > causal/SWA 也改为位置计算，新增验证与性能数据见
 > [位置式 mask 更新报告](../position_mask_all_dims_20261116/REPORT.md)。下表未用后续版本数据覆盖历史采集。

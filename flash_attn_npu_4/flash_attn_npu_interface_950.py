@@ -828,7 +828,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqused_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
 
         if seqused_k is not None and isinstance(seqused_k, int):
-            seqused_k = torch.full((q.shape[0],), seqused_k, dtype=torch.int32, device=k.device)
+            batch_size = cu_seqlens_q.numel() - 1 if cu_seqlens_q is not None else q.shape[0]
+            seqused_k = torch.full((batch_size,), seqused_k, dtype=torch.int32, device=k.device)
         seqused_q = _maybe_contiguous(seqused_q)
         seqused_k = _maybe_contiguous(seqused_k)
 
@@ -1540,69 +1541,3 @@ def flash_attn_varlen_func_with_quant(
         disable_scheduler_metadata=disable_scheduler_metadata,
         scales=scales,
     )
-
-
-@torch.no_grad()
-def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, qv=None, rotary_cos=None, rotary_sin=None, cache_seqlens: Optional[Union[int, torch.Tensor]]=None, cache_batch_idx: Optional[torch.Tensor]=None, cache_leftpad: Optional[torch.Tensor]=None, page_table: Optional[torch.Tensor]=None, cu_seqlens_q: Optional[torch.Tensor]=None, cu_seqlens_k_new: Optional[torch.Tensor]=None, max_seqlen_q: Optional[int]=None, rotary_seqlens: Optional[torch.Tensor]=None, q_descale: Optional[torch.Tensor]=None, k_descale: Optional[torch.Tensor]=None, v_descale: Optional[torch.Tensor]=None, softmax_scale=None, causal=False, window_size=(-1, -1), attention_chunk=0, softcap=0.0, rotary_interleaved=True, scheduler_metadata=None, num_splits=0, pack_gqa=None, sm_margin=0, return_softmax_lse=False):
-    """Ascend950 FA4 inference with dense or paged KV caches.
-
-    The cache API mirrors the FA3 forward subset. Append/rotary/cache-index
-    updates remain unsupported. Explicit scheduler metadata uses FA4's native
-    static/runtime split; omitted metadata selects Host tiling.
-    Non-paged TND K/V are packed (total_tokens, kv_heads, head_dim).
-    Multiple sequences require explicit cache_seqlens to delimit that storage.
-    """
-    unsupported = {"k": k, "v": v, "qv": qv, "rotary_cos": rotary_cos,
-                   "rotary_sin": rotary_sin, "cache_batch_idx": cache_batch_idx,
-                   "cache_leftpad": cache_leftpad, "cu_seqlens_k_new": cu_seqlens_k_new,
-                   "rotary_seqlens": rotary_seqlens}
-    for name, value in unsupported.items():
-        if value is not None:
-            raise NotImplementedError(f"Ascend950 FA4 cache forward does not support {name}")
-    if attention_chunk != 0 or pack_gqa:
-        raise NotImplementedError("Ascend950 FA4 cache forward does not support attention_chunk or pack_gqa")
-    if sm_margin != 0:
-        raise NotImplementedError("Ascend950 FA4 cache forward does not support sm_margin")
-    q, k_cache, v_cache = _prepare_forward_qkv(q, k_cache, v_cache, page_table, append_kv=False)
-    is_tnd = cu_seqlens_q is not None
-    batch = cu_seqlens_q.numel() - 1 if is_tnd else q.shape[0]
-    if is_tnd:
-        if max_seqlen_q is None:
-            raise ValueError("max_seqlen_q must be provided with cu_seqlens_q")
-        cu_seqlens_q = cu_seqlens_q.to(device=q.device, dtype=torch.int32).contiguous()
-    if is_tnd:
-        layout, q_kernel, k_kernel, v_kernel, was_bnsd = _LAYOUT_TND, q, k_cache, v_cache, False
-    else:
-        layout, q_kernel, k_kernel, v_kernel, was_bnsd = _detect_layout(q, k_cache, v_cache, page_table, None)
-    if page_table is not None:
-        capacity = page_table.shape[1] * k_cache.shape[1]
-    elif is_tnd:
-        # Axis 1 is KV heads, not tokens. This bound also drives SWA
-        # normalization, so using it can silently turn a finite left window
-        # into an unlimited one. Packed T is a safe per-sequence upper bound.
-        capacity = k_cache.shape[0]
-        if batch > 1 and cache_seqlens is None:
-            raise ValueError("cache_seqlens is required for non-paged TND caches with multiple sequences")
-    elif was_bnsd:
-        capacity = k_kernel.shape[2]
-    else:
-        capacity = k_cache.shape[1]
-    if cache_seqlens is None or isinstance(cache_seqlens, int):
-        length = capacity if cache_seqlens is None else cache_seqlens
-        cache_seqlens = torch.full((batch,), length, dtype=torch.int32, device=q.device)
-    else:
-        cache_seqlens = cache_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
-    result = _flash_attn_forward(
-        q_kernel, k_kernel, v_kernel,
-        cu_seqlens_q=cu_seqlens_q, max_seqlen_q=max_seqlen_q if is_tnd else None,
-        max_seqlen_k=capacity, seqused_k=cache_seqlens,
-        page_table=page_table, softmax_scale=softmax_scale, causal=causal,
-        window_size_left=_window_to_npu(window_size[0]),
-        window_size_right=_window_to_npu(window_size[1]), softcap=softcap,
-        num_splits=num_splits, pack_gqa=pack_gqa, return_lse=return_softmax_lse,
-        scheduler_metadata=scheduler_metadata, layout=layout,
-        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
-    out, lse, out_accum, lse_accum = result
-    if was_bnsd:
-        out = out.transpose(1, 2)
-    return (out, lse, out_accum, lse_accum) if return_softmax_lse else out

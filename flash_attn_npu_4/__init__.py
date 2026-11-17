@@ -45,12 +45,10 @@ elif is_ascend950():
         flash_attn_func_with_quant as flash_attn_func_with_quant,
         flash_attn_varlen_func as flash_attn_varlen_func,
         flash_attn_varlen_func_with_quant as flash_attn_varlen_func_with_quant,
-        flash_attn_with_kvcache as flash_attn_with_kvcache,
         get_scheduler_metadata as get_scheduler_metadata,
     )
 
     __all__ += [
-        "flash_attn_with_kvcache",
         "TensorwiseScales",
         "flash_attn_func_with_quant",
         "flash_attn_varlen_func_with_quant",

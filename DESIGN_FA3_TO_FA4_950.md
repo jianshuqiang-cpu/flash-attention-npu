@@ -6,11 +6,19 @@
 不再依赖 mask 矩阵，P 双槽与原流水深度保持不变。
 详见 [全维度位置式 mask 方案](DESIGN_POSITIONAL_MASK_950.md)。
 
+2026-11-16 接口修订：移除迁移时新增的 FA4 `flash_attn_with_kvcache`。
+原有 dense、TND、paged KV、SWA 和 FlashDecode 功能由 FA4 原生
+`flash_attn_func` / `flash_attn_varlen_func` 提供。TND 使用 `cu_seqlens_q`，
+KV 长度使用 `cu_seqlens_k` / `seqused_k`，分页使用 `page_table`。
+同时修复原生 varlen 在 TND 下将整数 `seqused_k` 按 token 数展开的问题，
+改为按 `cu_seqlens_q.numel()-1` 个 batch 展开。接口回归见
+[修订报告](batchtest/fa4_public_api_20261116/REPORT.md)。
+
 ## 范围与接口
 
 将当前工作区 FA3 的 forward 资源规划、搬运、mask、输出和 FlashDecode 实现迁入 FA4。FA3 参考库 SHA256 为 `f9b310b778f16657fbd67ed97486d1742893419dfd406ef915496bf16bef1edc`；迁移没有修改 FA3 源码或库。没有重新加入用户已放弃的长 Q GQA/MQA 尾块合并。
 
-FA4 保留现有 `flash_attn_func`、`flash_attn_varlen_func`、`get_scheduler_metadata`、`flash_attn_combine` 接口及其返回约定。补充 Ascend950 的 `flash_attn_with_kvcache`，签名对应 FA3 支持的 forward 子集，实际调用 `flash_attn_npu_4_950.fwd`。不经过 FA3 库。
+FA4 保留现有 `flash_attn_func`、`flash_attn_varlen_func`、`get_scheduler_metadata`、`flash_attn_combine` 接口及其返回约定，直接执行 `flash_attn_npu_4_950.fwd`。不新增 kvcache 接口。
 
 本次支持普通 FP16/BF16 的 `Dq=Dk=Dv=512`，以及已有的 D≤256 路径。D512 不支持 FP8、非对称 Dq/Dv、qv、KV append、rotary、cache 索引重排、attention_chunk、pack_gqa 或 backward。native Python入口对qv明确拒绝。已有 FA4 FP8 D128 路径保留。910 后端不在本次范围内。
 
@@ -55,17 +63,22 @@ FLASH_ATTN_FORCE_REBUILD=TRUE \
 
 功能测试入口：`batchtest/fa3_to_fa4_950_20261115/run_tests.py --stage d512` 与 `--stage legacy`。复用FP64 golden、dtype baseline和原精度阈值，禁止执行backward。
 
-性能入口：
+性能入口（请用当前构建记录校验库身份）：
 
 ```bash
 /opt/miniconda3/envs/hyh/bin/python \
   batchtest/fa3_to_fa4_950_20261115/benchmark.py \
-  --dim 512 --output batchtest/fa4_compare_d512
+  --dim 512 --output batchtest/fa4_compare_d512 \
+  --build-record ../fa4_public_api_20261116/current_identity.json
 ```
 
 `--dim 256`为原JD的30个独立输入；D512另加36个BSND/TND/paged、GQA/MQA、Q129/257/513用例。所有性能调用均为 `num_splits=0`。`torch_npu.profiler` warmup=5、active=5，比较主kernel的5次中位数。Host、metadata、辅助kernel、wall/Event耗时不混入主指标。输出目录必须是新目录。
 
 该入口复用JD的输入、抽样CPU精度校验、parser和计时。原 `JD_compare_fa3_fused.py` 仍只支持FA3及FIA/fusion，不能通过 `--pr-root` 加载FA4。
+
+当前 FA4 caller 使用原生 func/varlen；原生接口内部计算 LSE，即使调用者不返回 LSE。
+以下 2026-11-15 数据使用已移除的 cache wrapper，不作为本次接口调整后的性能结论；
+比较新数据时必须记录入口与 LSE 计算差异。
 
 最终功能为775 passed、188 skipped。性能批量首采为93/96在±5%内，3项超界均为FA4更快。验收对全部28项短decode/FD统一使用同输入相邻配对、每实现50个样本，其余68项保留批量首采；按此协议96/96在±5%内，原始两组数据完整保留于报告，不跨模式平均。配对采集入口为 `paired_perf.py --dim 512 --case decode-fp16 --output <新目录> --build-record build_attempt14.json --calls-per-step 10 --batch-cases`；可重复指定 `--case`。
 
