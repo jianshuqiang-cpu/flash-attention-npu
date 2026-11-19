@@ -296,6 +296,8 @@ class BishengBuildExt(build_ext):
                     break
             extra_includes.append(f"-I{this_dir}/csrc/ascend950/{version_dir}")
             extra_defines.append("-DCATLASS_ARCH=3510")
+            if version_dir == "flash_attn_npu_3" and os.getenv("FLASH_ATTN_950_FA3_ASWT") == "1":
+                extra_defines.append("-DFA950_ENABLE_ASWT=1")
         else:
             extra_defines.append("-DCATLASS_ARCH=2201")
 

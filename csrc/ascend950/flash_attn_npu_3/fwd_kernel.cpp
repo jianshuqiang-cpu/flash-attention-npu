@@ -34,6 +34,7 @@
 #include "tla/layout.hpp"
 
 #include "kernel_common.hpp"
+#include "fwd_aswt.h"
 #include "fa_block.h"
 #include "rescale_o.hpp"
 #include "online_softmax.hpp"
@@ -348,7 +349,29 @@ class FAIKernel950 {
         uint32_t pipelineTileBase = 0U;
         uint64_t pipelineL0AStageBase = 0U;
         uint64_t pipelineL0BStageBase = 0U;
-        for (uint32_t taskIdx = taskBegin; taskIdx < taskEnd; taskIdx += taskStep) {
+#ifdef FA950_ENABLE_ASWT
+        constexpr bool useAswt = qFormat == Format::BSND && kvFormat == Format::BSND &&
+                                 kvcacheType == CacheMode::normalCache && maskCategory == MaskCategory::NO_MASK;
+#else
+        constexpr bool useAswt = false;
+#endif
+        fa950_plan::AswtPlan aswt{};
+        if constexpr (useAswt) {
+            const bool alignedLse = (qSeqlen == 1 ? groupSize : qSeqlen) % fa950_plan::ASWT_HEAD_GRAIN == 0U;
+            if (batch_ == 1U && !flashDecodeFlag_ && faiTilingData->maxKvSeqlen >= 1024U && embedV_ % 16U == 0U &&
+                alignedLse) {
+                const uint32_t merged =
+                    GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize, qBaseTile_ < Q_M_TILE_MAX);
+                aswt = fa950_plan::MakeAswtPlan(totalTaskNum_, coreNum, static_cast<uint32_t>(qSeqlen), qBaseTile_,
+                                                merged == groupSize ? merged : 1U);
+                if (aswt.slots) {
+                    taskEnd = aswt.slots;
+                }
+            }
+        }
+        for (uint32_t slot = taskBegin; slot < taskEnd; slot += taskStep) {
+            const fa950_plan::AswtTask task = useAswt ? aswt.Map(slot) : fa950_plan::AswtTask{slot, 0U, 1U};
+            const uint32_t taskIdx = task.base;
             while (taskIdx >= curTotalTaskNum) {
                 ++curBatch;
                 preTotalTaskNum = curTotalTaskNum;
@@ -424,11 +447,32 @@ class FAIKernel950 {
             kvHeadIdx = qNBlockIdx / qNBlockNumPerGroup;
             qNStartIdx = kvHeadIdx * groupSize + qNBlockIdxInGroup * curQNBlockTile;
             qNBlockSize = AscendC::Std::min(curQNBlockTile, groupSize - qNBlockIdxInGroup * curQNBlockTile);
+            uint32_t qsBlockNum = (qSeqlen + qBaseTile_ - 1) / qBaseTile_;
+            uint32_t qSBlockSize = qSTileIdx == qsBlockNum - 1 ? qSeqlen - (qsBlockNum - 1) * qBaseTile_ : qBaseTile_;
+            int64_t qSOffset = static_cast<int64_t>(qSTileIdx) * qBaseTile_;
+            if constexpr (useAswt) {
+                if (task.parts > 1U) {
+                    const bool byHead = qSeqlen == 1;
+                    const uint32_t extent = byHead ? qNBlockSize : qSBlockSize;
+                    const uint32_t grain = byHead ? fa950_plan::ASWT_HEAD_GRAIN : fa950_plan::ASWT_TOKEN_GRAIN;
+                    const uint32_t start = fa950_plan::AswtBoundary(extent, grain, task.part, task.parts);
+                    const uint32_t end = fa950_plan::AswtBoundary(extent, grain, task.part + 1U, task.parts);
+                    if (start == end) {
+                        continue;
+                    }
+                    if (byHead) {
+                        qNStartIdx += start;
+                        qNBlockSize = end - start;
+                    } else {
+                        qSOffset += start;
+                        qSBlockSize = end - start;
+                    }
+                }
+            }
             int64_t gmOffsetQ = 0;
             int64_t gmOffsetK = 0;
             int64_t gmOffsetV = 0;
             int64_t gmOffsetO = 0;
-            int64_t qSOffset = qSTileIdx * qBaseTile_;
             gmOffsetQ = qBOffset + qSOffset * strideQ + qNStartIdx * qHeadStride;
             gmOffsetO = oBOffset + qSOffset * strideO + qNStartIdx * oHeadStride;
             uint32_t lseHeadStride = static_cast<uint32_t>(faiTilingData->maxQSeqlen);
@@ -458,8 +502,6 @@ class FAIKernel950 {
                 gmOffsetK = kBOffset + static_cast<uint64_t>(kvHeadIdx * embed_) * kvNumTokens;
                 gmOffsetV = vBOffset + static_cast<uint64_t>(kvHeadIdx * embedV_) * kvNumTokens;
             }
-            uint32_t qsBlockNum = (qSeqlen + qBaseTile_ - 1) / qBaseTile_;
-            uint32_t qSBlockSize = qSTileIdx == qsBlockNum - 1 ? qSeqlen - (qsBlockNum - 1) * qBaseTile_ : qBaseTile_;
             uint32_t rowNum = qSBlockSize * qNBlockSize;
             uint32_t rowNumRound = 0;
             if constexpr (IsDN) {
@@ -481,7 +523,7 @@ class FAIKernel950 {
             bool notNextMask = true;
             int32_t delStartRow = 0;
             int32_t delEndRow = static_cast<int32_t>(qSeqlen);
-            const int32_t qSTileStart = static_cast<int32_t>(qSTileIdx * qBaseTile_);
+            const int32_t qSTileStart = static_cast<int32_t>(qSOffset);
             if constexpr (maskCategory == MaskCategory::MASK_CAUSAL) {
                 int64_t causalKvEnd;
                 if (d512) {
