@@ -229,8 +229,13 @@ class FAIKernel950 {
         AscendC::LocalTensor<ElementP> l1PTensor[MAX_CROSS_CORE_BUF_STAGES];
         AscendC::LocalTensor<ElementS> ubSTensor[UB_S_BUF_STAGES];
         AscendC::LocalTensor<ElementOTmp> ubOTmpTensor[UB_S_OTMP_BUF_STAGES];
-        auto pvL1AddrStart_ = qkL1TileM_ * qkL1TileKLeft_ * qL1BufNum_ * sizeof(ElementQ) +
-                              qkL1TileKRight_ * qkL1TileN_ * kL1BufNum_ * sizeof(ElementK);
+        const uint32_t qBytes = qkL1TileM_ * qkL1TileKLeft_ * sizeof(ElementQ);
+        const uint32_t kBytes = qkL1TileKRight_ * qkL1TileN_ * kL1BufNum_ * sizeof(ElementK);
+        const uint32_t pBytes = pvL1TileM_ * pvL1TileKLeft_ * pL1BufNum_ * sizeof(ElementP);
+        const uint32_t vBytes = pvL1TileN_ * pvL1TileKRight_ * vL1BufNum_ * sizeof(ElementV);
+        // Use the same effective count for Cube and Vector, including legacy one-slot metadata.
+        qL1BufNum_ = qL1BufNum_ == 2U && 2U * qBytes + kBytes + pBytes + vBytes <= ArchTag::L1_SIZE ? 2U : 1U;
+        const uint32_t pvL1AddrStart_ = qL1BufNum_ * qBytes + kBytes;
         for (uint32_t i = 0; i < pL1BufNum_; i++) {
             l1PTensor[i] = resource.l1Buf.template GetBufferByByte<ElementP>(
                 pvL1AddrStart_ + pvL1TileM_ * pvL1TileKLeft_ * sizeof(ElementP) * i);
@@ -602,12 +607,13 @@ class FAIKernel950 {
             auto gmQTensorTla = tla::MakeTensor(gQ[gmOffsetQ], gmQLayoutTla, Arch::PositionGM{});
             auto gmQTensorTlaDN = tla::MakeTensor(gQ[gmOffsetQ], gmQLayoutTlaDN, Arch::PositionGM{});
 
+            const Gemm::Block::QueryL1Slot qSlot{taskSeq & (qL1BufNum_ - 1U)};
             GemmCoord actualBlockShapeQ{rowNum, embed_, 0};
             if (kvSLoopCount != 0U) {
                 if constexpr (IsDN) {
-                    blockMmadQK.loadQGM(gmQTensorTlaDN, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride);
+                    blockMmadQK.loadQGM(gmQTensorTlaDN, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride, qSlot);
                 } else {
-                    blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride);
+                    blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride, qSlot);
                 }
             }
             uint32_t kShapeRow = 0;
@@ -684,15 +690,15 @@ class FAIKernel950 {
                         blockMmadQK(gmKTensorTlaDN, ubSTensorTlaDN, gBlockTable[blockBOffset], actualBlockShapeQK,
                                     blockSize_, kvSTileIdx, pipelineTileSeq, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0,
                                     0, 0, qSBlockSize, qNBlockSize, qkReadyFlag, prefixSumL0AStages,
-                                    prefixSumL0BStages);
+                                    prefixSumL0BStages, qSlot);
                     } else {
                         blockMmadQK(gmKTensorTla, ubSTensorTla, gBlockTable[blockBOffset], actualBlockShapeQK,
                                     blockSize_, kvSTileIdx, pipelineTileSeq, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0,
                                     0, 0, qSBlockSize, qNBlockSize, qkReadyFlag, prefixSumL0AStages,
-                                    prefixSumL0BStages);
+                                    prefixSumL0BStages, qSlot);
                     }
                     if (kvSTileRelIdx == kvSLoopCount - 1U) {
-                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(qSlot.FreeEvent());
                     }
                     l0AStagesIssued += qkL0ATotalStages_;
                     l0BStagesIssued += qkL0BTotalStages_;
@@ -855,6 +861,9 @@ class FAIKernel950 {
         // same core sync between pipes
         // Query
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+        if (qL1BufNum_ == 2U) {
+            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(Gemm::Block::QueryL1Slot::PONG_EVENT);
+        }
         // Key
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID1);
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID2);
@@ -916,6 +925,9 @@ class FAIKernel950 {
 #ifdef __DAV_CUBE__
         // same core sync between pipes
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+        if (qL1BufNum_ == 2U) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(Gemm::Block::QueryL1Slot::PONG_EVENT);
+        }
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID1);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID2);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);

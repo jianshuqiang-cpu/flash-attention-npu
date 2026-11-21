@@ -90,10 +90,16 @@ def test_950_scheduler_metadata_matches_signature():
 
 
 @pytest.mark.skipif("Ascend950" not in _device_name, reason="950 task metadata")
-@pytest.mark.parametrize("group,causal", [(1, False), (3, True)])
-def test_950_cross_kv_head_segments(group, causal):
+@pytest.mark.parametrize("group,causal,sk,dq,dv", [
+    (1, False, 37, 64, 48),
+    (3, True, 37, 64, 48),
+    # Each head segment reuses Q across KV tiles; consecutive segments switch Q slots.
+    (1, False, 143, 256, 256),
+    (3, True, 129, 193, 193),
+])
+def test_950_cross_kv_head_segments(group, causal, sk, dq, dv):
     # Odd head counts and short rows expose incorrect K/V segment and LSE head strides.
-    batch, sq, sk, hk, dq, dv = 64, 5, 37, 5, 64, 48
+    batch, sq, hk = 64, 5, 5
     hq = hk * group
     gen = torch.Generator().manual_seed(975)
     q, k, v = [

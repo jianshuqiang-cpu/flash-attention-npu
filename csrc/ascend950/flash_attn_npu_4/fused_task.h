@@ -10,6 +10,26 @@
 #endif
 
 namespace fa950_task {
+// Nonempty FP16/BF16 segments are bounded in both metadata producers.
+constexpr uint32_t MAX_Q_ROWS = 128U;
+constexpr uint32_t KV_TILE = 128U;
+
+struct QkL1Layout {
+    uint32_t qSlots;
+    uint32_t kRows;
+    uint32_t kDepth;
+};
+
+// Each K slot holds one KV tile. For equal-width 16-bit inputs at D=256,
+// Q/K/V use 128 KiB each and P uses 96 KiB (480 KiB of the 512 KiB L1).
+inline QkL1Layout MakeQkL1Layout(uint32_t dq, uint32_t dv, uint32_t kvTile, bool fp8)
+{
+    if (dq == dv && dq > 0U && dq <= 256U) {
+        return {2U, kvTile, (dq + 15U) / 16U * 16U};
+    }
+    return {1U, 256U, fp8 ? 128U : 192U};
+}
+
 FA950_TASK_INLINE uint32_t CeilDiv(uint32_t n, uint32_t d)
 {
     return (n + d - 1U) / d;
@@ -17,8 +37,8 @@ FA950_TASK_INLINE uint32_t CeilDiv(uint32_t n, uint32_t d)
 
 FA950_TASK_INLINE uint32_t HeadTile(uint32_t rows, uint32_t groupSize, uint32_t qTile)
 {
-    uint32_t tile = rows == 0U ? 128U : (128U / rows) / 2U * 2U;
-    if (qTile < 128U && rows != 0U) {
+    uint32_t tile = rows == 0U ? MAX_Q_ROWS : (MAX_Q_ROWS / rows) / 2U * 2U;
+    if (qTile < MAX_Q_ROWS && rows != 0U) {
         const uint32_t capacity = qTile / rows;
         tile = tile < capacity ? tile : capacity;
     }

@@ -17,7 +17,7 @@ const uint32_t SIZE_OF_16BIT = 2;
 const uint32_t SIZE_OF_32BIT = 4;
 const uint32_t N_SPLIT_HELPER = 2;
 const uint32_t MAX_KV_STACK_LEN = 512;
-const uint32_t Q_TILE_CEIL = 128;
+const uint32_t Q_TILE_CEIL = fa950_task::MAX_Q_ROWS;
 const uint32_t WORKSPACE_BLOCK_SIZE_DB = Q_TILE_CEIL * MAX_KV_STACK_LEN;
 const uint32_t BASE_KV_SIZE = 128;
 const uint32_t PRELANCH_NUM = 3;
@@ -140,7 +140,7 @@ uint32_t FAInferTiling::GetQSBlockTile(int64_t kvSeqlen)
 }
 uint32_t FAInferTiling::GetKSBlockTile(int64_t kvSeqlen)
 {
-    uint32_t kSBlockTile = faInfo_.dataType == DataType::FP8 ? 256U : 128U;
+    uint32_t kSBlockTile = faInfo_.dataType == DataType::FP8 ? 256U : fa950_task::KV_TILE;
     return kSBlockTile;
 }
 
@@ -182,10 +182,8 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
     auto embeddingSizeVAligned16_ = (static_cast<uint32_t>(faInfo_.embeddingSizeV) + 15U) / 16U * 16U;
     auto qkL1TileM_ = Q_TILE_CEIL;
     auto qkL1TileKLeft_ = embeddingSizeAligned16_;
-    auto qL1BufNum_ = 1;
-    // K矩阵开启2buf，D按128分割，S2按256分割
-    auto qkL1TileN_ = 256;
-    auto qkL1TileKRight_ = quantMode == 1 ? 128 : 192;
+    const auto qkLayout = fa950_task::MakeQkL1Layout(faInfo_.embeddingSize, faInfo_.embeddingSizeV,
+                                                     kvBaseTile_, quantMode == 1U);
     auto kL1BufNum_ = 2;
     // V矩阵开启db，D按128分割，kvBaseTile_不分割，指令同样提前于核间同步下发
     // 如果kvBaseTile_进一步增大，考虑关闭db，使得kvBaseTile_不分割
@@ -202,14 +200,14 @@ void FAInferTiling::FillBasicTilingData(FAInferTilingData& faTilingData)
     faTilingData.set_qBaseTile(qBaseTile_);
     faTilingData.set_kvBaseTile(kvBaseTile_);
     faTilingData.set_qkL1TileM(qkL1TileM_);
-    faTilingData.set_qkL1TileN(qkL1TileN_);
+    faTilingData.set_qkL1TileN(qkLayout.kRows);
     faTilingData.set_qkL1TileKLeft(qkL1TileKLeft_);
-    faTilingData.set_qkL1TileKRight(qkL1TileKRight_);
+    faTilingData.set_qkL1TileKRight(qkLayout.kDepth);
     faTilingData.set_pvL1TileM(pvL1TileM_);
     faTilingData.set_pvL1TileN(pvL1TileN_);
     faTilingData.set_pvL1TileKLeft(pvL1TileKLeft_);
     faTilingData.set_pvL1TileKRight(pvL1TileKRight_);
-    faTilingData.set_qL1BufNum(qL1BufNum_);
+    faTilingData.set_qL1BufNum(qkLayout.qSlots);
     faTilingData.set_kL1BufNum(kL1BufNum_);
     faTilingData.set_vL1BufNum(vL1BufNum_);
     faTilingData.set_pL1BufNum(pL1BufNum_);
