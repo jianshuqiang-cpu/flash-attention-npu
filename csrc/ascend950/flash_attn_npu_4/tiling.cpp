@@ -553,30 +553,21 @@ void FAInferTiling::FillFlashDecodeTilingData(FAInferTilingData& tiling)
 void FAInferTiling::FillSplitCoreTilingData(FAInferTilingData& faTilingData)
 {
     uint32_t totalTaskNum = 0;
-    faTilingData.fusedCrossGroup = 0U;
     uint32_t groupSize = faInfo_.numHeads / faInfo_.kvHeads;
+    faTilingData.useGqaTailGrouping = faInfo_.dataType != DataType::FP8 && groupSize > 1U &&
+                                      faInfo_.maxQSeqlen > faTilingData.qBaseTile && !faInfo_.flashDecodeFlag;
     for (int32_t batchIdx = 0; batchIdx < faInfo_.batch; batchIdx++) {
         uint32_t qSeqlen = *(faInfo_.qSeqlenList + batchIdx);
-        uint32_t kvSeqlen = *(faInfo_.kvSeqlenList + batchIdx);
         if (faInfo_.layout == FwdLayout::TND) {
             uint64_t prevQSeqlenSum = *(faInfo_.qSeqlenList + batchIdx);
             qSeqlen = *(faInfo_.qSeqlenList + batchIdx + 1) - prevQSeqlenSum;
-            if (!faInfo_.pagedCacheFlag) {
-                uint64_t prevKvSeqlenSum = *(faInfo_.kvSeqlenList + batchIdx);
-                kvSeqlen = *(faInfo_.kvSeqlenList + batchIdx + 1) - prevKvSeqlenSum;
-            }
         }
-        const auto shape =
-            fa950_task::MakeShape(qSeqlen, faInfo_.numHeads, faInfo_.kvHeads, GetQSBlockTile(faInfo_.maxKvSeqlen),
-                                  faInfo_.batch, blockNum_,
-                                  faInfo_.layout != FwdLayout::TND, faInfo_.dataType == DataType::FP8,
-                                  faInfo_.maskType != MaskType::NO_MASK, faInfo_.maxKvSeqlen <= BASE_KV_SIZE);
-        const uint32_t curTaskNum = shape.totalTasks;
-        faTilingData.fusedCrossGroup |= shape.tailRows && shape.tailHeadTile > groupSize;
+        const auto taskShape = fa950_task::MakeShape(qSeqlen, groupSize, faInfo_.kvHeads, faTilingData.qBaseTile,
+                                                    faTilingData.useGqaTailGrouping != 0U);
         if (batchIdx == 0) {
-            faTilingData.set_firstBatchTaskNum(curTaskNum);
+            faTilingData.set_firstBatchTaskNum(taskShape.totalTasks);
         }
-        totalTaskNum += curTaskNum;
+        totalTaskNum += taskShape.totalTasks;
     }
     faTilingData.set_totalTaskNum(totalTaskNum);
 }

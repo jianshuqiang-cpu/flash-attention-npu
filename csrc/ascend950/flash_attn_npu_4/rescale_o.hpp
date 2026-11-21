@@ -384,6 +384,20 @@ class BlockEpilogue<EpilogueFARescaleO, ElementO_, ElementOTmp_, ElementS_, Elem
         }
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
         AscendC::PipeBarrier<PIPE_V>();
+        if (qNBlockSize == 1U && fullyMaskedRowsPerHead == 0U &&
+            (qSeqlen == 0U || (delStartRow == 0 && delEndRow == static_cast<int32_t>(qSeqlen)))) {
+            // A single head's LSE rows are contiguous in GM. Use the output
+            // scratch protected by MTE3_V(4), not LM, which the next softmax
+            // may overwrite before this DMA completes.
+            ComputeLse((__ubuf__ float*)glUbTensor32.GetPhyAddr(), (__ubuf__ float*)gmUbTensor32.GetPhyAddr(),
+                       (__ubuf__ float*)goUbTensor32.GetPhyAddr(), rowCount);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
+            AscendC::DataCopyPad(gLse[rowStart], goUbTensor32,
+                                 AscendC::DataCopyExtParams(1, rowCount * sizeof(float), 0, 0, 0));
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+            return;
+        }
         ComputeLse((__ubuf__ float*)glUbTensor32.GetPhyAddr(), (__ubuf__ float*)gmUbTensor32.GetPhyAddr(),
                    (__ubuf__ float*)lmUbTensor32.GetPhyAddr(), rowCount);
         AscendC::PipeBarrier<PIPE_V>();

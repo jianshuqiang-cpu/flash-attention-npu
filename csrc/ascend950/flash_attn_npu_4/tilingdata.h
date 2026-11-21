@@ -95,7 +95,8 @@ struct FAInferStaticTilingData {
     uint64_t workSpaceSize;
     uint64_t padding1;
     uint64_t padding2;
-    uint32_t fusedCrossGroup;
+    // Reuse a reserved zero word so existing scheduler metadata keeps its task layout.
+    uint32_t useGqaTailGrouping = 0U;
     int64_t preToken = 0;
     int64_t nextToken = 0;
     int32_t sparseMode = 0;
@@ -219,10 +220,6 @@ struct FAInferStaticTilingData {
     {
         return padding2;
     }
-    uint32_t get_fusedCrossGroup() const
-    {
-        return fusedCrossGroup;
-    }
     uint64_t get_splitLseTotalSize() const
     {
         return splitLseTotalSize;
@@ -316,10 +313,6 @@ struct FAInferStaticTilingData {
     void set_padding2(uint64_t value)
     {
         padding2 = value;
-    }
-    void set_fusedCrossGroup(uint32_t value)
-    {
-        fusedCrossGroup = value;
     }
     void set_sparseMode(int32_t value)
     {

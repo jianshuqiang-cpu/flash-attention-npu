@@ -9,7 +9,6 @@
 #include <cstring>
 #include <unordered_map>
 
-#include "device_triu_mask.h"
 #include "fa_metadata_args.h"
 #include "mha_fwd.cpp"
 #include "mha_bwd.cpp"
