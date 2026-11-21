@@ -554,8 +554,10 @@ void FAInferTiling::FillSplitCoreTilingData(FAInferTilingData& faTilingData)
 {
     uint32_t totalTaskNum = 0;
     uint32_t groupSize = faInfo_.numHeads / faInfo_.kvHeads;
-    faTilingData.useGqaTailGrouping = faInfo_.dataType != DataType::FP8 && groupSize > 1U &&
-                                      faInfo_.maxQSeqlen > faTilingData.qBaseTile && !faInfo_.flashDecodeFlag;
+    const uint32_t budget = faInfo_.dataType == DataType::FP8 ? 0U :
+        fa950_task::HeadGroupBudget(faInfo_.batch, faInfo_.kvHeads, blockNum_);
+    bool hasCrossHeadTasks = false;
+    bool uniformTaskCount = true;
     for (int32_t batchIdx = 0; batchIdx < faInfo_.batch; batchIdx++) {
         uint32_t qSeqlen = *(faInfo_.qSeqlenList + batchIdx);
         if (faInfo_.layout == FwdLayout::TND) {
@@ -563,12 +565,17 @@ void FAInferTiling::FillSplitCoreTilingData(FAInferTilingData& faTilingData)
             qSeqlen = *(faInfo_.qSeqlenList + batchIdx + 1) - prevQSeqlenSum;
         }
         const auto taskShape = fa950_task::MakeShape(qSeqlen, groupSize, faInfo_.kvHeads, faTilingData.qBaseTile,
-                                                    faTilingData.useGqaTailGrouping != 0U);
+                                                    budget);
+        hasCrossHeadTasks |= taskShape.headsPerTailTask > groupSize;
         if (batchIdx == 0) {
             faTilingData.set_firstBatchTaskNum(taskShape.totalTasks);
+        } else {
+            uniformTaskCount &= taskShape.totalTasks == faTilingData.firstBatchTaskNum;
         }
         totalTaskNum += taskShape.totalTasks;
     }
+    faTilingData.uniformBatchTaskCount = uniformTaskCount ? faTilingData.firstBatchTaskNum : 0U;
+    faTilingData.headGroupBudget = hasCrossHeadTasks ? budget : (budget != 0U);
     faTilingData.set_totalTaskNum(totalTaskNum);
 }
 BatchParams FAInferTiling::getBatchParams(uint32_t bIdx, uint32_t groupSize)

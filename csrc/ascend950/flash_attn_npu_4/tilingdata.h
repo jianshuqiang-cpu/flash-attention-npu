@@ -93,10 +93,10 @@ struct FAInferStaticTilingData {
     uint64_t pvOutSize;
     uint64_t UpdateSize;
     uint64_t workSpaceSize;
-    uint64_t padding1;
+    uint64_t uniformBatchTaskCount = 0; // Formerly reserved; zero selects variable task counts.
     uint64_t padding2;
-    // Reuse a reserved zero word so existing scheduler metadata keeps its task layout.
-    uint32_t useGqaTailGrouping = 0U;
+    // 0 = legacy, 1 = within-KV tail grouping, 2+ = maximum distinct KV groups per task.
+    uint32_t headGroupBudget = 0U;
     int64_t preToken = 0;
     int64_t nextToken = 0;
     int32_t sparseMode = 0;
@@ -212,9 +212,9 @@ struct FAInferStaticTilingData {
     {
         return workSpaceSize;
     }
-    uint64_t get_padding1() const
+    uint64_t get_uniformBatchTaskCount() const
     {
-        return padding1;
+        return uniformBatchTaskCount;
     }
     uint64_t get_padding2() const
     {
@@ -306,9 +306,9 @@ struct FAInferStaticTilingData {
     {
         workSpaceSize = value;
     }
-    void set_padding1(uint64_t value)
+    void set_uniformBatchTaskCount(uint64_t value)
     {
-        padding1 = value;
+        uniformBatchTaskCount = value;
     }
     void set_padding2(uint64_t value)
     {

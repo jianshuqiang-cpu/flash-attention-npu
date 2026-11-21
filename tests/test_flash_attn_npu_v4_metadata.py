@@ -89,6 +89,65 @@ def test_950_scheduler_metadata_matches_signature():
     ]
 
 
+@pytest.mark.skipif("Ascend950" not in _device_name, reason="950 task metadata")
+@pytest.mark.parametrize("group,causal", [(1, False), (3, True)])
+def test_950_cross_kv_head_segments(group, causal):
+    # Odd head counts and short rows expose incorrect K/V segment and LSE head strides.
+    batch, sq, sk, hk, dq, dv = 64, 5, 37, 5, 64, 48
+    hq = hk * group
+    gen = torch.Generator().manual_seed(975)
+    q, k, v = [
+        (torch.randn(shape, generator=gen) * 0.5).bfloat16()
+        for shape in ((batch, sq, hq, dq), (batch, sk, hk, dq), (batch, sk, hk, dv))
+    ]
+    qh = q.transpose(1, 2).float()
+    kh = k.transpose(1, 2).float().repeat_interleave(group, dim=1)
+    vh = v.transpose(1, 2).float().repeat_interleave(group, dim=1)
+    scores = (qh @ kh.transpose(-1, -2)) * dq**-0.5
+    if causal:
+        scores.masked_fill_(torch.ones(sq, sk, dtype=torch.bool).triu(sk - sq + 1), -torch.inf)
+    expected_o = (scores.softmax(-1) @ vh).transpose(1, 2).reshape(-1, hq, dv)
+    expected_lse = scores.logsumexp(-1).transpose(0, 1).reshape(hq, -1)
+    q, k, v = [t.flatten(0, 1).npu() for t in (q, k, v)]
+    cq = torch.arange(batch + 1, dtype=torch.int32, device="npu") * sq
+    ck = torch.arange(batch + 1, dtype=torch.int32, device="npu") * sk
+    used_k = torch.full((batch,), sk, dtype=torch.int32, device="npu")
+    metadata = get_scheduler_metadata(
+        sq, sk, hq, hk, dq, 1, headdim_v=dv, cu_seqlens_q=cq, cu_seqlens_k=ck,
+        seqused_k=used_k, causal=causal,
+    )
+    # FAInferStaticTilingData::totalTaskNum is the ninth uint32 field.
+    total_tasks = int(metadata.cpu().view(torch.int32)[8])
+    assert 0 < total_tasks < batch * hk
+    for opts in ({"scheduler_metadata": metadata}, {"disable_scheduler_metadata": True}):
+        out, lse, *_ = flash_attn_varlen_func(
+            q, k, v, cu_seqlens_q=cq, cu_seqlens_k=ck, max_seqlen_q=sq, max_seqlen_k=sk,
+            causal=causal, num_splits=1, return_lse=True, **opts,
+        )
+        torch.testing.assert_close(out.cpu().float(), expected_o, rtol=0.015, atol=0.003)
+        torch.testing.assert_close(lse.cpu().reshape_as(expected_lse), expected_lse, rtol=0.0, atol=0.001)
+
+
+@pytest.mark.skipif("Ascend950" not in _device_name, reason="950 fixed-layout task indexing")
+def test_950_dense_cache_batch_stride_with_used_lengths():
+    batch, sq, capacity, heads, dim = 64, 3, 32, 5, 16
+    lengths = torch.tensor([3, 19, 2, 31] * (batch // 4), dtype=torch.int32)
+    q = torch.zeros(batch, sq, heads, dim, device="npu", dtype=torch.bfloat16)
+    k = torch.zeros(batch, capacity, heads, dim, device="npu", dtype=q.dtype)
+    tags = (torch.arange(batch)[:, None] % 11 + 2 * torch.arange(heads)[None, :]).to(q.dtype)
+    v = tags[:, None, :, None].expand(batch, capacity, heads, dim).clone()
+    v.masked_fill_(torch.arange(capacity)[None, :, None, None] >= lengths[:, None, None, None], -64)
+    expected = tags[:, None, :, None].expand(batch, sq, heads, dim)
+    expected_lse = lengths.float().log()[:, None, None].expand(batch, heads, sq)
+    for host_tiling in (True, False):
+        out, lse, *_ = flash_attn_varlen_func(
+            q, k, v.npu(), seqused_k=lengths.npu(), max_seqlen_q=sq, max_seqlen_k=capacity,
+            return_lse=True, disable_scheduler_metadata=host_tiling,
+        )
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(lse.cpu(), expected_lse, rtol=0, atol=1e-5)
+
+
 @pytest.mark.parametrize("page_size", [128, 256, 512, 1024])
 @pytest.mark.parametrize("paged", [False, True])
 def test_950_metadata_reuse_with_forward_parameters(page_size, paged):

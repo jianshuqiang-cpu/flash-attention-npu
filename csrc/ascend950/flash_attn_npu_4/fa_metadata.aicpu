@@ -468,8 +468,10 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
     uint32_t totalTaskNum = 0;
     uint32_t firstBatchTaskNum = 0;
     const uint32_t groupSize = metadataArgs->numHeadsK == 0 ? 1 : metadataArgs->numHeads / metadataArgs->numHeadsK;
-    const bool useGqaTailGrouping = metadataArgs->quantMode == 0U && groupSize > 1U;
-    tilingData->useGqaTailGrouping = useGqaTailGrouping;
+    const uint32_t budget = metadataArgs->quantMode == 0U ?
+        fa950_task::HeadGroupBudget(metadataArgs->batch, metadataArgs->numHeadsK, metadataArgs->blockDim) : 0U;
+    bool hasCrossHeadTasks = false;
+    bool uniformTaskCount = true;
     for (uint32_t batchIndex = 0; batchIndex < metadataArgs->batch; ++batchIndex) {
         const uint32_t qSeqlen =
             metadataArgs->isVarlen ? (metadataArgs->hasSequsedQ != 0
@@ -482,14 +484,19 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
         maxQSeqlen = maxQSeqlen > qSeqlen ? maxQSeqlen : qSeqlen;
         maxKvSeqlen = maxKvSeqlen > kvSeqlen ? maxKvSeqlen : kvSeqlen;
         const auto taskShape = fa950_task::MakeShape(qSeqlen, groupSize, metadataArgs->numHeadsK,
-                                                    tilingData->qBaseTile, useGqaTailGrouping);
+                                                    tilingData->qBaseTile, budget);
+        hasCrossHeadTasks |= taskShape.headsPerTailTask > groupSize;
         if (batchIndex == 0) {
             firstBatchTaskNum = taskShape.totalTasks;
+        } else {
+            uniformTaskCount &= taskShape.totalTasks == firstBatchTaskNum;
         }
         totalTaskNum += taskShape.totalTasks;
     }
     tilingData->maxQSeqlen = maxQSeqlen;
     tilingData->maxKvSeqlen = maxKvSeqlen;
+    tilingData->uniformBatchTaskCount = uniformTaskCount ? firstBatchTaskNum : 0U;
+    tilingData->headGroupBudget = hasCrossHeadTasks ? budget : (budget != 0U);
     tilingData->firstBatchTaskNum = firstBatchTaskNum;
     tilingData->totalTaskNum = totalTaskNum;
 
@@ -500,7 +507,6 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args)
                                         maxQSeqlen * groupSizeForFlashDecode <= 128 && maxKvSeqlen >= 1024;
     if (isFlashDecodeCandidate) {
         // FlashDecode only accepts Q lengths that fit in one tile.
-        tilingData->useGqaTailGrouping = 0U;
         FillFlashDecodeTiling(tilingData, metadataArgs, cuSeqlensQ, seqlensQ, seqlensK);
     }
     AscendC::DataStoreBarrier();

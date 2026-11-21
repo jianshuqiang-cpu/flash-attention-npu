@@ -352,21 +352,12 @@ class FAIKernel950 {
         uint32_t cachedBatch = 0xFFFFFFFFU;
         // Used lengths drive task counts; physical (region) lengths drive offsets.
         int64_t qSeqlen = GetQSeqLen(curBatch, faiTilingData->maxQSeqlen, gActualQseqlen, gSeqUsedQ);
-        int64_t qPhysicalSeqlen = faiTilingData->maxQSeqlen;
         int64_t kvSeqlen = 0;
-        int64_t kvPhysicalSeqlen = gActualKvseqlen.GetValue(curBatch);
         uint32_t curTotalTaskNum = firstBatchTaskNum_;
-        const bool useGqaTailGrouping = faiTilingData->useGqaTailGrouping == 1U;
+        const uint32_t uniformTasks = static_cast<uint32_t>(faiTilingData->uniformBatchTaskCount);
+        const uint32_t headGroupBudget = faiTilingData->headGroupBudget;
         auto taskShape =
-            fa950_task::MakeShape(static_cast<uint32_t>(qSeqlen), groupSize, kvHeads_, qBaseTile_, useGqaTailGrouping);
-        if constexpr (qFormat == Format::TND) {
-            qPhysicalSeqlen =
-                static_cast<int64_t>(gActualQseqlen.GetValue(curBatch + 1) - gActualQseqlen.GetValue(curBatch));
-        }
-        if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
-            kvPhysicalSeqlen =
-                static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
-        }
+            fa950_task::MakeShape(static_cast<uint32_t>(qSeqlen), groupSize, kvHeads_, qBaseTile_, headGroupBudget);
         uint32_t taskBegin = coreIdx;
         uint32_t taskEnd = totalTaskNum_;
         uint32_t taskStep = coreNum;
@@ -391,72 +382,70 @@ class FAIKernel950 {
         // L0 A/B stage counters in exact issue order
         uint64_t l0AStagesIssued = 0U;
         uint64_t l0BStagesIssued = 0U;
-        for (uint32_t taskIdx = taskBegin; taskIdx < taskEnd; taskIdx += taskStep) {
-            while (taskIdx >= curTotalTaskNum) {
-                ++curBatch;
-                preTotalTaskNum = curTotalTaskNum;
-                // Batch strides are recomputed on every batch advance because the
-                // BSND forms depend on the physical (region) seqlen of the batch
-                // being left.  BNSD planes are maxSeqlen sized so they are constant.
-                int64_t qBatchStride = 0;
-                if constexpr (qFormat == Format::BNSD) {
-                    qBatchStride = static_cast<int64_t>(qHeads_) * qHeadStride;
-                } else {
-                    qBatchStride = qPhysicalSeqlen * strideQ;
+        fa950_task::Task task{};
+        uint32_t headOffset = 0U;
+        for (uint32_t taskIdx = taskBegin; taskIdx < taskEnd;) {
+            if (headOffset == 0U) {
+                while (taskIdx >= curTotalTaskNum) {
+                    if (uniformTasks != 0U) {
+                        curBatch = taskIdx / uniformTasks;
+                        preTotalTaskNum = curBatch * uniformTasks;
+                    } else {
+                        ++curBatch;
+                        preTotalTaskNum = curTotalTaskNum;
+                    }
+                    const int64_t nextQ = GetQSeqLen(curBatch, faiTilingData->maxQSeqlen, gActualQseqlen, gSeqUsedQ);
+                    if (nextQ != qSeqlen) {
+                        qSeqlen = nextQ;
+                        taskShape = fa950_task::MakeShape(static_cast<uint32_t>(qSeqlen), groupSize, kvHeads_,
+                                                          qBaseTile_, headGroupBudget);
+                    }
+                    curTotalTaskNum = preTotalTaskNum + taskShape.totalTasks;
                 }
-                // O always follows BSND: one batch is qPhysicalSeqlen rows of
-                // strideO elements each.
-                int64_t oBatchStride = qPhysicalSeqlen * strideO;
-                int64_t kBatchStride = 0;
-                int64_t vBatchStride = 0;
-                if constexpr (kvFormat == Format::BNSD) {
-                    kBatchStride = static_cast<int64_t>(kvHeads_) * kvHeadStrideK;
-                    vBatchStride = static_cast<int64_t>(kvHeads_) * kvHeadStrideV;
-                } else {
-                    kBatchStride = kvPhysicalSeqlen * strideK;
-                    vBatchStride = kvPhysicalSeqlen * strideV;
+                if (curBatch != cachedBatch) {
+                    // Storage offsets follow the packed prefix or the allocated batch stride.
+                    // Used lengths determine the attention region, including in paged caches.
+                    int64_t qStart;
+                    if constexpr (qFormat == Format::TND) {
+                        qStart = gActualQseqlen.GetValue(curBatch);
+                    } else {
+                        qStart = static_cast<int64_t>(curBatch) * faiTilingData->maxQSeqlen;
+                    }
+                    if constexpr (qFormat == Format::BNSD) {
+                        qBOffset = static_cast<int64_t>(curBatch) * qHeads_ * qHeadStride;
+                    } else {
+                        qBOffset = qStart * strideQ;
+                    }
+                    oBOffset = qStart * strideO;
+                    if constexpr (kvcacheType == CacheMode::normalCache) {
+                        if constexpr (kvFormat == Format::BNSD) {
+                            kBOffset = static_cast<int64_t>(curBatch) * kvHeads_ * kvHeadStrideK;
+                            vBOffset = static_cast<int64_t>(curBatch) * kvHeads_ * kvHeadStrideV;
+                        } else {
+                            int64_t kStart;
+                            if constexpr (kvFormat == Format::TND) {
+                                kStart = gActualKvseqlen.GetValue(curBatch);
+                            } else {
+                                kStart = static_cast<int64_t>(curBatch) * params.kvSeqlenAllocated;
+                            }
+                            kBOffset = kStart * strideK;
+                            vBOffset = kStart * strideV;
+                        }
+                    }
+                    blockBOffset = static_cast<int64_t>(curBatch) * maxNumBlocksPerBatch_;
+                    kvSeqlen = GetKvSeqLen(curBatch, gActualKvseqlen, gSeqUsedKv);
+                    cachedBatch = curBatch;
                 }
-                qBOffset += qBatchStride;
-                if constexpr (kvcacheType == CacheMode::normalCache) {
-                    kBOffset += static_cast<uint64_t>(kBatchStride);
-                    vBOffset += static_cast<uint64_t>(vBatchStride);
-                } else {
-                    blockBOffset += static_cast<uint64_t>(maxNumBlocksPerBatch_);
-                }
-                oBOffset += oBatchStride;
-
-                qSeqlen = GetQSeqLen(curBatch, faiTilingData->maxQSeqlen, gActualQseqlen, gSeqUsedQ);
-                qPhysicalSeqlen = faiTilingData->maxQSeqlen;
-                kvPhysicalSeqlen = gActualKvseqlen.GetValue(curBatch);
-                if constexpr (qFormat == Format::TND) {
-                    qPhysicalSeqlen =
-                        static_cast<int64_t>(gActualQseqlen.GetValue(curBatch + 1) - gActualQseqlen.GetValue(curBatch));
-                }
-                if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
-                    kvPhysicalSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) -
-                                                            gActualKvseqlen.GetValue(curBatch));
-                }
-                taskShape = fa950_task::MakeShape(static_cast<uint32_t>(qSeqlen), groupSize, kvHeads_, qBaseTile_,
-                                                 useGqaTailGrouping);
-                curTotalTaskNum += taskShape.totalTasks;
+                task = fa950_task::Decode(taskShape, taskIdx - preTotalTaskNum, groupSize, kvHeads_);
             }
-            if (curBatch != cachedBatch) {
-                kvSeqlen = GetKvSeqLen(curBatch, gActualKvseqlen, gSeqUsedKv);
-                cachedBatch = curBatch;
-            }
-            uint32_t taskIdxCurBatch = taskIdx - preTotalTaskNum;
-            const bool tailTask = taskIdxCurBatch >= taskShape.fullTasks;
-            const uint32_t qSTileIdx =
-                tailTask ? taskShape.fullBlocks : taskIdxCurBatch / taskShape.fullHeadTasks;
-            const uint32_t curQNBlockTile = tailTask ? taskShape.headsPerTailTask : taskShape.headsPerFullTask;
-            const uint32_t qNBlockIdx = taskIdxCurBatch -
-                                        (tailTask ? taskShape.fullTasks : qSTileIdx * taskShape.fullHeadTasks);
-            const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
-            const uint32_t qNBlockIdxInGroup = qNBlockIdx % qNBlockNumPerGroup;
-            const uint32_t kvHeadIdx = qNBlockIdx / qNBlockNumPerGroup;
-            const uint32_t qNStartIdx = kvHeadIdx * groupSize + qNBlockIdxInGroup * curQNBlockTile;
-            const uint32_t qNBlockSize =
-                AscendC::Std::min(curQNBlockTile, groupSize - qNBlockIdxInGroup * curQNBlockTile);
+            const uint32_t qSTileIdx = task.qTileIndex;
+            const uint32_t qNStartIdx = task.firstHead + headOffset;
+            const uint32_t kvHeadIdx = qNStartIdx / groupSize;
+            // A segment owns one K/V head. Q heads sharing that K/V stay together.
+            // Issue segments into the same QK/softmax/PV pipeline, with independent
+            // statistics and output addresses for each segment.
+            const uint32_t qNBlockSize = AscendC::Std::min(task.heads, groupSize);
+            const bool lastSegment = headOffset + qNBlockSize == task.heads;
             int64_t gmOffsetQ = 0;
             int64_t gmOffsetK = 0;
             int64_t gmOffsetV = 0;
@@ -634,7 +623,7 @@ class FAIKernel950 {
 #endif
             const uint32_t taskStatsSlot = taskSeq % fa950_stats::STATS_TASK_STAGES;
             // Only the last task flushes the delayed PV queue
-            const bool lastTaskOnCore = (taskIdx + taskStep >= taskEnd);
+            const bool lastTaskOnCore = lastSegment && taskIdx + taskStep >= taskEnd;
             const bool flushPvQueue = lastTaskOnCore || emptySpan;
             const uint32_t kvLoopEnd = kvSLoopCount + (flushPvQueue ? PV_DESC_SLOTS : 0U);
             for (uint32_t kvSTileRelIdx = 0; kvSTileRelIdx < kvLoopEnd; ++kvSTileRelIdx) {
@@ -835,6 +824,12 @@ class FAIKernel950 {
             // Only tasks that issued softmax work consume a statistics slot.
             if (kvSLoopCount != 0U) {
                 ++taskSeq;
+            }
+            if (lastSegment) {
+                headOffset = 0U;
+                taskIdx += taskStep;
+            } else {
+                headOffset += qNBlockSize;
             }
         }
         ReleaseSyncFlags<4, 4, 4>();
