@@ -738,8 +738,11 @@ class FAIKernel950 {
                 blockMmadQK.loadQGM(gmQTensorTlaDN, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride);
             } else {
                 blockMmadQK.qBank = 0U;
-                blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride);
-                if (paired) {
+                const bool loadPair = PairedHeads && !PairedKv && MixedKv && qFormat == Format::TND &&
+                    kvcacheType == CacheMode::pagedCache && maskCategory == MaskCategory::MASK_SWA &&
+                    qNBlockSize == 1U && qSBlockSize == 128U && qHeadStride == embed_ && strideQ <= 65535U;
+                blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride, loadPair);
+                if (paired && !loadPair) {
                     auto nextQ = tla::MakeTensor(gQ[gmOffsetQ + qNBlockSize * qHeadStride], gmQLayoutTla, Arch::PositionGM{});
                     blockMmadQK.qBank = 1U;
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);

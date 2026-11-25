@@ -204,21 +204,25 @@ struct BlockMmadTla<MmadFlashAttentionQK<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
     // pitch of the Nd2Nz source matrix (rows are Q heads).
     template <class TensorA>
     __aicore__ inline void loadQGM(TensorA& gATensor, GemmCoord actualOriShape, uint32_t qSBlockSize,
-                                   uint32_t qNBlockSize, int64_t qHeadStride)
+                                   uint32_t qNBlockSize, int64_t qHeadStride, bool loadPair = false)
     {
         using CopyGmToL1A = typename TileCopy_::template CopyGmToL1A<TensorA>;
         CopyGmToL1A copyGmToL1A;
         uint32_t embed = actualOriShape[1];
         uint32_t embedPhysical = RoundUp(embed, C0_ELEMS);
         uint32_t rowNum = actualOriShape[0];
-        auto l1ALayoutTla = MakeCustomLayout(rowNum, embedPhysical, qSBlockSize);
+        // Adjacent TND heads are contiguous in GM. For a full paired tile, the second
+        // ND row lands at the next L1 bank; both banks keep their original NZ layout.
+        const uint32_t headsToCopy = loadPair ? 2U : qNBlockSize;
+        const uint32_t dstHeadStride = loadPair ? l1ATileM * l1ATileK / C0_ELEMS : qSBlockSize;
+        auto l1ALayoutTla = MakeCustomLayout(rowNum, embedPhysical, dstHeadStride);
         auto l1ATensorTla = tla::MakeTensor(l1ATensor[qBank], l1ALayoutTla, Arch::PositionL1{});
 
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
-        auto gmQLayoutTla = tla::MakeLayout(tla::MakeShape(qNBlockSize, embed),
+        auto gmQLayoutTla = tla::MakeLayout(tla::MakeShape(headsToCopy, embed),
                                             tla::MakeStride(static_cast<uint32_t>(qHeadStride), tla::Int<1>{}));
         auto gmQTensorTla = tla::MakeTensor(gATensor.data(), gmQLayoutTla, Arch::PositionGM{});
-        auto l1QTile = GetTile(l1ATensorTla, tla::MakeCoord(0, 0), tla::MakeShape(qNBlockSize, embed));
+        auto l1QTile = GetTile(l1ATensorTla, tla::MakeCoord(0, 0), tla::MakeShape(headsToCopy, embed));
         copyGmToL1A(l1QTile, gmQTensorTla, qSBlockSize, tla::get<0>(gATensor.stride()), C0_ELEMS);
 
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
