@@ -1,0 +1,385 @@
+# Copyright (c) 2026, Minghua Shen.
+
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional
+
+# Generates the v2 NPU dispatch translation units (one explicit instantiation
+# per .cpp so the kernel templates compile in parallel). head_dim is NOT a
+# template axis:
+# the forward (FAInfer) does not bin by head_dim at all, and the backward
+# (FAGGeneral) selects head_dim at runtime via a switch() inside the impl
+# (fag_general_dispatch_impl.hpp). So head_dim is deliberately dropped here.
+#
+# The real compile-time axes are dtype and input layout (the forward supports
+# BSND / TND / BNSD; the backward stays at BSND / TND). Each
+# generated .cpp holds exactly ONE explicit instantiation of the per-family
+# launch wrapper, so the heavy kernel templates land in separate, parallel-
+# compiled translation units. The impl bodies live in the shared *_impl.hpp
+# headers (one directory up); this script only emits the instantiation stubs.
+#
+# Combo TUs (compile-time split of the runtime switch tree):
+#   fwd: paged(2) x mask(3) x softcap(2) x return_softmax(2) x dropout(2) = 48
+#        FAInfer instantiations per (dtype, layout). Split by the
+#        (softcap, return_softmax, dropout) triple into 8 combo TUs of 6
+#        instantiations each (paged x mask stays a runtime switch inside).
+#   fag: softcap(2) x causal(2) x deterministic(2) x dropout(2) x headdim(4)
+#        = 64 FAGGeneral instantiations per (dtype, layout). Split by the
+#        (headdim, softcap) pair into 8 variant TUs of 8 instantiations each
+#        (causal x deterministic x dropout stays a runtime switch inside).
+# Each generated TU is named fwd_combo_/fag_<dtype>_<layout>_<axis values>
+# and defines ONE plain launcher
+# function; the light *_impl.hpp dispatchers select between them via the
+# generated fwd_combo_decls.hpp and fag_decls.hpp headers.
+
+# dtype key -> (C++ type token, filename suffix)
+DTYPE_MAP = {
+    "fp16": ("half", "fp16"),
+    "bf16": ("bfloat16_t", "bf16"),
+}
+
+# layout key -> display name. The forward supports three input layouts
+# (BSND / TND / BNSD); the backward (FAG) stays at two because BNSD is
+# forward-only, so the two generation axes are kept separate.
+FWD_LAYOUTS = [
+    ("bsnd", "BSND"),
+    ("tnd", "TND"),
+    ("bnsd", "BNSD"),
+]
+
+# layout key -> (layout key, display name, fag layout enum token from fag_layout.hpp)
+FAG_LAYOUTS = [
+    ("bsnd", "BSND", "BSND"),
+    ("tnd", "TND", "TND"),
+]
+
+# headdim values of the FAGGeneral runtime switch (v2 fag variant axis)
+FAG_HEADDIMS = [64, 128, 192, 256]
+
+BOOL_TOKEN = {0: "false", 1: "true"}
+
+PRELUDE = (
+    "// Copyright (c) 2026, Minghua Shen.\n"
+)
+
+
+def _feature_suffix(*features: tuple) -> str:
+    """Return suffixes only for enabled boolean generation axes."""
+    return "".join(f"_{name}" for enabled, name in features if enabled)
+
+
+def _header(family_desc: str, dtype_key: str, layout_display: Optional[str]) -> str:
+    layout_note = f", {layout_display} variant" if layout_display else " variant (always TND)"
+    return (
+        PRELUDE + f"// v2 {family_desc}{layout_note}. One explicit instantiation per\n"
+        "// translation unit so the kernel templates compile in parallel across\n"
+        "// cores; head_dim is a runtime axis (switch inside the impl), not a\n"
+        "// template parameter, so it is not a generation axis.\n\n"
+    )
+
+
+def fwd_kernel(dtype_key: str, layout: tuple) -> "Kernel":
+    ctype, _ = DTYPE_MAP[dtype_key]
+    layout_key, display = layout
+    body = (
+        _header("forward FAInfer dispatch", dtype_key, display)
+        + '#include "../fwd_dispatch_impl.hpp"\n\n'
+        + f"template void launch_fwd_impl<{ctype}, "
+        + f"KernelCommon::FaiKenel::inputLayout::{display}>(const FwdLaunchArgs &);"
+        f"  // {display}\n"
+    )
+    return Kernel(
+        family="fwd",
+        dtype=dtype_key,
+        layout=layout_key,
+        filename=f"fwd_dispatch_{dtype_key}_{layout_key}.cpp",
+        content=body,
+    )
+
+
+def fwd_combo(
+    dtype_key: str, layout: tuple, softcap: int, return_softmax: int, dropout: int
+) -> "Kernel":
+    ctype, _ = DTYPE_MAP[dtype_key]
+    layout_key, display = layout
+    layout_token = f"FaiKenel::inputLayout::{display}"
+    sc, rs, do = BOOL_TOKEN[softcap], BOOL_TOKEN[return_softmax], BOOL_TOKEN[dropout]
+    suffix = _feature_suffix(
+        (softcap, "softcap"),
+        (return_softmax, "retsoftmax"),
+        (dropout, "dropout"),
+    )
+    symbol = f"fwd_combo_{dtype_key}_{layout_key}{suffix}"
+    body = (
+        PRELUDE + f"// v2 forward FAInfer combo, {display} variant, softcap={sc} "
+        f"return_softmax={rs} dropout={do}.\n"
+        + "// Fixes the (softcap, return_softmax, dropout) triple at compile time and\n"
+        + "// switches over paged x mask (6 FAInfer instantiations) so the 48 variants\n"
+        + "// of one (dtype, layout) family compile in 8 parallel TUs. Generated by\n"
+        + "// autogen/generate_kernels.py - do not edit by hand.\n\n"
+        + '#include "../fwd_kernel_launch.hpp"\n\n'
+        + f"void {symbol}"
+        + "(const FwdLaunchArgs &a) {\n"
+        + "    FWD_BOOL_SWITCH(a.paged_KV, IsPaged, {\n"
+        + "        FWD_MASK_SWITCH(a.is_local, a.is_causal, MaskType, {\n"
+        + f"            FWD_KERNEL_LAUNCH({ctype}, IsPaged, MaskType, {layout_token}, {sc}, {rs}, {do});\n"
+        + "        });\n"
+        + "    });\n"
+        + "}\n"
+    )
+    return Kernel(
+        family="fwd_combo",
+        dtype=dtype_key,
+        layout=layout_key,
+        filename=f"{symbol}.cpp",
+        content=body,
+    )
+
+
+def fag_kernel(dtype_key: str, layout: tuple) -> "Kernel":
+    _, suffix = DTYPE_MAP[dtype_key]
+    layout_key, display, enum = layout
+    body = (
+        _header("FAGGeneral backward dispatch", dtype_key, display)
+        + '#include "../fag_general_dispatch_impl.hpp"\n\n'
+        + f"template void launch_fag_general_dispatch_{suffix}<{enum}>"
+        f"(const FagGeneralLaunchArgs &);  // {display} (constant from fag_layout.hpp)\n"
+    )
+    return Kernel(
+        family="fag_general_bwd",
+        dtype=dtype_key,
+        layout=layout_key,
+        filename=f"fag_general_dispatch_{dtype_key}_{layout_key}.cpp",
+        content=body,
+    )
+
+
+def fag_kernel_variant(dtype_key: str, layout: tuple, headdim: int, softcap: int) -> "Kernel":
+    ctype, _ = DTYPE_MAP[dtype_key]
+    layout_key, display, enum = layout
+    sc = BOOL_TOKEN[softcap]
+    suffix = _feature_suffix((softcap, "softcap"))
+    symbol = f"fag_{dtype_key}_{layout_key}_headdim{headdim}{suffix}"
+    body = (
+        PRELUDE
+        + f"// v2 FAGGeneral backward variant, {display}, headdim={headdim} softcap={sc}.\n"
+        + "// Fixes the (headdim, softcap) pair at compile time and switches over\n"
+        + "// causal x deterministic x dropout (8 FAGGeneral instantiations) so the 64\n"
+        + "// variants of one (dtype, layout) family compile in 8 parallel TUs.\n"
+        + "// Generated by autogen/generate_kernels.py - do not edit by hand.\n\n"
+        + '#include "../fag_kernel_launch.hpp"\n\n'
+        + f"void {symbol}"
+        + "(const FagGeneralLaunchArgs &a) {\n"
+        + "    auto fag_call = [=]() -> int {\n"
+        + "        FAG_BOOL_SWITCH(a.is_causal, IsAttenMask, {\n"
+        + "            FAG_BOOL_SWITCH(a.deterministic, IsDtm, {\n"
+        + "                FAG_BOOL_SWITCH(a.has_dropout, IsDrop, {\n"
+        + f"                    FAG_KERNEL_LAUNCH({ctype}, {enum}, Aligned{headdim}, "
+        + "IsAttenMask, IsDrop, IsDtm, "
+        + f"{sc});\n"
+        + "                });\n"
+        + "            });\n"
+        + "        });\n"
+        + "        return 0;\n"
+        + "    };\n"
+        + '    at_npu::native::OpCommand::RunOpApiV2("ascendc_fag", fag_call);\n'
+        + "}\n"
+    )
+    return Kernel(
+        family="fag",
+        dtype=dtype_key,
+        layout=layout_key,
+        filename=f"{symbol}.cpp",
+        content=body,
+    )
+
+
+def varlen_bwd_kernel(dtype_key: str) -> "Kernel":
+    ctype, _ = DTYPE_MAP[dtype_key]
+    body = (
+        _header("varlen backward FAGVarlenOpt dispatch", dtype_key, None)
+        + '#include "../varlen_bwd_dispatch_impl.hpp"\n\n'
+        + f"template void launch_varlen_bwd_impl<{ctype}>(const VarlenBwdLaunchArgs &);\n"
+    )
+    return Kernel(
+        family="varlen_bwd",
+        dtype=dtype_key,
+        layout=None,
+        filename=f"varlen_bwd_dispatch_{dtype_key}.cpp",
+        content=body,
+    )
+
+
+def fwd_combo_decls() -> str:
+    decls = []
+    for dtype_key in DTYPE_MAP:
+        for layout in FWD_LAYOUTS:
+            for softcap in (0, 1):
+                for return_softmax in (0, 1):
+                    for dropout in (0, 1):
+                        suffix = _feature_suffix(
+                            (softcap, "softcap"),
+                            (return_softmax, "retsoftmax"),
+                            (dropout, "dropout"),
+                        )
+                        decls.append(
+                            f"void fwd_combo_{dtype_key}_{layout[0]}"
+                            f"{suffix}"
+                            "(const FwdLaunchArgs &a);"
+                        )
+    dispatch_macro = (
+        "#define FWD_SELECT_COMBO_8(dt, ly)                                                                          \\\n"
+        "    do {                                                                                                      \\\n"
+        "        if (!a.has_softcap && !a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly(a); return; }                 \\\n"
+        "        if (!a.has_softcap && !a.return_softmax &&  a.has_dropout) { fwd_combo_##dt##_##ly##_dropout(a); return; }      \\\n"
+        "        if (!a.has_softcap &&  a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_retsoftmax(a); return; }   \\\n"
+        "        if (!a.has_softcap &&  a.return_softmax &&  a.has_dropout) { fwd_combo_##dt##_##ly##_retsoftmax_dropout(a); return; } \\\n"
+        "        if ( a.has_softcap && !a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_softcap(a); return; }      \\\n"
+        "        if ( a.has_softcap && !a.return_softmax &&  a.has_dropout) { fwd_combo_##dt##_##ly##_softcap_dropout(a); return; } \\\n"
+        "        if ( a.has_softcap &&  a.return_softmax && !a.has_dropout) { fwd_combo_##dt##_##ly##_softcap_retsoftmax(a); return; } \\\n"
+        "        fwd_combo_##dt##_##ly##_softcap_retsoftmax_dropout(a);                                                 \\\n"
+        "    } while (0)\n"
+    )
+    return (
+        PRELUDE
+        + "#pragma once\n\n"
+        + "// Generated by autogen/generate_kernels.py - do not edit by hand.\n"
+        + "//\n"
+        + "// Declarations of the 48 v2 forward combo launchers (dtype x layout x\n"
+        + "// softcap x return_softmax x dropout; each combo TU instantiates the 6\n"
+        + "// paged x mask FAInfer variants) plus the dispatcher macro used by\n"
+        + "// fwd_dispatch_impl.hpp. The macro `return`s out of the enclosing void\n"
+        + "// dispatcher, so exactly one combo runs per dispatch.\n\n"
+        + '#include "../fwd_dispatch.hpp"\n\n'
+        + "\n".join(decls)
+        + "\n\n"
+        + dispatch_macro
+    )
+
+
+def fag_decls() -> str:
+    decls = []
+    for dtype_key in DTYPE_MAP:
+        for layout in FAG_LAYOUTS:
+            for headdim in FAG_HEADDIMS:
+                for softcap in (0, 1):
+                    decls.append(
+                        f"void fag_{dtype_key}_{layout[0]}"
+                        f"_headdim{headdim}{'_softcap' if softcap else ''}"
+                        "(const FagGeneralLaunchArgs &a);"
+                    )
+    dispatch_macro = (
+        "#define FAG_SELECT_VARIANT_16(dt, ly)                                  \\\n"
+        "    do {                                                              \\\n"
+        "        if (a.is_softcap) {                                           \\\n"
+        "            switch (a.qk_headdim_kernel) {                            \\\n"
+        "                case 64:  fag_##dt##_##ly##_headdim64_softcap(a);  return; \\\n"
+        "                case 128: fag_##dt##_##ly##_headdim128_softcap(a); return; \\\n"
+        "                case 192: fag_##dt##_##ly##_headdim192_softcap(a); return; \\\n"
+        "                case 256: fag_##dt##_##ly##_headdim256_softcap(a); return; \\\n"
+        "                default: break;                                       \\\n"
+        "            }                                                     \\\n"
+        "        }                                                         \\\n"
+        "        switch (a.qk_headdim_kernel) {                            \\\n"
+        "            case 64:  fag_##dt##_##ly##_headdim64(a);  return; \\\n"
+        "            case 128: fag_##dt##_##ly##_headdim128(a); return; \\\n"
+        "            case 192: fag_##dt##_##ly##_headdim192(a); return; \\\n"
+        "            case 256: fag_##dt##_##ly##_headdim256(a); return; \\\n"
+        "            default: break;                                       \\\n"
+        "        }                                                         \\\n"
+        "    } while (0)\n"
+    )
+    return (
+        PRELUDE
+        + "#pragma once\n\n"
+        + "// Generated by autogen/generate_kernels.py - do not edit by hand.\n"
+        + "//\n"
+        + "// Declarations of the 32 v2 FAGGeneral variant launchers (dtype x layout x\n"
+        + "// headdim x softcap; each variant TU instantiates the 8 causal x\n"
+        + "// deterministic x dropout FAGGeneral variants) plus the dispatcher macro\n"
+        + "// used by fag_general_dispatch_impl.hpp. The macro `return`s out of the\n"
+        + "// enclosing void dispatcher, so exactly one variant runs per dispatch.\n\n"
+        + '#include "../fag_general_dispatch.hpp"\n\n'
+        + "\n".join(decls)
+        + "\n\n"
+        + dispatch_macro
+    )
+
+
+@dataclass
+class Kernel:
+    family: str
+    dtype: str
+    layout: Optional[str]
+    filename: str
+    content: str
+
+
+def get_all_kernels() -> List[Kernel]:
+    kernels: List[Kernel] = []
+    for dtype in DTYPE_MAP:
+        for layout in FWD_LAYOUTS:
+            kernels.append(fwd_kernel(dtype, layout))
+            for softcap in (0, 1):
+                for return_softmax in (0, 1):
+                    for dropout in (0, 1):
+                        kernels.append(fwd_combo(dtype, layout, softcap, return_softmax, dropout))
+        for layout in FAG_LAYOUTS:
+            kernels.append(fag_kernel(dtype, layout))
+            for headdim in FAG_HEADDIMS:
+                for softcap in (0, 1):
+                    kernels.append(fag_kernel_variant(dtype, layout, headdim, softcap))
+        kernels.append(varlen_bwd_kernel(dtype))
+    return kernels
+
+
+# Files owned by this script's combo generation; removed before writing so a
+# granularity change never leaves stale combo TUs behind.
+STALE_PATTERNS = (
+    "fwd_combo_*.cpp",
+    "fag_combo_*.cpp",
+    "fag_*.cpp",
+    "fwd_combo_decls.hpp",
+    "fag_combo_decls.hpp",
+    "fag_decls.hpp",
+    # legacy pre-rename names, cleaned once so old TUs never linger
+    "fwd_one_*.cpp",
+    "fag_one_*.cpp",
+)
+
+
+def write_kernel(kernel: Kernel, output_dir: Path) -> None:
+    (output_dir / kernel.filename).write_text(kernel.content)
+
+
+def main(output_dir: Optional[str]) -> None:
+    output_dir = Path(output_dir) if output_dir is not None else Path(__file__).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for pattern in STALE_PATTERNS:
+        for stale in output_dir.glob(pattern):
+            stale.unlink()
+    kernels = get_all_kernels()
+    for kernel in kernels:
+        write_kernel(kernel, output_dir)
+    (output_dir / "fwd_combo_decls.hpp").write_text(fwd_combo_decls())
+    (output_dir / "fag_decls.hpp").write_text(fag_decls())
+    print(f"Generated {len(kernels)} dispatch/variant TUs + 2 declaration headers in {output_dir}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        prog="generate_kernels",
+        description="Generate the v2 flash_attn_npu dispatch template instantiations "
+        "(per dtype x layout stubs + per-combo launch TUs; head_dim is a runtime axis "
+        "and is not a generation axis).",
+    )
+    parser.add_argument(
+        "-o",
+        "--output_dir",
+        required=False,
+        help="Where to generate the dispatch .cpp stubs; "
+        "defaults to this script's directory (csrc/flash_attn_npu/autogen).",
+    )
+    args = parser.parse_args()
+    main(args.output_dir)

@@ -1,0 +1,941 @@
+# Copyright (c) 2023, Tri Dao.
+# Modified by Minghua Shen, 2026.
+
+import os
+import glob
+import importlib.util
+import re
+import sys
+import sysconfig
+from packaging.version import parse
+import platform
+
+from setuptools import setup, find_packages, Extension
+from setuptools.command.build_ext import build_ext
+import subprocess
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import urllib.request
+import urllib.error
+from setuptools.command.bdist_wheel import bdist_wheel as _bdist_wheel
+
+with open("README.md", "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+
+
+this_dir = os.path.dirname(os.path.realpath(__file__))
+
+PACKAGE_NAME = "flash_attn_npu"
+
+# FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
+# SKIP_NPU_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any NPU compilation
+FORCE_BUILD = (
+    os.getenv("FLASH_ATTN_FORCE_BUILD", os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE")).upper()
+    == "TRUE"
+)
+SKIP_NPU_BUILD = (
+    os.getenv(
+        "FLASH_ATTN_SKIP_NPU_BUILD", os.getenv("FLASH_ATTENTION_SKIP_NPU_BUILD", "FALSE")
+    ).upper()
+    == "TRUE"
+)
+EXTENSION_COMMANDS = {"build", "build_ext", "bdist_wheel", "install", "develop"}
+BUILD_EXTENSIONS = not SKIP_NPU_BUILD and bool(EXTENSION_COMMANDS.intersection(sys.argv[1:]))
+
+torch = None
+torch_npu = None
+if BUILD_EXTENSIONS:
+    import torch
+    import torch_npu
+# FLASH_ATTN_BUILD_VERSION selects which API generations to build:
+#   "v2"   build flash_attn_npu.flash_attn_npu     (910B/C only)
+#   "v3"   build the v3 backends selected by FLASH_ATTN_BUILD_NPU:
+#            flash_attn_npu_3.flash_attn_npu_3    (Ascend 910B/C, csrc/ascend910)
+#            flash_attn_npu_3_950                 (Ascend 950,    csrc/ascend950)
+#   "v4"   build the v4 backends selected by FLASH_ATTN_BUILD_NPU:
+#            flash_attn_npu_4.flash_attn_npu_4      (Ascend 910B/C, csrc/ascend910)
+#            flash_attn_npu_4_950                   (Ascend 950,    csrc/ascend950)
+#          Runtime dispatch in flash_attn_npu_4/__init__.py picks the
+#          matching backend per host via torch_npu.npu.get_device_name(),
+#          so a single wheel runs on both 910 and 950.
+#   "all"  build v2 + v3 + the v4 backends selected by FLASH_ATTN_BUILD_NPU.
+# FLASH_ATTN_BUILD_NPU selects which NPU hardware backends to build:
+#   "auto" detect the local device using torch_npu (default); build all backends if unavailable
+#   "910"  only Ascend 910B/C backends (flash_attn_npu.flash_attn_npu,
+#          flash_attn_npu_3.flash_attn_npu_3, flash_attn_npu_4.flash_attn_npu_4)
+#   "950"  only the Ascend 950 backends (flash_attn_npu_3_950,
+#          flash_attn_npu_4_950)
+#   "all"  build every backend whose API generation is selected above.
+#          Runtime dispatch in flash_attn_npu_3/__init__.py and
+#          flash_attn_npu_4/__init__.py picks the matching backend per host
+#          via torch_npu.npu.get_device_name(), so an "all" wheel runs on
+#          both 910 and 950.
+BUILD_VERSION = os.getenv("FLASH_ATTN_BUILD_VERSION", "all").lower()
+
+BUILD_VERSION_ALIASES = {
+    "fa2": "v2",
+    "fa3": "v3",
+    "fa4": "v4",
+}
+
+BUILD_VERSION = BUILD_VERSION_ALIASES.get(BUILD_VERSION, BUILD_VERSION)
+
+if BUILD_VERSION not in ("v2", "v3", "v4", "all"):
+    raise RuntimeError(
+        f"Invalid FLASH_ATTN_BUILD_VERSION={BUILD_VERSION!r}; choose fa2, fa3, fa4, or all."
+    )
+
+
+def get_build_npu():
+    target = os.getenv("FLASH_ATTN_BUILD_NPU", "auto").lower()
+    if target in ("910", "950", "all"):
+        return target
+    if target != "auto":
+        raise RuntimeError(
+            f"Invalid FLASH_ATTN_BUILD_NPU={target!r}; choose auto, 910, 950, or all."
+        )
+    if not BUILD_EXTENSIONS:
+        return "auto"
+    try:
+        device_name = torch_npu.npu.get_device_name()
+    except Exception as error:
+        print(
+            f"Warning: cannot detect the NPU for this build ({error}). "
+            "Falling back to all backends (equivalent to FLASH_ATTN_BUILD_NPU=all), "
+            "which builds both 910 and 950 backends. Set FLASH_ATTN_BUILD_NPU=910 "
+            "or 950 to build only the backend you need.",
+            file=sys.stderr,
+        )
+        return "all"
+    if "Ascend950" in device_name:
+        return "950"
+    if "Ascend910" in device_name:
+        return "910"
+    raise RuntimeError(
+        f"Unsupported NPU device {device_name!r}; set FLASH_ATTN_BUILD_NPU "
+        "to 910, 950, or all explicitly."
+    )
+
+
+BUILD_NPU = get_build_npu()
+# FLASH_ATTN_ENABLE_MSSANITIZER: 使能 Ascend msSanitizer 内存异常检测。
+# 开启后：
+#  - 910 (dav-2201)：编译追加 "-g --cce-enable-sanitizer"，链接追加 "--cce-enable-sanitizer"（静态插桩）；
+#  - 950 (dav-3510)：CANN 9.1.0 未提供 sanitizer stub（libsanitizer_stub_dav-c310），无法静态插桩，
+#                    追加 "-g -fno-jump-tables"，内存检测需配合 mssanitizer 运行时注入：
+#                    mssanitizer --tool=memcheck -- python -m pytest ...
+# 910 / 950 均须通过 mssanitizer --tool=memcheck -- python -m pytest ... 启动。
+# 静态插桩也依赖检测运行时初始化，不能直接运行插桩后的二进制。
+# FLASH_ATTN_MSSANITIZER_MODE=auto（默认：910 static / 950 runtime）、static、runtime。
+# 910 图捕获须使用 runtime 或普通构建；静态插桩会触发 AssignGlobalHead 107030。
+# runtime 仅准备运行时插桩产物，是否覆盖图内 kernel 仍须检查工具日志和越界对照。
+# "-g" 用于异常报告输出文件名/行号/调用栈；静态插桩可检测越界访问、多核踩踏、非对齐访问等。
+# 仅用于调试定位，会显著增大二进制并降低性能。建议通过 bdist_wheel 独立产出检测版，
+# 避免覆盖正常版本（editable 安装下正常 .so 位于 flash_attn_npu/ 目录内）。
+ENABLE_MSSANITIZER = os.getenv("FLASH_ATTN_ENABLE_MSSANITIZER", "FALSE") == "TRUE"
+
+
+def load_wheel_metadata_module():
+    module_path = os.path.join(this_dir, "flash_attn_npu", "_wheel_metadata.py")
+    spec = importlib.util.spec_from_file_location("_flash_attn_npu_wheel_metadata", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load wheel metadata module: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+wheel_metadata = load_wheel_metadata_module()
+# Static instrumentation is for eager checking. Graph execution needs a build
+# without static stubs; runtime mode retains symbols for optional tool checking.
+MSSANITIZER_MODE = os.getenv("FLASH_ATTN_MSSANITIZER_MODE", "auto").lower()
+if MSSANITIZER_MODE not in ("auto", "static", "runtime"):
+    raise RuntimeError(
+        f"Invalid FLASH_ATTN_MSSANITIZER_MODE={MSSANITIZER_MODE!r}; "
+        "choose auto, static, or runtime."
+    )
+
+
+def get_platform():
+    """
+    Returns the platform name as used in wheel filenames.
+    """
+    if sys.platform.startswith("linux"):
+        return f"linux_{platform.uname().machine}"
+    else:
+        raise ValueError("Unsupported platform: {}".format(sys.platform))
+
+
+def get_cann_arch_dir():
+    return f"{platform.machine()}-linux"  # aarch64-linux | x86_64-linux
+
+
+def _get_hcc_cpp_include(hcc):
+    """Find libstdc++ headers matching CANN's AICPU cross-compiler."""
+    compiler = os.path.join(hcc, "bin", "aarch64-target-linux-gnu-g++")
+    try:
+        version = subprocess.check_output(
+            [compiler, "-dumpfullversion", "-dumpversion"],
+            text=True,
+            stderr=subprocess.PIPE,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError(
+            f"Cannot query the HCC GCC version using {compiler}. "
+            "Check ASCEND_TOOLKIT_HOME / ASCEND_HOME_PATH and the CANN HCC installation."
+        ) from error
+    if not re.fullmatch(r"\d+(?:\.\d+)*", version):
+        raise RuntimeError(f"Unexpected HCC GCC version from {compiler}: {version!r}")
+
+    cpp_root = os.path.join(hcc, "aarch64-target-linux-gnu", "include", "c++")
+    # Some toolchains name the include directory with only the major version.
+    # Prefer the full version, and never select a different installed GCC version.
+    parts = version.split(".")
+    while parts:
+        include = os.path.join(cpp_root, ".".join(parts))
+        if os.path.isfile(os.path.join(include, "cstddef")) and os.path.isfile(
+            os.path.join(include, "aarch64-target-linux-gnu", "bits", "c++config.h")
+        ):
+            return include
+        parts.pop()
+    raise RuntimeError(
+        f"Cannot find HCC C++ headers for GCC {version} under {cpp_root}. "
+        "Check ASCEND_TOOLKIT_HOME / ASCEND_HOME_PATH and the CANN HCC installation."
+    )
+
+
+def _cmdhash(compile_common):
+    """Stable hash of the per-extension compile flags (arch / -O / ABI / includes).
+    A change here means a stored .o was produced with different flags and must be
+    rebuilt, even if no source/header mtime moved."""
+    return hashlib.md5("\0".join(compile_common).encode("utf-8")).hexdigest()
+
+
+def _obj_is_fresh(obj, src, depfile, cmdhash_file, compile_common):
+    """True iff `obj` may be reused instead of recompiled. Conservative: any
+    doubt -> False (recompile). Over-recompiling is safe; reusing a stale .o is
+    not. Three staleness signals:
+      1. source mtime > obj mtime  (.cpp edited)
+      2. any depfile-listed header newer than obj  (-MMD tracks user headers,
+         incl. .cpp files included as headers such as fag_kernel.cpp; NOT
+         system/CANN headers)
+      3. the recorded compile-flag hash differs from the current one, or is
+         missing (first time tracking this obj) -> rebuild to establish it."""
+    if not os.path.exists(obj):
+        return False
+    obj_mtime = os.path.getmtime(obj)
+    if os.path.getmtime(src) > obj_mtime:
+        return False
+    if os.path.exists(depfile):
+        try:
+            with open(depfile, "r", errors="replace") as f:
+                content = f.read().replace("\\\n", " ")
+            deps = content.split(":", 1)[1] if ":" in content else ""
+            for tok in deps.split():
+                if tok.endswith(":"):
+                    break  # secondary target (-MP not used; defensive)
+                if tok and os.path.exists(tok) and os.path.getmtime(tok) > obj_mtime:
+                    return False
+        except Exception:
+            return False  # parse error -> be safe, recompile
+    try:
+        with open(cmdhash_file, "r") as f:
+            prev = f.read().strip()
+    except OSError:
+        return False  # first time tracking this obj -> recompile to record hash
+    return prev == _cmdhash(compile_common)
+
+
+def _inputs_signature(paths):
+    """Return a stable signature for source/header inputs used by a link step."""
+    digest = hashlib.md5()
+    for path in sorted(os.path.abspath(p) for p in paths if os.path.exists(p)):
+        stat = os.stat(path)
+        digest.update(path.encode("utf-8"))
+        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+        digest.update(str(stat.st_size).encode("ascii"))
+    return digest.hexdigest()
+
+
+class BishengBuildExt(build_ext):
+    _toolchains = None
+
+    def _get_toolchain(self, ext):
+        ext_name = ext.name
+        if self._toolchains is None:
+            self._toolchains = {}
+        if ext_name in self._toolchains:
+            return self._toolchains[ext_name]
+
+        ascend_home = os.getenv(
+            "ASCEND_TOOLKIT_HOME", os.getenv("ASCEND_HOME_PATH", "/usr/local/Ascend")
+        )
+        if not os.path.exists(ascend_home):
+            raise RuntimeError(f"ASCEND_TOOLKIT_HOME={ascend_home}")
+
+        # Determine the target arch (3510 vs 2201) and the versioned ascend950
+        # include dir from the extension's first source path. v3 modules are
+        # named flash_attn_npu_3_950 (sources under csrc/ascend950/flash_attn_npu_3),
+        # v4 modules are named flash_attn_npu_4_950 (sources under
+        # csrc/ascend950/flash_attn_npu_4); deriving both pieces from the source
+        # path keeps the v3/v4 divergence working without hardcoding.
+        first_src = ext.sources[0] if ext.sources else ""
+        src_norm = first_src.replace("\\", "/")
+        is_ascend950 = "ascend950" in src_norm
+        npu_arch = "dav-3510" if is_ascend950 else "dav-2201"
+
+        extra_includes = []
+        extra_defines = []
+        if is_ascend950:
+            version_dir = "flash_attn_npu_3"  # fallback
+            for part in src_norm.split("/"):
+                if part in ("flash_attn_npu", "flash_attn_npu_3", "flash_attn_npu_4"):
+                    version_dir = part
+                    break
+            extra_includes.append(f"-I{this_dir}/csrc/ascend950/{version_dir}")
+            extra_defines.append("-DCATLASS_ARCH=3510")
+        else:
+            extra_defines.append("-DCATLASS_ARCH=2201")
+
+        asc_include_paths = [
+            os.path.join(ascend_home, "compiler/tikcpp/include"),
+            os.path.join(ascend_home, get_cann_arch_dir(), "tikcpp/include"),
+        ]
+
+        asc_lib_paths = [
+            os.path.join(ascend_home, "compiler/lib64"),
+            os.path.join(ascend_home, get_cann_arch_dir(), "lib64"),
+        ]
+
+        python_include = sysconfig.get_path("include")
+
+        torch_cmake_path = torch.utils.cmake_prefix_path
+        torch_package_path = os.path.dirname(torch.__file__)
+        torch_include = os.path.join(torch_cmake_path, "Torch/include")
+        torch_lib = os.path.join(torch_cmake_path, "Torch/lib")
+
+        torch_npu_path = os.path.dirname(torch_npu.__file__)
+        torch_npu_include = os.path.join(torch_npu_path, "include")
+        torch_npu_lib = os.path.join(torch_npu_path, "lib")
+
+        forced_abi = os.getenv("FLASH_ATTN_FORCE_CXX11_ABI")
+        torch_abi = (
+            forced_abi.upper() == "TRUE"
+            if forced_abi and forced_abi.upper() in {"TRUE", "FALSE"}
+            else torch._C._GLIBCXX_USE_CXX11_ABI
+        )
+        abi_flag = f"-D_GLIBCXX_USE_CXX11_ABI={1 if torch_abi else 0}"
+
+        compile_arch_flags = [
+            "-x",
+            "asc",
+            f"--npu-arch={npu_arch}",
+            *(
+                ["--cce-auto-infer-kernel-type=false"]
+                if parse(torch_npu.utils.get_cann_version()) >= parse("9.0.0")
+                else []
+            ),
+            *extra_defines,
+        ]
+        # At link time only the target arch is needed (for device-code linking).
+        link_arch_flags = [f"--npu-arch={npu_arch}"]
+        # msSanitizer 静态插桩仅支持 910 (dav-c220)：CANN 9.1.0 未提供 950 的 sanitizer stub
+        # （libsanitizer_stub_dav-c310 缺失），950 编译时加 "--cce-enable-sanitizer" 会在设备链接阶段
+        # 报 "unable to find library -lsanitizer_stub_dav-c310"。
+        # 950 (dav-3510) 请改用 mssanitizer 运行时注入（编译不加插桩，运行测试命令前加 mssanitizer 前缀）。
+        if ENABLE_MSSANITIZER and MSSANITIZER_MODE == "static" and is_ascend950:
+            raise RuntimeError(
+                "Static msSanitizer instrumentation is unavailable for Ascend950; use runtime."
+            )
+        use_ms_static = ENABLE_MSSANITIZER and not is_ascend950 and MSSANITIZER_MODE != "runtime"
+        if use_ms_static:
+            link_arch_flags = ["--cce-enable-sanitizer", *link_arch_flags]
+
+        include_flags = [
+            *[f"-I{p}" for p in asc_include_paths],
+            f"-I{python_include}",
+            f"-I{torch_npu_include}",
+            f"-I{torch_include}",
+            f"-I{ascend_home}/include",
+            f"-I{ascend_home}/pkg_inc",
+            f"-I{ascend_home}/pkg_inc/profiling",
+            f"-I{ascend_home}/runtime/include",
+            f"-I{ascend_home}/include/experiment/runtime",
+            f"-I{ascend_home}/include/experiment/msprof",
+            f"-I{torch_package_path}/include",
+            f"-I{torch_package_path}/include/torch/csrc/api/include",
+            f"-I{this_dir}/csrc/catlass/include",
+            *extra_includes,
+        ]
+
+        link_flags = [
+            *[f"-L{p}" for p in asc_lib_paths],
+            f"-L{torch_lib}",
+            f"-L{torch_npu_lib}",
+            f"-L{torch_package_path}/lib",
+            f"-L{ascend_home}/lib64",
+            "-lascendcl",
+            "-ltorch_npu",
+            "-ltiling_api",
+            "-lplatform",
+        ]
+
+        # NOTE: ccache is intentionally NOT supported. bisheng requires `-x asc`
+        # to enter ASC/device-compile mode (without it, kernel_operator.h and the
+        # ASC headers are unresolvable). ccache hard-rejects any `-x <lang>` it
+        # does not recognize, treating `-x asc` as "Unsupported language: asc" and
+        # falling back to running the real compiler with zero caching — so wrapping
+        # bisheng in ccache provides no benefit. If ccache ever adds ASC language
+        # support, reintroduce an opt-in wrapper here.
+        compiler = ["bisheng"]
+
+        compile_common = [
+            *compiler,
+            "-O2",
+            *compile_arch_flags,
+            "-fPIC",
+            "-std=c++17",
+            abi_flag,
+            *include_flags,
+        ]
+        if use_ms_static:
+            # msSanitizer 静态插桩：-g 生成定位信息（异常报告输出文件名/行号/调用栈），
+            # --cce-enable-sanitizer 开启内存异常检测插桩。
+            compile_common += ["-g", "--cce-enable-sanitizer"]
+            print(
+                f"[mssanitizer] {ext_name}: 已启用静态插桩 -g --cce-enable-sanitizer；"
+                f"必须通过检测运行时启动：mssanitizer --tool=memcheck -- python -m pytest ...；"
+                f"图捕获检测请使用 FLASH_ATTN_MSSANITIZER_MODE=runtime 重新构建"
+            )
+        elif ENABLE_MSSANITIZER:
+            # Runtime instrumentation: retain symbols and avoid jump tables.
+            # Do not link static stubs, which cannot initialize during capture.
+            compile_common += ["-g", "-fno-jump-tables"]
+            print(
+                f"[mssanitizer] {ext_name}: 运行时插桩模式，已追加 -g -fno-jump-tables；"
+                f"内存检测请用：mssanitizer --tool=memcheck -- python -m pytest ...；"
+                f"图回放成功不代表图内 kernel 已被检测，请核对检测日志与越界对照"
+            )
+
+        self._toolchains[ext_name] = (compiler, compile_common, link_arch_flags, link_flags)
+        return self._toolchains[ext_name]
+
+    def _force_rebuild(self):
+        return (
+            bool(getattr(self, "force", None))
+            or os.getenv("FLASH_ATTN_FORCE_REBUILD", "FALSE") == "TRUE"
+        )
+
+    def _build_aicpu_metadata(self, ext_fullpath, ext_name):
+        """Compile fa_metadata.aicpu (host AICPU object) for the extensions
+        that carry the scheduler-metadata feature (910 v2/v3/v4 and 950 v3/v4). This
+        is a separate `bisheng -x aicpu` invocation (host CPU code
+        cross-compiled with hcc, not ASC device code); the resulting object is
+        linked into the extension alongside the ASC device objects. Returns the
+        .o path, or None if there is no aicpu source."""
+        ascend_home = os.getenv(
+            "ASCEND_TOOLKIT_HOME", os.getenv("ASCEND_HOME_PATH", "/usr/local/Ascend")
+        )
+        aicpu_src_dirs = {
+            "flash_attn_npu.flash_attn_npu": os.path.join(
+                this_dir, "csrc/ascend910", "flash_attn_npu"
+            ),
+            "flash_attn_npu_3.flash_attn_npu_3": os.path.join(
+                this_dir, "csrc/ascend910", "flash_attn_npu_3"
+            ),
+            "flash_attn_npu_3_950": os.path.join(this_dir, "csrc/ascend950", "flash_attn_npu_3"),
+            "flash_attn_npu_4.flash_attn_npu_4": os.path.join(
+                this_dir, "csrc/ascend910", "flash_attn_npu_4"
+            ),
+            "flash_attn_npu_4_950": os.path.join(this_dir, "csrc/ascend950", "flash_attn_npu_4"),
+        }
+        src_dir = aicpu_src_dirs.get(ext_name)
+        if src_dir is None:
+            return None
+        aicpu_src = os.path.join(src_dir, "fa_metadata.aicpu")
+        if not os.path.exists(aicpu_src):
+            return None
+        aicpu_obj = os.path.join(
+            self.build_temp,
+            # All extensions share the temporary directory. Keep the
+            # AICPU objects per extension; otherwise the later 950 build
+            # overwrites the object already queued for the earlier one.
+            f"fa_metadata_{ext_name.replace('.', '_')}.o",
+        )
+        # Incremental AICPU compilation must also track the local headers. In
+        # particular, fa_metadata.aicpu includes tilingdata.h and metadata
+        # helpers whose changes otherwise leave a stale object after a branch
+        # switch or stash re-apply.
+        aicpu_stamp = aicpu_obj + ".inputs"
+        aicpu_inputs = [aicpu_src]
+        for name in (
+            "tilingdata.h",
+            "fa_metadata_args.h",
+            "fa_split.h",
+            "fused_task.h",
+            "fwd_resource_plan.h",
+            "fwd_tiling_policy.h",
+        ):
+            header = os.path.join(src_dir, name)
+            if os.path.exists(header):
+                aicpu_inputs.append(header)
+        expected_signature = _inputs_signature(aicpu_inputs)
+        try:
+            with open(aicpu_stamp) as stamp:
+                current_signature = stamp.read().strip()
+        except OSError:
+            current_signature = ""
+        if (
+            not self._force_rebuild()
+            and os.path.exists(aicpu_obj)
+            and current_signature == expected_signature
+        ):
+            print("[compile-aicpu-skip]", aicpu_src, "(obj up-to-date)")
+            return aicpu_obj
+        cann_arch_dir = get_cann_arch_dir()
+        aicpu_inc = os.path.join(ascend_home, cann_arch_dir, "asc/include/aicpu_api")
+        aicpu_lib = os.path.join(ascend_home, cann_arch_dir, "lib64/device/lib64")
+        hcc = os.path.join(ascend_home, "toolkit/toolchain/hcc")
+        hcc_isys = os.path.join(hcc, "aarch64-target-linux-gnu/include")
+        hcc_cpp = _get_hcc_cpp_include(hcc)
+        aicpu_cmd = [
+            "bisheng",
+            "-O2",
+            "-std=c++17",
+            "-fvisibility=default",
+            "-fvisibility-inlines-hidden",
+            "-D_GLIBCXX_USE_CXX11_ABI=0",
+            "-D_FORTIFY_SOURCE=2",
+            "-D_GNU_SOURCE",
+            f"-I{aicpu_inc}",
+            f"-I{src_dir}",  # tilingdata.h
+            f"--cce-aicpu-L{aicpu_lib}",
+            "--cce-aicpu-laicpu_api",
+            f"--cce-aicpu-toolkit-path={os.path.join(hcc, 'bin')}",
+            f"--cce-aicpu-sysroot={os.path.join(hcc, 'sysroot')}",
+            "-isystem",
+            hcc_isys,
+            "-isystem",
+            hcc_cpp,
+            "-isystem",
+            os.path.join(hcc_cpp, "aarch64-target-linux-gnu"),
+            "-isystem",
+            os.path.join(hcc_cpp, "backward"),
+            "-c",
+            "-o",
+            aicpu_obj,
+            "-x",
+            "aicpu",
+            aicpu_src,
+        ]
+        print("[compile-aicpu]", aicpu_src)
+        print("[compile-aicpu-cmd]", " ".join(aicpu_cmd))
+        try:
+            result = subprocess.run(aicpu_cmd, capture_output=True, text=True, check=True)
+            if result.stdout:
+                print(result.stdout)
+            with open(aicpu_stamp, "w") as stamp:
+                stamp.write(expected_signature)
+            print(f"AICPU compilation successful! output: {aicpu_obj}")
+        except subprocess.CalledProcessError as e:
+            print(f"AICPU compilation failed! Error output:\n{e.stderr}")
+            raise e
+        return aicpu_obj
+
+    def build_extensions(self):
+        # Only runtime modules belong in build_lib; wheel installation copies
+        # that entire tree, including any compiler intermediates left in it.
+        os.makedirs(self.build_temp, exist_ok=True)
+        toolchains = {ext.name: self._get_toolchain(ext) for ext in self.extensions}
+        force = self._force_rebuild()
+
+        # Map every TU source -> (ext_name, obj_path). obj dir is per-extension so
+        # v2/v3 .o files (same basenames, e.g. flash_api.o) never collide.
+        tasks = []  # (ext_name, src, obj)
+        for ext in self.extensions:
+            ext_fullpath = self.get_ext_fullpath(ext.name)
+            os.makedirs(os.path.dirname(ext_fullpath), exist_ok=True)
+            obj_dir = os.path.join(self.build_temp, ext.name + ".objs")
+            os.makedirs(obj_dir, exist_ok=True)
+            for src in ext.sources:
+                obj = os.path.join(obj_dir, os.path.splitext(os.path.basename(src))[0] + ".o")
+                tasks.append((ext.name, src, obj))
+
+        def compile_one(task):
+            ext_name, src, obj = task
+            _compiler, compile_common, _la, _lf = toolchains[ext_name]
+            depfile = obj + ".d"
+            cmdhash_file = obj + ".cmdhash"
+            if not force and _obj_is_fresh(obj, src, depfile, cmdhash_file, compile_common):
+                print("[compile-skip]", ext_name, os.path.basename(src), "(obj up-to-date)")
+                return (ext_name, obj)
+            cmd = [*compile_common, "-c", src, "-o", obj, "-MMD", "-MF", depfile]
+            print("[compile]", ext_name, os.path.basename(src))
+            print("[compile-cmd]", " ".join(cmd))
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                if result.stdout:
+                    print(result.stdout)
+                with open(cmdhash_file, "w") as f:
+                    f.write(_cmdhash(compile_common))
+                return (ext_name, obj)
+            except subprocess.CalledProcessError as e:
+                print(f"Compilation failed for {src}! Error output:\n{e.stderr}")
+                raise
+
+        # One shared pool across all extensions so the heaviest TUs compile
+        # concurrently regardless of which extension owns them. TUs per extension
+        # once autogen dispatch TUs are added: ascend910_v2=12, ascend910_v3=9,
+        # ascend950_v3=6, ascend910_v4=5, ascend950_v4=6.
+        build_jobs = os.getenv("FLASH_ATTN_BUILD_JOBS")
+        if build_jobs:
+            try:
+                requested_workers = int(build_jobs)
+            except ValueError as error:
+                raise RuntimeError("FLASH_ATTN_BUILD_JOBS must be a positive integer") from error
+            if requested_workers <= 0:
+                raise RuntimeError("FLASH_ATTN_BUILD_JOBS must be a positive integer")
+        else:
+            requested_workers = os.cpu_count() or 1
+        max_workers = min(len(tasks), requested_workers)
+        print(f"[build-config] compile_jobs={max_workers}")
+        objs_by_ext = {ext.name: [] for ext in self.extensions}
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(compile_one, t): t for t in tasks}
+            for fut in as_completed(futures):
+                ext_name, obj = fut.result()
+                objs_by_ext[ext_name].append(obj)
+
+        # AICPU metadata object for the extensions carrying the
+        # scheduler-metadata feature: compiled separately (host code,
+        # `bisheng -x aicpu`) and appended to each extension's link set. Built
+        # after the parallel ASC compiles, before linking.
+        for ext in self.extensions:
+            ext_fullpath = self.get_ext_fullpath(ext.name)
+            aicpu_obj = self._build_aicpu_metadata(ext_fullpath, ext.name)
+            if aicpu_obj is not None:
+                objs_by_ext[ext.name].append(aicpu_obj)
+
+        # Link each extension from its own object files (serial; link is cheap
+        # relative to compile - measured ~1s/ext - so parallelizing would save
+        # only ~5s total and stays serial). Skip an ext's link when its .so
+        # already exists and is no older than every .o: that means no object
+        # changed since the last link, so relinking would be a no-op.
+        for ext in self.extensions:
+            ext_fullpath = self.get_ext_fullpath(ext.name)
+            objs = objs_by_ext[ext.name]
+            link_stamp = os.path.join(self.build_temp, ext.name + ".inputs")
+            link_inputs = [src for src in ext.sources]
+            link_inputs.extend(
+                os.path.join(os.path.dirname(src), name)
+                for src in ext.sources
+                for name in ("tilingdata.h", "fa_metadata_args.h")
+                if os.path.exists(os.path.join(os.path.dirname(src), name))
+            )
+            expected_link_signature = _inputs_signature(link_inputs)
+            try:
+                with open(link_stamp) as stamp:
+                    current_link_signature = stamp.read().strip()
+            except OSError:
+                current_link_signature = ""
+            if (
+                not force
+                and os.path.exists(ext_fullpath)
+                and current_link_signature == expected_link_signature
+                and all(
+                    os.path.exists(o) and os.path.getmtime(o) <= os.path.getmtime(ext_fullpath)
+                    for o in objs
+                )
+            ):
+                print("[link-skip]", ext_fullpath, "(.so up-to-date)")
+                continue
+            compiler, _cc, link_arch_flags, link_flags = toolchains[ext.name]
+            link_cmd = [
+                *compiler,
+                *link_arch_flags,
+                "-shared",
+                "-fPIC",
+                *objs,
+                *link_flags,
+                "-o",
+                ext_fullpath,
+            ]
+            print("[link]", ext_fullpath)
+            print("[link-cmd]", " ".join(link_cmd))
+            try:
+                result = subprocess.run(link_cmd, capture_output=True, text=True, check=True)
+                if result.stdout:
+                    print(result.stdout)
+                with open(link_stamp, "w") as stamp:
+                    stamp.write(expected_link_signature)
+                print(f"Link successful! output: {ext_fullpath}")
+            except subprocess.CalledProcessError as e:
+                print(f"Link failed! Error output:\n{e.stderr}")
+                raise e
+
+    def build_extension(self, ext):
+        saved = self.extensions
+        self.extensions = [ext]
+        try:
+            self.build_extensions()
+        finally:
+            self.extensions = saved
+
+
+ext_modules = []
+
+if (
+    BUILD_EXTENSIONS
+    and os.path.isdir(".git")
+    and os.environ.get("FLASH_ATTN_SKIP_SUBMODULE_INIT") != "1"
+):
+    subprocess.run(
+        ["git", "submodule", "update", "--init", "--depth", "1", "csrc/catlass"],
+        check=False,
+    )
+
+if BUILD_EXTENSIONS and not os.path.exists(
+    os.path.join(this_dir, "csrc/catlass", "include/catlass/catlass.hpp")
+):
+    raise RuntimeError(
+        "csrc/catlass is missing its catlass headers (include/catlass/catlass.hpp). "
+        "The submodule gitlink may be unreachable. Run "
+        "`git -C csrc/catlass checkout master` (or fetch the submodule manually) "
+        "and retry."
+    )
+
+src_ascend910_v2 = glob.glob(
+    os.path.join(this_dir, "csrc/ascend910/flash_attn_npu", "flash_api.cpp"), recursive=True
+)
+src_ascend910_v2 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend910/flash_attn_npu", "fag_general_host.cpp"), recursive=True
+)
+# ascend910 v2's forward FAInfer / FAGGeneral backward / varlen-backward dispatch is split
+# into per-(dtype, layout) translation units under autogen/, generated by
+# autogen/generate_kernels.py, so the heavy kernel templates compile in parallel.
+src_ascend910_v2 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend910/flash_attn_npu", "autogen", "*.cpp"), recursive=True
+)
+src_ascend910_v3 = glob.glob(
+    os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_3", "flash_api.cpp"), recursive=True
+)
+# ascend910 v3's forward FAInfer / backward FAGGeneral dispatch is split into per-
+# (dtype, layout) translation units under autogen/, generated by
+# autogen/generate_kernels.py. flash_api.cpp keeps the fa_split host loop +
+# metadata logic; the kernel templates are instantiated only in the autogen TUs.
+src_ascend910_v3 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_3", "autogen", "*.cpp"), recursive=True
+)
+# Standalone split-attention combine (fwd_combine) kernel. Kept in its own
+# translation unit so the Vector-only kernel does not land in flash_api.cpp.
+src_ascend910_v3 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_3", "combine_kernel.cpp"), recursive=True
+)
+src_ascend950_v3 = glob.glob(
+    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "flash_api.cpp"), recursive=True
+)
+# ascend950 v3's forward FAInfer dispatch is split into per-(dtype, layout) translation
+# units under autogen/, generated by autogen/generate_kernels.py, so the FAInfer /
+src_ascend950_v3 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "autogen", "*.cpp"), recursive=True
+)
+src_ascend950_v3.append(os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "fwd_dispatch_mixed_swa.cpp"))
+src_ascend950_v3.append(os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "fwd_dispatch_paired_full.cpp"))
+# Standalone split-attention combine (fwd_combine) kernel.
+src_ascend950_v3 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_3", "combine_kernel.cpp"), recursive=True
+)
+src_ascend910_v4 = glob.glob(
+    os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_4", "flash_api.cpp"), recursive=True
+)
+# ascend910's forward FAInfer / backward FAGGeneral dispatch is split into
+# per-(dtype, layout) translation units under autogen/, generated by
+# autogen/generate_kernels.py. flash_api.cpp keeps the fa_split host loop and
+# mha_bwd tiling; the kernel templates are instantiated only in the autogen TUs.
+src_ascend910_v4 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_4", "autogen", "*.cpp"), recursive=True
+)
+# Standalone split-attention combine (fwd_combine) kernel.
+src_ascend910_v4 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend910/flash_attn_npu_4", "combine_kernel.cpp"), recursive=True
+)
+src_ascend950_v4 = glob.glob(
+    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_4", "flash_api.cpp"), recursive=True
+)
+# ascend950 v4's forward FAInfer dispatch is split into per-(dtype, layout) translation
+# units under autogen/, generated by autogen/generate_kernels.py, so the FAInfer /
+src_ascend950_v4 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_4", "autogen", "*.cpp"), recursive=True
+)
+# Standalone split-attention combine (fwd_combine) kernel.
+src_ascend950_v4 += glob.glob(
+    os.path.join(this_dir, "csrc/ascend950/flash_attn_npu_4", "combine_kernel.cpp"), recursive=True
+)
+
+if BUILD_EXTENSIONS:
+    if BUILD_VERSION in ("v2", "all") and BUILD_NPU in ("910", "all"):
+        # Nested under the Python package so the extension name does not collide
+        # with the flash_attn_npu package itself.
+        ext_modules.append(
+            Extension(
+                name="flash_attn_npu.flash_attn_npu",
+                sources=src_ascend910_v2,
+                language="c++",
+            )
+        )
+
+    if BUILD_VERSION in ("v3", "all") and BUILD_NPU in ("910", "all"):
+        ext_modules.append(
+            Extension(
+                name="flash_attn_npu_3.flash_attn_npu_3",
+                sources=src_ascend910_v3,
+                language="c++",
+            )
+        )
+
+    if BUILD_VERSION in ("v3", "all") and BUILD_NPU in ("950", "all"):
+        if not src_ascend950_v3:
+            raise RuntimeError(
+                "FLASH_ATTN_BUILD_NPU=950 or FLASH_ATTN_BUILD_VERSION=v3 requires csrc/ascend950/flash_attn_npu_3/flash_api.cpp;"
+            )
+        ext_modules.append(
+            Extension(
+                name="flash_attn_npu_3_950",
+                sources=src_ascend950_v3,
+                language="c++",
+            )
+        )
+
+    if BUILD_VERSION in ("v4", "all") and BUILD_NPU in ("910", "all"):
+        if not src_ascend910_v4:
+            raise RuntimeError(
+                "FLASH_ATTN_BUILD_VERSION=v4 requires csrc/ascend910/flash_attn_npu_4/flash_api.cpp;"
+            )
+        ext_modules.append(
+            Extension(
+                name="flash_attn_npu_4.flash_attn_npu_4",
+                sources=src_ascend910_v4,
+                language="c++",
+            )
+        )
+
+    if BUILD_VERSION in ("v4", "all") and BUILD_NPU in ("950", "all"):
+        if not src_ascend950_v4:
+            raise RuntimeError(
+                "FLASH_ATTN_BUILD_NPU=950 or FLASH_ATTN_BUILD_VERSION=v4 requires csrc/ascend950/flash_attn_npu_4/flash_api.cpp;"
+            )
+        ext_modules.append(
+            Extension(
+                name="flash_attn_npu_4_950",
+                sources=src_ascend950_v4,
+                language="c++",
+            )
+        )
+
+    if not ext_modules:
+        raise RuntimeError(
+            f"FLASH_ATTN_BUILD_VERSION={BUILD_VERSION!r} + "
+            f"FLASH_ATTN_BUILD_NPU={BUILD_NPU!r} selects no extensions to "
+            f"build (e.g. v2 has no 950 backend). Set FLASH_ATTN_BUILD_NPU "
+            f"to 910, 950, or all."
+        )
+
+
+def get_package_version():
+    return wheel_metadata.get_build_config().version
+
+
+def get_wheel_url():
+    config = wheel_metadata.get_build_config()
+    return wheel_metadata.get_release_url(config), wheel_metadata.get_wheel_filename(config)
+
+
+class CachedWheelsCommand(_bdist_wheel):
+    """
+    The CachedWheelsCommand plugs into the default bdist wheel, which is ran by pip when it cannot
+    find an existing wheel (which is currently the case for all flash attention installs). We use
+    the environment parameters to detect whether there is already a pre-built version of a compatible
+    wheel available and short-circuits the standard full build pipeline.
+    """
+
+    def run(self):
+        if FORCE_BUILD:
+            return super().run()
+
+        wheel_url, wheel_filename = get_wheel_url()
+        config = wheel_metadata.get_build_config()
+        print(
+            "[wheel-config] "
+            f"npu={config.npu} api={config.api} cann={config.cann} "
+            f"torch={config.torch} torch_npu={config.torch_npu} abi={config.abi}"
+        )
+        print("Guessing wheel URL: ", wheel_url)
+        try:
+            urllib.request.urlretrieve(wheel_url, wheel_filename)
+
+            if not os.path.exists(self.dist_dir):
+                os.makedirs(self.dist_dir)
+
+            impl_tag, abi_tag, plat_tag = self.get_tag()
+            archive_basename = f"{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}"
+
+            wheel_path = os.path.join(self.dist_dir, archive_basename + ".whl")
+            os.rename(wheel_filename, wheel_path)
+        except (OSError, urllib.error.HTTPError, urllib.error.URLError) as error:
+            print(
+                f"Precompiled wheel unavailable ({error}); attempted {wheel_url}. "
+                "Building from source..."
+            )
+            super().run()
+
+
+cmdclass = {"bdist_wheel": CachedWheelsCommand}
+if ext_modules:
+    cmdclass["build_ext"] = BishengBuildExt
+
+print("[BUILD-CONFIG] version =", BUILD_VERSION)
+print("[BUILD-CONFIG] npu =", BUILD_NPU)
+print(
+    "[BUILD-CONFIG] extensions =",
+    [ext.name for ext in ext_modules],
+)
+setup(
+    name=PACKAGE_NAME,
+    version=get_package_version(),
+    packages=find_packages(
+        exclude=(
+            "build",
+            "ci",
+            "ci.*",
+            "csrc/ascend910",
+            "csrc/ascend950",
+            "include",
+            "tests",
+            "tests.*",
+            "dist",
+            "docs",
+            "benchmarks",
+        )
+    ),
+    author="Minghua Shen",
+    package_data={"flash_attn_npu_4.catlass_dsl": ["README.md"]},
+    author_email="shenmh6@mail.sysu.edu.cn",
+    description="High-performance FlashAttention Implementation for Ascend NPU",
+    long_description=long_description,
+    long_description_content_type="text/markdown",
+    url="https://github.com/MinghuasLab/flash-attention-npu",
+    classifiers=[
+        "Programming Language :: Python :: 3",
+        "Operating System :: Unix",
+    ],
+    license="BSD-3-Clause",
+    ext_modules=ext_modules,
+    cmdclass=cmdclass,
+    python_requires=">=3.9",
+    install_requires=[
+        "torch",
+        "torch_npu",
+    ],
+)

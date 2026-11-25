@@ -1,0 +1,8 @@
+---
+name: catlass-dev
+
+channels:
+  - ascend
+
+dependencies:
+  - ascend::cann-a3-ops>=8.5.0

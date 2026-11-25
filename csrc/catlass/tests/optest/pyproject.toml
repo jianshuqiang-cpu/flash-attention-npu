@@ -1,0 +1,95 @@
+# This program is free software, you can redistribute it and/or modify.
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This file is a part of the CANN Open Software.
+# Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING
+# BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE. See LICENSE in the root of
+# the software repository for the full text of the License.
+
+[build-system]
+requires = ["scikit-build-core>=0.8.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "torch-catlass"
+dynamic = ["version"]
+description = "Catlass-based TorchNPU operators with multi-architecture support"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "attrs",
+    "cython",
+    "numpy>=2.4.4",
+    "decorator",
+    "sympy",
+    "cffi",
+    "pyyaml>=6.0.3",
+    "pathlib2",
+    "psutil",
+    "protobuf==3.20.0",
+    "scipy",
+    "requests",
+    "absl-py",
+    "torch>=2.0.0",
+    "torch-npu",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "ruff>=0.11.0",
+]
+
+[tool.scikit-build]
+cmake.version = ">=3.16"
+cmake.args = [
+    "-DCMAKE_BUILD_TYPE=Release",
+]
+ninja.make-fallback = true
+wheel.packages = ["torch_catlass"]
+wheel.install-dir = "torch_catlass"
+editable.rebuild = false
+editable.verbose = false
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "torch_catlass/_version.py"
+
+[tool.scikit-build.cmake.define]
+CATLASS_ARCH_LIST = {env = "CATLASS_ARCH_LIST", default = "2201;3510"}
+
+[tool.uv]
+no-build-isolation-package = ["torch-catlass"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # bugbear
+    "SIM", # simplify
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401", "E402", "F403", "F405"]
+"tests/*" = ["N"]
+"torch_catlass/ops/basic_matmul.py" = ["N803", "N806"]

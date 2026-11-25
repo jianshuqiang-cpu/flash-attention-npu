@@ -1,0 +1,205 @@
+#!/bin/bash
+
+# This program is free software, you can redistribute it and/or modify.
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This file is a part of the CANN Open Software.
+# Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING
+# BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE. See LICENSE in the root of
+# the software repository for the full text of the License.
+
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+PYTHON="${PYTHON:-$(which python3)}"
+echo "Using python: $($PYTHON --version 2>&1) at $PYTHON"
+
+usage() {
+    echo "Usage: $0 [options]"
+    echo ""
+    echo "Options:"
+    echo "  --build-type <type>         Build type (Release|Debug), default: Release"
+    echo "  --skip-wheel                Skip building wheel package (editable install)"
+    echo "  --disable-ascend950         Disable Ascend 950 support (ENABLE_ASCEND950=0)"
+    echo "  --clean                     Clean all caches (JIT disk cache + wheel artifacts)"
+    echo "  -h, --help                  Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  $0 --build-type Debug"
+    echo "  $0 --clean"
+}
+
+BUILD_TYPE="Release"
+SKIP_WHEEL=false
+CLEAN=false
+DISABLE_ASCEND950=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --build-type)
+            BUILD_TYPE="$2"
+            shift 2
+            ;;
+        --skip-wheel)
+            SKIP_WHEEL=true
+            shift
+            ;;
+        --clean)
+            CLEAN=true
+            shift
+            ;;
+        --disable-ascend950)
+            DISABLE_ASCEND950=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+if [ "$CLEAN" = true ]; then
+    # JIT cache priority (kernels/jit/jit_compiler.cpp):
+    #   1. $CATLASS_JIT_CACHE_DIR  (env override)
+    #   2. $HOME/.cache/catlass/jit_cache  (default, with <version> subdir)
+    #   3. /tmp/catlass_jit  (fallback when HOME is unset)
+    if [ -n "${CATLASS_JIT_CACHE_DIR:-}" ] && [ -d "$CATLASS_JIT_CACHE_DIR" ]; then
+        echo "Cleaning JIT disk cache (env): \$CATLASS_JIT_CACHE_DIR=$CATLASS_JIT_CACHE_DIR"
+        rm -rf "$CATLASS_JIT_CACHE_DIR"
+    fi
+    if [ -d "$HOME/.cache/catlass/jit_cache" ]; then
+        echo "Cleaning JIT disk cache (default): $HOME/.cache/catlass/jit_cache"
+        rm -rf "$HOME/.cache/catlass/jit_cache"
+    fi
+    if [ -d /tmp/catlass_jit ]; then
+        echo "Cleaning JIT disk cache (fallback): /tmp/catlass_jit"
+        rm -rf /tmp/catlass_jit
+    fi
+    echo "Cleaning build artifacts: dist/ *.egg-info _skbuild/"
+    rm -rf dist/ *.egg-info _skbuild/
+    echo "Cleaning pytest cache: .pytest_cache tests/__pycache__"
+    rm -rf .pytest_cache tests/__pycache__
+    echo "Cleaning test log: tests/test.log"
+    rm -f tests/test.log
+    echo "Cleaning ruff cache: .ruff_cache"
+    rm -rf .ruff_cache
+    echo "Clean complete."
+    exit 0
+fi
+
+# ============================================================
+# 编译时确定版本号：从 catlass git 仓库推导
+# ============================================================
+CATLASS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+GIT_DESC="unknown"
+GIT_COMMIT="unknown"
+GIT_TS=""
+if cd "$CATLASS_ROOT" 2>/dev/null; then
+    GIT_DESC=$(git describe --tags --always --dirty 2>/dev/null || echo "unknown")
+    GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    GIT_TS=$(git log -1 --format=%cd --date=format:%Y%m%d%H%M%S 2>/dev/null || echo "")
+fi
+cd "$SCRIPT_DIR"
+
+# Parse tag from git describe output
+RAW_TAG=$(echo "$GIT_DESC" | sed 's/-dirty$//')
+# Extract the clean version prefix (e.g., "v1.5.0" from "v1.5.0-41-g10fb189")
+CLEAN_TAG=$(echo "$RAW_TAG" | sed 's/-[0-9]*-g[0-9a-f]*//')
+# Extract commit count after tag (0 for exact tag)
+NUM_AFTER_TAG=$(echo "$RAW_TAG" | sed -n 's/.*-\([0-9]*\)-g.*/\1/p')
+
+# Build PEP 440 compliant version for wheel name
+if echo "$GIT_DESC" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+'; then
+    if [ -n "$NUM_AFTER_TAG" ]; then
+        # tag-N-gcommit (with or without dirty)
+        PKG_VERSION="${CLEAN_TAG#v}.dev${NUM_AFTER_TAG}+${GIT_COMMIT}"
+    elif echo "$GIT_DESC" | grep -q '\-dirty$'; then
+        # dirty on exact tag
+        PKG_VERSION="${CLEAN_TAG#v}.dev0+${GIT_COMMIT}"
+    else
+        # exact clean tag
+        PKG_VERSION="${CLEAN_TAG#v}"
+    fi
+else
+    # no tag → use commit hash
+    PKG_VERSION="0.0.0+${GIT_COMMIT}"
+fi
+
+# 生成 _version.py（运行时不再跑 git）
+# 如果版本没变则跳过写入，避免破坏 CMake 增量缓存
+_VERSION_PY="torch_catlass/_version.py"
+_VERSION_CONTENT=$(cat << VERSIONEOF
+# Auto-generated by build.sh at build time. DO NOT EDIT.
+"""Version information for torch-catlass, derived from catlass repository."""
+
+__version__ = "${PKG_VERSION}"
+__version_dict__ = {
+    "full": "${CLEAN_TAG}+${GIT_COMMIT}+${GIT_TS}",
+    "tag": "${CLEAN_TAG}",
+    "commit": "${GIT_COMMIT}",
+    "timestamp": "${GIT_TS}",
+}
+
+
+def get_version():
+    """Return version dict matching the original interface."""
+    return dict(__version_dict__)
+VERSIONEOF
+)
+if [ -f "$_VERSION_PY" ] && [ "$(cat "$_VERSION_PY")" = "$_VERSION_CONTENT" ]; then
+    echo "Version unchanged — skipping _version.py write (preserves CMake cache)."
+else
+    echo "$_VERSION_CONTENT" > "$_VERSION_PY"
+fi
+
+echo "============================================"
+echo "Building torch-catlass with scikit-build-core..."
+echo "============================================"
+echo "Catlass version: ${CLEAN_TAG}+${GIT_COMMIT}+${GIT_TS}"
+echo "Package version: ${PKG_VERSION}"
+echo "Build type: $BUILD_TYPE"
+echo ""
+
+# Ensure pip is available in the venv (no-op if already installed)
+$PYTHON -m ensurepip --upgrade >/dev/null 2>&1 || true
+$PYTHON -m pip install --upgrade pip 2>/dev/null || true
+
+CONFIG_SETTINGS=()
+
+# Auto-detect Torch cmake dir from active Python (fixes scikit-build-core not inheriting venv)
+TORCH_CMAKE_DIR=$($PYTHON -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'share', 'cmake', 'Torch'))" 2>/dev/null || true)
+if [ -n "$TORCH_CMAKE_DIR" ] && [ -d "$TORCH_CMAKE_DIR" ]; then
+    CONFIG_SETTINGS+=(--config-settings="cmake.define.Torch_DIR=${TORCH_CMAKE_DIR}")
+    CONFIG_SETTINGS+=(--config-settings="cmake.define.Python_EXECUTABLE=${PYTHON}")
+    echo "Torch cmake dir: $TORCH_CMAKE_DIR"
+else
+    echo "Warning: Could not detect Torch cmake dir from active Python."
+    echo "Make sure torch is installed in the current environment."
+fi
+
+if [ "$DISABLE_ASCEND950" = true ]; then
+    CONFIG_SETTINGS+=(--config-settings="cmake.define.DISABLE_ASCEND950=ON")
+    echo "Ascend 950 support: DISABLED (ENABLE_ASCEND950=0)"
+fi
+
+if [ "$SKIP_WHEEL" = true ]; then
+    $PYTHON -m pip install -e . -v --no-build-isolation "${CONFIG_SETTINGS[@]}"
+else
+    mkdir -p dist
+    $PYTHON -m pip wheel . -v --no-deps --no-build-isolation -w dist/ "${CONFIG_SETTINGS[@]}"
+fi
+
+echo "============================================"
+echo "Build completed successfully!"
+echo "============================================"
+[ "$SKIP_WHEEL" = false ] && echo "Wheel package in: $SCRIPT_DIR/dist/"

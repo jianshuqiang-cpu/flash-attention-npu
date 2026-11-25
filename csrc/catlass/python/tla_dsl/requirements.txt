@@ -1,0 +1,15 @@
+# Build tools
+setuptools>=68
+wheel
+cmake>=3.28,<4.0
+ninja>=1.12,<2
+pybind11==2.13.6
+setuptools-scm>=8
+
+# Runtime, development, and documentation tools
+numpy>=1.24,<3
+pytest
+ruff
+black
+mypy
+mkdocs>=1.6.1

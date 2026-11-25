@@ -1,0 +1,406 @@
+// Copyright (c) 2026, Minghua Shen.
+
+#ifndef FLASH_ATTENTION_REGULAR_H
+#define FLASH_ATTENTION_REGULAR_H
+
+struct coreNode {
+    int startBIdx;
+    int startN1Idx;
+    int startS1Idx;
+    int startS2Idx;
+    int endBIdx;
+    int endN1Idx;
+    int endS1Idx;
+    int endS2Idx;
+    int64_t firstSplitKVTaskLseOffset;
+    int64_t firstSplitKVTaskOOffset;
+};
+
+struct splitNode {
+    int batchIdx;
+    int headStartIdx;
+    int headEndIdx;
+    int qStartIdx;
+    int qEndIdx;
+    int splitNum;
+    int64_t lseTaskOffset;
+    int64_t oTaskOffset;
+};
+
+// Read-only scheduling data shared by all calls using the same metadata.
+struct FAInferStaticTilingData {
+    uint32_t numHeads;
+    uint32_t embeddingSize;
+    uint32_t embeddingSizeV;
+    uint32_t maxQSeqlen;
+    uint32_t maxKvSeqlen;
+    uint32_t kvHeads;
+    uint32_t batch;
+    uint32_t firstBatchTaskNum;
+    uint32_t totalTaskNum;
+    uint64_t mm1OutSize;
+    uint64_t smOnlineOutSize;
+    uint64_t mm2OutSize;
+    uint64_t UpdateSize;
+    uint64_t workSpaceSize;
+    uint64_t padding1;
+    uint64_t padding2;
+    uint32_t padding3;
+    // P0 (G2): per-batch KV-split budget sunk by the host for the absorbed-MLA
+    // decode gemv kernel; tasks re-derived on device; 2336-byte ABI unchanged.
+    uint32_t nsplitPerBatch;
+    uint64_t splitLseTotalSize;
+    uint64_t splitOTotalSize;
+    uint32_t totalSplitNodeNum;
+    uint32_t needCoreNum;
+    uint32_t flashDecodeFlag;
+    uint32_t numSplits;
+    coreNode coreInfo[25];
+    splitNode splitInfo[25];
+
+    uint32_t get_numHeads() const
+    {
+        return numHeads;
+    }
+    uint32_t get_embeddingSize() const
+    {
+        return embeddingSize;
+    }
+    uint32_t get_embeddingSizeV() const
+    {
+        return embeddingSizeV;
+    }
+    uint32_t get_maxQSeqlen() const
+    {
+        return maxQSeqlen;
+    }
+    uint32_t get_maxKvSeqlen() const
+    {
+        return maxKvSeqlen;
+    }
+    uint32_t get_kvHeads() const
+    {
+        return kvHeads;
+    }
+    uint32_t get_batch() const
+    {
+        return batch;
+    }
+    uint32_t get_firstBatchTaskNum() const
+    {
+        return firstBatchTaskNum;
+    }
+    uint32_t get_totalTaskNum() const
+    {
+        return totalTaskNum;
+    }
+    uint64_t get_mm1OutSize() const
+    {
+        return mm1OutSize;
+    }
+    uint64_t get_smOnlineOutSize() const
+    {
+        return smOnlineOutSize;
+    }
+    uint64_t get_mm2OutSize() const
+    {
+        return mm2OutSize;
+    }
+    uint64_t get_UpdateSize() const
+    {
+        return UpdateSize;
+    }
+    uint64_t get_workSpaceSize() const
+    {
+        return workSpaceSize;
+    }
+    uint64_t get_padding1() const
+    {
+        return padding1;
+    }
+    uint64_t get_padding2() const
+    {
+        return padding2;
+    }
+    uint32_t get_padding3() const
+    {
+        return padding3;
+    }
+    uint32_t get_nsplitPerBatch() const
+    {
+        return nsplitPerBatch;
+    }
+    uint64_t get_splitLseTotalSize() const
+    {
+        return splitLseTotalSize;
+    }
+    uint64_t get_splitOTotalSize() const
+    {
+        return splitOTotalSize;
+    }
+    uint32_t get_totalSplitNodeNum() const
+    {
+        return totalSplitNodeNum;
+    }
+    uint32_t get_needCoreNum() const
+    {
+        return needCoreNum;
+    }
+    uint32_t get_flashDecodeFlag() const
+    {
+        return flashDecodeFlag;
+    }
+    uint32_t get_numSplits() const
+    {
+        return numSplits;
+    }
+
+    void set_numHeads(uint32_t value)
+    {
+        numHeads = value;
+    }
+    void set_embeddingSize(uint32_t value)
+    {
+        embeddingSize = value;
+    }
+    void set_embeddingSizeV(uint32_t value)
+    {
+        embeddingSizeV = value;
+    }
+    void set_maxQSeqlen(uint32_t value)
+    {
+        maxQSeqlen = value;
+    }
+    void set_maxKvSeqlen(uint32_t value)
+    {
+        maxKvSeqlen = value;
+    }
+    void set_kvHeads(uint32_t value)
+    {
+        kvHeads = value;
+    }
+    void set_batch(uint32_t value)
+    {
+        batch = value;
+    }
+    void set_firstBatchTaskNum(uint32_t value)
+    {
+        firstBatchTaskNum = value;
+    }
+    void set_totalTaskNum(uint32_t value)
+    {
+        totalTaskNum = value;
+    }
+    void set_mm1OutSize(uint64_t value)
+    {
+        mm1OutSize = value;
+    }
+    void set_smOnlineOutSize(uint64_t value)
+    {
+        smOnlineOutSize = value;
+    }
+    void set_mm2OutSize(uint64_t value)
+    {
+        mm2OutSize = value;
+    }
+    void set_UpdateSize(uint64_t value)
+    {
+        UpdateSize = value;
+    }
+    void set_workSpaceSize(uint64_t value)
+    {
+        workSpaceSize = value;
+    }
+    void set_padding1(uint64_t value)
+    {
+        padding1 = value;
+    }
+    void set_padding2(uint64_t value)
+    {
+        padding2 = value;
+    }
+    void set_padding3(uint32_t value)
+    {
+        padding3 = value;
+    }
+    void set_nsplitPerBatch(uint32_t value)
+    {
+        nsplitPerBatch = value;
+    }
+    void set_splitLseTotalSize(uint64_t value)
+    {
+        splitLseTotalSize = value;
+    }
+    void set_splitOTotalSize(uint64_t value)
+    {
+        splitOTotalSize = value;
+    }
+    void set_totalSplitNodeNum(uint32_t value)
+    {
+        totalSplitNodeNum = value;
+    }
+    void set_needCoreNum(uint32_t value)
+    {
+        needCoreNum = value;
+    }
+    void set_flashDecodeFlag(uint32_t value)
+    {
+        flashDecodeFlag = value;
+    }
+    void set_numSplits(uint32_t value)
+    {
+        numSplits = value;
+    }
+};
+
+// Per-forward execution values; never stored in reusable scheduler metadata.
+struct FAInferRuntimeData {
+    uint32_t numBlocks;
+    uint32_t blockSize;
+    uint32_t maxNumBlocksPerBatch;
+    uint32_t maskType;
+    float scaleValue;
+    float softcapValue;
+    int64_t windowSizeLeft = 0;
+    int64_t windowSizeRight = 0;
+    // Element strides for paged KV. The API receives logical
+    // [page, token, head, dim] tensors; a transposed view can retain physical
+    // BNBD storage, whose token/head strides identify the inner layout.
+    uint64_t keyPageStride;
+    uint64_t valuePageStride;
+    uint64_t keyTokenStride;
+    uint64_t valueTokenStride;
+    uint64_t keyHeadStride;
+    uint64_t valueHeadStride;
+    // TND LSE is (num_heads, q.size(0)). q.size(0) may exceed cu_seqlens_q[-1];
+    // the extra tail is unused storage and this stride keeps head rows apart.
+    uint64_t totalQTokens;
+
+    uint32_t get_numBlocks() const
+    {
+        return numBlocks;
+    }
+    uint32_t get_blockSize() const
+    {
+        return blockSize;
+    }
+    uint32_t get_maxNumBlocksPerBatch() const
+    {
+        return maxNumBlocksPerBatch;
+    }
+    uint32_t get_maskType() const
+    {
+        return maskType;
+    }
+    float get_scaleValue() const
+    {
+        return scaleValue;
+    }
+    float get_softcapValue() const
+    {
+        return softcapValue;
+    }
+    int64_t get_windowSizeLeft() const
+    {
+        return windowSizeLeft;
+    }
+    int64_t get_windowSizeRight() const
+    {
+        return windowSizeRight;
+    }
+    uint64_t get_keyPageStride() const
+    {
+        return keyPageStride;
+    }
+    uint64_t get_valuePageStride() const
+    {
+        return valuePageStride;
+    }
+    uint64_t get_keyTokenStride() const
+    {
+        return keyTokenStride;
+    }
+    uint64_t get_valueTokenStride() const
+    {
+        return valueTokenStride;
+    }
+    uint64_t get_keyHeadStride() const
+    {
+        return keyHeadStride;
+    }
+    uint64_t get_valueHeadStride() const
+    {
+        return valueHeadStride;
+    }
+    uint64_t get_totalQTokens() const
+    {
+        return totalQTokens;
+    }
+
+    void set_numBlocks(uint32_t value)
+    {
+        numBlocks = value;
+    }
+    void set_blockSize(uint32_t value)
+    {
+        blockSize = value;
+    }
+    void set_maxNumBlocksPerBatch(uint32_t value)
+    {
+        maxNumBlocksPerBatch = value;
+    }
+    void set_maskType(uint32_t value)
+    {
+        maskType = value;
+    }
+    void set_scaleValue(float value)
+    {
+        scaleValue = value;
+    }
+    void set_softcapValue(float value)
+    {
+        softcapValue = value;
+    }
+    void set_windowSizeLeft(int64_t value)
+    {
+        windowSizeLeft = value;
+    }
+    void set_windowSizeRight(int64_t value)
+    {
+        windowSizeRight = value;
+    }
+    void set_keyPageStride(uint64_t value)
+    {
+        keyPageStride = value;
+    }
+    void set_valuePageStride(uint64_t value)
+    {
+        valuePageStride = value;
+    }
+    void set_keyTokenStride(uint64_t value)
+    {
+        keyTokenStride = value;
+    }
+    void set_valueTokenStride(uint64_t value)
+    {
+        valueTokenStride = value;
+    }
+    void set_keyHeadStride(uint64_t value)
+    {
+        keyHeadStride = value;
+    }
+    void set_valueHeadStride(uint64_t value)
+    {
+        valueHeadStride = value;
+    }
+    void set_totalQTokens(uint64_t value)
+    {
+        totalQTokens = value;
+    }
+};
+
+// CPU tiler convenience aggregate only. Serialize the two bases separately;
+// this aggregate is not a device ABI and is never passed to a kernel.
+struct FAInferTilingData : FAInferStaticTilingData, FAInferRuntimeData {};
+
+#endif

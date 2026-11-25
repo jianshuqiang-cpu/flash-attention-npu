@@ -1,0 +1,73 @@
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ *
+ * Modified by Minghua Shen, 2026.
+ */
+
+#ifndef FAI_BLOCK_HPP
+#define FAI_BLOCK_HPP
+
+#include "catlass/catlass.hpp"
+#include "catlass/arch/arch.hpp"
+#include "catlass/gemm/dispatch_policy.hpp"
+
+using namespace Catlass;
+
+namespace Catlass::Epilogue {
+    enum class LseModeT {NONE = 0, OUT_ONLY = 1};
+    template <LseModeT LSE_MODE_, typename SM_DTYPE_, bool HAS_SOFTCAP_>
+    struct EpilogueAtlasA2OnlineSoftmaxT {
+        using ArchTag = Arch::AtlasA2;
+        using IntermPrec = SM_DTYPE_;
+        static constexpr LseModeT LSE_MODE = LSE_MODE_;
+        static constexpr bool HAS_SOFTCAP = HAS_SOFTCAP_;
+    };
+
+    template <LseModeT LSE_MODE_, typename SM_DTYPE_>
+    struct EpilogueAtlasA2RescaleOT {
+        using ArchTag = Arch::AtlasA2;
+        using IntermPrec = SM_DTYPE_;
+        static constexpr LseModeT LSE_MODE = LSE_MODE_;
+    };
+
+    template <LseModeT LSE_MODE_>
+    struct EpilogueAtlasA2InitOutWhenZero {
+        using ArchTag = Arch::AtlasA2;
+        static constexpr LseModeT LSE_MODE = LSE_MODE_;
+    };
+}
+
+namespace Catlass::Gemm {
+    template <bool PAGED_CACHE_FLAG_ = false, bool ENABLE_UNIT_FLAG_ = false>
+    struct MmadAtlasA2FAIPVT : public Gemm::MmadAtlasA2{
+        static constexpr uint32_t STAGES = 2;
+        static constexpr bool PAGED_CACHE_FLAG = PAGED_CACHE_FLAG_;
+        static constexpr bool ENABLE_UNIT_FLAG = ENABLE_UNIT_FLAG_;
+    };
+
+    template <bool PAGED_CACHE_FLAG_ = false, bool ENABLE_UNIT_FLAG_ = false>
+    struct MmadAtlasA2FAIQKT : public Gemm::MmadAtlasA2{
+        static constexpr uint32_t STAGES = 2;
+        static constexpr bool PAGED_CACHE_FLAG = PAGED_CACHE_FLAG_;
+        static constexpr bool ENABLE_UNIT_FLAG = ENABLE_UNIT_FLAG_;
+
+    };
+
+    namespace Block {
+        // QK and PV share the same physical L1/L0 buffers across task boundaries.
+        // Keep their ping-pong phase in one kernel-wide state so delayed PV cannot
+        // reuse a bank that a later QK task still owns.
+        struct BlockPingPongState {
+            uint32_t l1PingPongFlag = 0;
+            uint32_t l0CPingPongFlag = 0;
+            uint32_t l0ABPingPongFlag = 0;
+        };
+    }
+}
+#endif // FAI_BLOCK_HPP

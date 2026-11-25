@@ -1,0 +1,135 @@
+// Copyright (c) 2026, Minghua Shen.
+
+#ifndef CSRC_ASCEND950_FLASH_ATTN_NPU_3_FA_METADATA_ARGS_H
+#define CSRC_ASCEND950_FLASH_ATTN_NPU_3_FA_METADATA_ARGS_H
+
+#include <cstdint>
+#include <type_traits>
+
+#include "tilingdata.h"
+#include "../attention_window.h"
+
+static_assert(std::is_trivially_copyable<FAInferTilingData>::value,
+              "FAInferTilingData must be trivially copyable to cross the AICPU/device boundary");
+
+namespace fa_metadata {
+constexpr uint32_t MASK_DIM = 2048;
+constexpr uint64_t MASK_BYTES = static_cast<uint64_t>(MASK_DIM) * MASK_DIM;
+
+constexpr uint64_t WORKSPACE_BLOCK_SIZE_DB = static_cast<uint64_t>(128) * 512;
+constexpr uint32_t SIZE_OF_16BIT = 2;
+constexpr uint32_t SIZE_OF_32BIT = 4;
+constexpr uint32_t PRELAUNCH_NUM = 3;
+constexpr uint64_t WS_FLOOR = uint64_t(1024) * 1024 * 32 * 4; // 128 MiB
+
+// scheduler_metadata contains tiling and cumulative KV lengths. The forward VF masks by position.
+inline uint64_t TilingOffset(bool /*hasMask*/)
+{
+    return 0;
+}
+
+inline uint64_t MetadataBytes(bool /*hasMask*/)
+{
+    return sizeof(FAInferTilingData);
+}
+
+inline uint64_t KvSeqlenOffset(bool hasMask)
+{
+    return MetadataBytes(hasMask);
+}
+
+inline uint64_t KvSeqlenBytes(uint32_t batch)
+{
+    return (static_cast<uint64_t>(batch) + 1) * sizeof(int32_t);
+}
+
+inline uint64_t MetadataBytesWithKv(bool hasMask, uint32_t batch)
+{
+    return KvSeqlenOffset(hasMask) + KvSeqlenBytes(batch);
+}
+
+inline uint64_t Mm1OutSize(uint64_t blockDim)
+{
+    return blockDim * WORKSPACE_BLOCK_SIZE_DB * SIZE_OF_32BIT * PRELAUNCH_NUM;
+}
+
+inline uint64_t SmOnlineOutSize(uint64_t blockDim)
+{
+    return blockDim * WORKSPACE_BLOCK_SIZE_DB * SIZE_OF_16BIT * PRELAUNCH_NUM;
+}
+
+inline uint64_t Mm2OutSize(uint64_t blockDim)
+{
+    return blockDim * WORKSPACE_BLOCK_SIZE_DB * SIZE_OF_32BIT * PRELAUNCH_NUM;
+}
+
+inline uint64_t UpdateOutSize(uint64_t blockDim)
+{
+    return blockDim * WORKSPACE_BLOCK_SIZE_DB * SIZE_OF_32BIT * PRELAUNCH_NUM;
+}
+
+inline uint64_t WorkSpaceSize(uint64_t blockDim)
+{
+    return Mm1OutSize(blockDim) + SmOnlineOutSize(blockDim) + Mm2OutSize(blockDim) + UpdateOutSize(blockDim);
+}
+} // namespace fa_metadata
+
+struct FwdMaskDerivation {
+    bool is_causal;
+    bool is_local;
+    int64_t window_left;
+    int64_t window_right;
+    uint32_t maskType;
+};
+
+// Select the kernel from the requested window, independently of length bounds.
+// Metadata creation can know a tight per-sequence bound while its consumer
+// only knows total packed KV or padded page capacity. Folding finite windows
+// using those different bounds can select different mask categories. Keep
+// unlimited sides negative so an undersized bound cannot truncate them.
+inline FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right,
+                                       int64_t max_seqlen_q_bound, int64_t max_seqlen_k_bound)
+{
+    FwdMaskDerivation derived;
+    fa_window::NormalizeAttentionWindow(causal, max_seqlen_q_bound, max_seqlen_k_bound, window_left, window_right,
+                                        derived.is_causal, derived.is_local);
+    derived.window_left = window_left;
+    derived.window_right = window_right;
+    derived.maskType = derived.is_local ? 4u : (derived.is_causal ? 1u : 0u);
+    return derived;
+}
+
+// Private trailer for automatic, validated paged-SWA prefills. Public metadata
+// has its original layout and length and does not include this record.
+enum class PrefillLengthStatus : uint32_t { Valid, NegativeLength, OutsideStorage };
+struct PrefillLaunchInfo {
+    uint32_t qBanks;
+    uint32_t tasks;
+    PrefillLengthStatus status;
+};
+
+struct FAMetadataArgs {
+    uint64_t seqlensQAddr;
+    uint64_t cacheSeqlensAddr;
+    uint64_t metaOutAddr;
+    uint32_t batch;
+    uint32_t numHeads;
+    uint32_t numHeadsK;
+    uint32_t embeddingSize;
+    uint32_t embeddingSizeV;
+    uint32_t blockSize;
+    uint32_t maxQSeqlen;
+    uint32_t maskType;
+    int64_t windowSizeLeft;
+    int64_t windowSizeRight;
+    uint32_t blockDim;
+    uint32_t qCumulative;
+    uint32_t kvCumulative;
+    uint32_t pagedKV;
+    uint32_t quantMode;
+    uint32_t softcapActive; // 1 when the caller supplies softcap > 0 (disables the paired prefill wave)
+    uint64_t packedQueryRows; // nonzero only for internal automatic prefill
+    uint64_t pageCapacity;
+};
+
+#endif

@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "catlass-cppgen"
+dynamic = ["version"]
+description = "通过pylib框架构建CATLASS算子"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "ml-dtypes",
+    "numpy<2",
+    "torch",
+]
+
+[tool.setuptools]
+packages = [
+    "catlass_cppgen",
+    "catlass_cppgen.catlass",
+    "catlass_cppgen.catlass.arch",
+    "catlass_cppgen.catlass.evg",
+    "catlass_cppgen.catlass.gemm",
+    "catlass_cppgen.catlass.layout",
+    "catlass_cppgen.common",
+    "catlass_cppgen.kernel",
+    "catlass_cppgen.kernel.gemm",
+    "catlass_cppgen.kernel.group_gemm",
+    "catlass_cppgen.op",
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "catlass_cppgen._version.__version__"}
+
+[tool.setuptools.package-data]
+catlass_cppgen = ["py.typed"]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu" },
+]
+torchvision = [
+    { index = "pytorch-cpu" },
+]
+
+[[tool.uv.index]]
+url="https://pypi.tuna.tsinghua.edu.cn/simple"
+default=true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

@@ -1,0 +1,129 @@
+site_name: CATLASS
+site_description: 昇腾算子模板库文档
+site_url: !ENV READTHEDOCS_CANONICAL_URL
+repo_url: https://gitcode.com/cann/catlass
+repo_name: cann/catlass
+edit_uri: edit/master/docs/
+
+docs_dir: docs
+site_dir: site
+use_directory_urls: true
+
+theme:
+  name: material
+  language: zh
+  icon:
+    repo: fontawesome/brands/git-alt
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-7
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-4
+  features:
+    - content.action.edit
+    - content.code.annotate
+    - content.code.copy
+    - navigation.footer
+    - navigation.indexes
+    - navigation.sections
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.top
+    - search.highlight
+    - search.share
+    - search.suggest
+    - toc.follow
+
+plugins:
+  - search
+  - i18n:
+      docs_structure: folder
+      build_only_locale: !ENV [BUILD_ONLY_LOCALE]
+      fallback_to_default: false
+      reconfigure_material: true
+      reconfigure_search: true
+      languages:
+        - locale: zh
+          name: 简体中文
+          default: true
+          build: true
+          nav_translations:
+            0x new versions: 新版本能力
+            1 Practice: 开发实践
+            2 Design: 模块设计
+            3 API: API文档
+            Evaluation: 调测与分析
+            Others: 专题实践
+            01 kernel design: Kernel 设计
+            00 basics: 基础知识
+            02 tla: TLA
+            03 evg: EVG
+        - locale: en
+          name: English
+          build: true
+          site_description: CATLASS project documentation
+          nav_translations:
+            1 Practice: Practices
+            2 Design: Design
+            3 API: API
+            Evaluation: Evaluation
+            Others: Topics
+            01 kernel design: Kernel Design
+            00 basics: Basics
+            02 tla: TLA
+            03 evg: EVG
+
+hooks:
+  - mkdocs_hooks.py
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+extra_css:
+  - assets/stylesheets/ascend.css
+
+extra_javascript:
+  - assets/javascripts/readthedocs.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+
+extra:
+  source_branch: master
+
+copyright: Copyright &copy; CATLASS contributors

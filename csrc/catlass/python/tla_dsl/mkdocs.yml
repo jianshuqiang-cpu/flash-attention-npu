@@ -1,0 +1,54 @@
+site_name: TLA DSL Docs
+docs_dir: docs
+site_dir: site
+use_directory_urls: false
+
+theme:
+  name: material
+  language: zh
+  features:
+    - navigation.sections
+
+plugins:
+  - search
+  - i18n:
+      docs_structure: folder
+      languages:
+        - locale: zh
+          name: 简体中文
+          default: true
+        - locale: en
+          name: English
+
+nav:
+  - Overview: index.md
+  - Environment Variables: environment_variables.md
+  - Torch Tensor Binding: framework_integration.md
+  - Static & Dynamic Layout: dsl_dynamic_layout.md
+  - Kernel API Reference: kernel_api_reference.md
+  - Control Flow: control_flow.md
+  - DSL Syntax Constraints: dsl_python_syntax_guide.md
+  - BC Backend Integration: bc-backend-integration.md
+  - Developer Guide:
+      - Environment Setup:
+          - Choose a Setup Method: dev_guide/00_environment_setup.md
+          - Conda Installation: dev_guide/environment/conda.md
+          - Docker Installation: dev_guide/environment/docker.md
+      - Build and Test: dev_guide/01_build_and_test.md
+      - API Documentation: dev_guide/02_api_docs.md
+      - Advanced:
+          - Build AscendNPU-IR: dev_guide/advanced/ascend_npu_ir.md
+          - Manual CMake Build: dev_guide/advanced/manual_cmake_build.md
+
+markdown_extensions:
+  - toc:
+      permalink: true
+  - tables
+  - fenced_code
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+validation:
+  links:
+    not_found: ignore

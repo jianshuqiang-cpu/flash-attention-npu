@@ -1,0 +1,17 @@
+global-exclude .*
+prune .github
+prune .cache
+prune tests
+prune build
+prune ci
+prune benchmarks
+global-exclude __pycache__ *.py[cod]
+include flash_attn_npu_4/catlass_dsl/README.md
+recursive-include examples *.py
+
+include csrc/fag_tensor_strides.h
+
+recursive-include csrc/ascend910 *.h *.hpp *.cpp *.aicpu
+recursive-include csrc/ascend950 *.h *.hpp *.cpp *.aicpu
+recursive-include csrc/catlass/include *.h *.hpp *.cpp
+recursive-include csrc/catlass/tools/library *.h *.hpp *.cpp

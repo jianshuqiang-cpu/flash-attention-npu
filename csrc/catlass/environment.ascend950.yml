@@ -1,0 +1,9 @@
+---
+name: catlass-dev
+
+channels:
+  - ascend
+
+dependencies:
+  - ascend::cann-toolkit>=9.0.0
+  - ascend::cann-950-ops>=9.0.0

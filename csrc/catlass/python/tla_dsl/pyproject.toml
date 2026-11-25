@@ -1,0 +1,94 @@
+[build-system]
+requires = [
+  "setuptools>=68",
+  "wheel",
+  "cmake>=3.28,<4.0",
+  "ninja>=1.12",
+  "pybind11==2.13.6",
+  "setuptools-scm>=8"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ascend-catlass-dsl"
+description = "Ascend CATLASS DSL (Tla IR / Python catlass), nested under the CATLASS repository."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Ascend CATLASS DSL Contributors" }
+]
+dependencies = [
+  "numpy>=1.24,<3",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+docs = [
+  "mkdocs>=1.6.1",
+]
+
+# PEP 735 dependency groups. Install with:
+#   pip install --group cann       # CANN Python deps (base for on-board runtime)
+#   pip install --group runtime    # cann + project runtime deps
+#   pip install --group dev        # runtime + dev/test tooling
+# `--group` installs the listed deps WITHOUT installing the current package.
+[dependency-groups]
+# CANN Python base deps (standalone, unrelated to project runtime).
+cann = [
+  "attrs",
+  "cython",
+  "decorator",
+  "sympy",
+  "cffi",
+  "pyyaml",
+  "pathlib2",
+  "psutil",
+  "protobuf==3.20.0",
+  "scipy",
+  "requests",
+  "absl-py",
+]
+# Runtime: project runtime deps only.
+runtime = [
+  "numpy>=1.24,<3",
+]
+# Dev: runtime + dev/test tooling.
+dev = [
+  {include-group = "runtime"},
+  "pytest",
+  "ruff",
+  "black",
+  "mypy",
+]
+
+[tool.setuptools]
+packages = ["catlass"]
+
+[tool.setuptools_scm]
+write_to = "catlass/_version.py"
+fallback_version = "0.0.0"
+search_parent_directories = true
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.format]
+exclude = [
+  "catlass/_mlir_bindings/tla_ops_gen.py",
+  "catlass/_version.py",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"catlass/_mlir_bindings/tla_ops_gen.py" = ["E402", "E701", "F401"]
+"catlass/base_dsl/__init__.py" = ["F403"]
+# Pre-commit CI: suppress non-format lint (E402 after path bootstrap, re-export F401/F822,
+# latent F821, intentional unused DSL locals F841). Format is handled by ruff-format.
+"catlass/catlass_dsl/ascend_jit_executor.py" = ["F821"]
+"catlass/core_api.py" = ["E402", "F401", "F822"]
+"catlass/dsl.py" = ["E402"]
+"catlass/execution.py" = ["E402", "F401"]
+"catlass/runtime.py" = ["F401", "F822"]
+"catlass/types.py" = ["E402", "F822"]
+"catlass/tla/__init__.py" = ["F401"]
+"examples/**/*.py" = ["E402", "F401", "F722", "F841"]

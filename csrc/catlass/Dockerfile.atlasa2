@@ -1,0 +1,25 @@
+FROM swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:8.5.0-910b-ubuntu22.04-py3.11
+WORKDIR /opt
+RUN pip config --user set global.index https://mirrors.huaweicloud.com/repository/pypi && \
+    pip config --user set global.index-url https://mirrors.huaweicloud.com/repository/pypi/simple && \
+    pip config --user set global.trusted-host mirrors.huaweicloud.com
+RUN pip install --no-cache-dir \
+    absl-py \
+    attrs \
+    cffi \
+    cython \
+    decorator \
+    ml_dtypes \
+    'numpy>=1.19.2,<=1.24.0' \
+    pathlib2 \
+    protobuf==3.20.0 \
+    psutil \
+    pybind11 \
+    pyyaml \
+    requests \
+    scipy \
+    sympy \
+    torch==2.9.0 \
+    torch_npu==2.9.0
+RUN git clone https://gitcode.com/cann/catlass.git
+WORKDIR /opt/catlass

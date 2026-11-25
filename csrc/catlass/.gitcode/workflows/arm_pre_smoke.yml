@@ -1,0 +1,95 @@
+name: arm_pre_smoke
+
+on:
+  workflow_call:
+    inputs:
+      task_name:
+        required: true
+        type: string
+      image_version:
+        required: true
+        type: string
+
+jobs:
+  JOB_pre_smoke:
+    name: pre_smoke_catlass
+    steps:
+      -
+        name: Checkout
+        identifier: process_checkout
+        uses: checkout
+        with:
+          ref: ${{ atomgit.event.pull_request.merge_commit_sha || atomgit.sha }}
+          token: ${{secrets.GIT_TOKEN}}
+      -
+        name: Checkout gitcode
+        identifier: process_checkout_gitcode
+        uses: checkout
+        with:
+          repository: "https://gitcode.com/cann/.gitcode.git"
+          ref: master
+          path: "./ci"
+      -
+        name: download
+        uses: obs-download
+        with:
+          endpoint: "https://obs.cn-north-4.myhuaweicloud.com"
+          bucket: "ascend-cann-open"
+          access-key: ${{ secrets.AK }}
+          secret-key: ${{ secrets.SK }}
+          key: |
+            ${{ env.obs_path }}/pr_filelist.txt
+            ${{ env.obs_path }}/pr_filelist_mod.txt
+            ${{ env.obs_path }}/pre_smoke.sh
+          path: ${{ steps.process_checkout.outputs.path }}
+      -
+        name: tar businesscode
+        run: |
+          cd ${{ steps.process_checkout.outputs.path }}
+          tar -zcf ../pre_smoke_data.tar.gz .
+          mv ../pre_smoke_data.tar.gz ./
+      -
+        name: upload
+        identifier: process_upload
+        uses: obs-upload
+        with:
+          endpoint: "https://obs.cn-north-4.myhuaweicloud.com"
+          bucket: "ascend-cann-open"
+          access-key: ${{secrets.AK}}
+          secret-key: ${{secrets.SK}}
+          artifact-path: |
+            ${{ steps.process_checkout.outputs.path }}/pre_smoke_data.tar.gz
+          object-prefix: ${{ env.obs_pre_smoke_path }}/
+      -
+        name: pre_smoke_catlass
+        uses: manifest-management-plugin
+        with:
+          action: DEPLOY
+          repo: ${{ steps.process_checkout.outputs.path }}
+          file_path: ${{ steps.process_checkout.outputs.path }}/ci/smoke-conf/smoke-A2.yaml
+          manifest_image: swr.cn-north-4.myhuaweicloud.com/hw-ascend/${{ inputs.image_version }}
+          custom_shell_script: |-
+            set -e
+            # set env
+            export repo_name=${{env.repo_name}}
+            export pr_id=${{ env.MERGE_ID }}
+            export AK=${{secrets.AK}}
+            export SK=${{secrets.SK}}
+            export obs_smoke_path=${{ env.obs_smoke_path_A2 }}
+            export obs_path=${{ env.obs_path }}
+            whoami
+            pwd
+            mkdir -p ~/taskspace && cd ~/taskspace
+            wget -nv ${{ steps.process_upload.outputs.primary-url }}
+            tar -zxf $(basename "${{ steps.process_upload.outputs.primary-url }}")
+            sudo bash ~/taskspace/pre_smoke.sh
+      -
+        name: pre_smoke resource clean
+        uses: manifest-management-plugin
+        with:
+          action: CRUSH
+          repo: ${{ steps.process_checkout.outputs.path }}
+          file_path: ${{ steps.process_checkout.outputs.path }}/ci/smoke-conf/smoke-A2.yaml
+    if: "${{ default() }}"
+    runs-on: ['self-hosted','arch=arm','smoke=204']
+

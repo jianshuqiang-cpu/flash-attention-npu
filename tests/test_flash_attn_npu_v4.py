@@ -1,0 +1,1944 @@
+# Copyright (c) 2026, Minghua Shen.
+
+from torch._subclasses.fake_tensor import FakeTensorMode
+
+import os
+import torch
+import torch_npu
+import pytest
+from tests.common.attention_ref import cached_autograd_grads, ref_flash_attention_pair
+from tests.common.compare import assert_fa_close
+from tests.common.test_utils import (
+    gather_paged_kv_batch,
+    make_block_table,
+    make_cu_seqlens,
+    make_golden_attention_mask,
+    make_packed_random_tensor,
+    make_paged_kv_cache,
+    make_padded_varlen_mask,
+    pad_packed_tensor,
+    make_random_tensor,
+    make_varlen_seqlens,
+    make_varlen_seqlens_with_unused,
+)
+from flash_attn_npu_4 import (
+    flash_attn_combine,
+    flash_attn_func,
+    flash_attn_varlen_func,
+)
+
+
+def build_cann_causal_mask():
+    """Fixed [2048, 2048] causal mask for npu_fused_infer_attention_score."""
+    return torch.triu(torch.ones(2048, 2048), diagonal=1).bool().npu()
+
+
+# add_unused_qkv is the last column: TND head_size A groups use False and B groups use True plus a few classic specials
+# Single-option parameters: fixed values
+#   batch_size: [2]
+#   block_size: [128]
+# Two-option parameters
+#   data_type: [torch.float16, torch.bfloat16]
+#   is_causal: [False, True]
+#   add_unused_qkv: [False, True] (TND only)
+# Per-group variation: num_heads,kv_heads in {(6,6),(6,1),(6,3)} x head_size
+# x (q_seqlen,kv_seqlen) x window, with each column independently shuffled.
+# softcap (tanh) is a 16th column, carried explicitly by every row: 0.0 keeps
+# the plain softmax, 2.0 turns the softcap on. In the three modes the last two
+# rows of each 6-row group are the 2.0 rows; in the special group below the 2.0
+# rows are the split-KV / FlashDecode / boundary / empty-prefix ones.
+# Each mode has an independent parameter range (columns shuffled within groups):
+#   1) dense BSND (func-style)              cache_mode=0, layout=BSND, non-varlen, num_splits=0
+#        num_heads,kv_heads: A=[(6,6),(6,1),(6,3)] (shared by all three modes)
+#        head_size: A=[32,64], B=[128,192]
+#        (q_seqlen,kv_seqlen):
+#            A=[(1,128),(64,256),(3,799),(3,1024),(16,20000),(16,131072)]
+#            B=[(128,128),(1,339),(64,800),(64,2048),(1,131072),(16,4096)]
+#        (window_left,window_right): A=[(-1,-1),(512,0)], B=[(0,256),(542,647)]
+#   2) dense varlen TND (varlen-style, supports backward)
+#                                              cache_mode=0, layout=TND, varlen, num_splits=0
+#        head_size: A=[32,64], B=[128,192]
+#        (q_seqlen,kv_seqlen) (small set to avoid excessive packed-varlen size):
+#            A=[(1,128),(64,256),(3,799),(3,1024),(16,4096),(16,8192)]
+#            B=[(128,128),(1,339),(64,800),(64,2048),(16,2000),(16,4096)]
+#        (window_left,window_right): A=[(-1,-1),(512,0)], B=[(0,256),(542,647)]
+#   3) paged KV cache (matching Tri Dao test_flash_attn_kvcache scenarios)
+#                                              cache_mode=1, layout=TND, varlen, num_splits=1
+#        head_size（kvcache d-list [32,59,64,80,128,256]）: A=[32,59,64,80], B=[128,256]
+#        (q_seqlen,kv_seqlen) (including decode q=1 and long KV):
+#            A=[(1,128),(16,20000),(3,799),(16,131072),(3,1024),(64,256)]
+#            B=[(1,339),(1,131072),(128,128),(64,800),(64,2048),(16,4096)]
+#        (window_left,window_right) (NPU-specific):
+#            A=[(-1,-1),(0,256),(59,571),(460,62)], B=[(536,462),(563,425),(746,16)]
+# kv 131072 is kept only in a few rows per mode, other rows demoted to 16383 for CI time
+test_cases = [
+    # ================ 1) dense BSND (func): cache_mode=0, layout=BSND, non-varlen, num_splits=0 ================
+    # data_type=float16, is_causal=False, cache_mode=0, layout=BSND, is_varied=False, num_splits=0
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=A, (q_seqlen,kv_seqlen)=seqA, (window_left,window_right)=winA
+    (torch.float16, 2, 6, 6, 16, 20000, 64, 0, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.float16, 2, 6, 3, 3, 1024, 32, 0, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.float16, 2, 6, 3, 3, 799, 64, 0, 128, False, "BSND", False, 512, 0, 0, 0.0, False),
+    (torch.float16, 2, 6, 1, 64, 256, 32, 0, 128, False, "BSND", False, 512, 0, 0, 0.0, False),
+    (torch.float16, 2, 6, 6, 1, 128, 32, 0, 128, False, "BSND", False, 512, 0, 0, 2.0, False),
+    (torch.float16, 2, 6, 1, 16, 16383, 64, 0, 128, False, "BSND", False, -1, -1, 0, 2.0, False),
+    # data_type=float16, is_causal=True, cache_mode=0, layout=BSND, is_varied=False, num_splits=0
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=A, (q_seqlen,kv_seqlen)=seqA, (window_left,window_right)=winA
+    (torch.float16, 2, 6, 1, 3, 1024, 64, 0, 128, True, "BSND", False, 512, 0, 0, 0.0, False),
+    (torch.float16, 2, 6, 6, 3, 799, 64, 0, 128, True, "BSND", False, 512, 0, 0, 0.0, False),
+    (torch.float16, 2, 6, 1, 64, 256, 64, 0, 128, True, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.float16, 2, 6, 3, 16, 131072, 32, 0, 128, True, "BSND", False, 512, 0, 0, 0.0, False),
+    (torch.float16, 2, 6, 3, 1, 128, 32, 0, 128, True, "BSND", False, -1, -1, 0, 2.0, False),
+    (torch.float16, 2, 6, 6, 16, 20000, 32, 0, 128, True, "BSND", False, -1, -1, 0, 2.0, False),
+    # data_type=float16, is_causal=False, cache_mode=0, layout=BSND, is_varied=False, num_splits=0
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=B, (q_seqlen,kv_seqlen)=seqB, (window_left,window_right)=winB
+    (torch.float16, 2, 6, 6, 16, 4096, 128, 0, 128, False, "BSND", False, 0, 256, 0, 0.0, False),
+    (torch.float16, 2, 6, 3, 1, 339, 128, 0, 128, False, "BSND", False, 542, 647, 0, 0.0, False),
+    (torch.float16, 2, 6, 3, 1, 131072, 192, 0, 128, False, "BSND", False, 542, 647, 0, 0.0, False),
+    (torch.float16, 2, 6, 1, 64, 2048, 192, 0, 128, False, "BSND", False, 0, 256, 0, 0.0, False),
+    (torch.float16, 2, 6, 1, 64, 800, 128, 0, 128, False, "BSND", False, 542, 647, 0, 2.0, False),
+    (torch.float16, 2, 6, 6, 128, 128, 192, 0, 128, False, "BSND", False, 0, 256, 0, 2.0, False),
+    # data_type=float16, is_causal=True, cache_mode=0, layout=BSND, is_varied=False, num_splits=0
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=B, (q_seqlen,kv_seqlen)=seqB, (window_left,window_right)=winB
+    (torch.float16, 2, 6, 1, 128, 128, 192, 0, 128, True, "BSND", False, 542, 647, 0, 0.0, False),
+    (torch.float16, 2, 6, 6, 64, 2048, 192, 0, 128, True, "BSND", False, 0, 256, 0, 0.0, False),
+    (torch.float16, 2, 6, 3, 16, 4096, 128, 0, 128, True, "BSND", False, 0, 256, 0, 0.0, False),
+    (torch.float16, 2, 6, 6, 1, 339, 192, 0, 128, True, "BSND", False, 542, 647, 0, 0.0, False),
+    (torch.float16, 2, 6, 1, 1, 16383, 128, 0, 128, True, "BSND", False, 542, 647, 0, 2.0, False),
+    (torch.float16, 2, 6, 3, 64, 800, 128, 0, 128, True, "BSND", False, 0, 256, 0, 2.0, False),
+    # data_type=bfloat16, is_causal=False, cache_mode=0, layout=BSND, is_varied=False, num_splits=0
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=A, (q_seqlen,kv_seqlen)=seqA, (window_left,window_right)=winA
+    (torch.bfloat16, 2, 6, 6, 1, 128, 32, 0, 128, False, "BSND", False, 512, 0, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 3, 64, 256, 64, 0, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 3, 3, 1024, 64, 0, 128, False, "BSND", False, 512, 0, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 1, 16, 16383, 32, 0, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 6, 16, 20000, 64, 0, 128, False, "BSND", False, 512, 0, 0, 2.0, False),
+    (torch.bfloat16, 2, 6, 1, 3, 799, 32, 0, 128, False, "BSND", False, -1, -1, 0, 2.0, False),
+    # data_type=bfloat16, is_causal=True, cache_mode=0, layout=BSND, is_varied=False, num_splits=0
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=A, (q_seqlen,kv_seqlen)=seqA, (window_left,window_right)=winA
+    (torch.bfloat16, 2, 6, 6, 1, 128, 32, 0, 128, True, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 3, 16, 16383, 64, 0, 128, True, "BSND", False, 512, 0, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 1, 16, 20000, 64, 0, 128, True, "BSND", False, 512, 0, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 1, 64, 256, 32, 0, 128, True, "BSND", False, 512, 0, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 3, 3, 1024, 64, 0, 128, True, "BSND", False, -1, -1, 0, 2.0, False),
+    (torch.bfloat16, 2, 6, 6, 3, 799, 32, 0, 128, True, "BSND", False, -1, -1, 0, 2.0, False),
+    # data_type=bfloat16, is_causal=False, cache_mode=0, layout=BSND, is_varied=False, num_splits=0
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=B, (q_seqlen,kv_seqlen)=seqB, (window_left,window_right)=winB
+    (torch.bfloat16, 2, 6, 1, 16, 4096, 128, 0, 128, False, "BSND", False, 0, 256, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 3, 1, 339, 128, 0, 128, False, "BSND", False, 0, 256, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 3, 128, 128, 192, 0, 128, False, "BSND", False, 542, 647, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 1, 64, 800, 192, 0, 128, False, "BSND", False, 542, 647, 0, 0.0, False),
+    (
+        torch.bfloat16,
+        2,
+        6,
+        6,
+        1,
+        131072,
+        128,
+        0,
+        128,
+        False,
+        "BSND",
+        False,
+        542,
+        647,
+        0,
+        2.0,
+        False,
+    ),
+    (torch.bfloat16, 2, 6, 6, 64, 2048, 192, 0, 128, False, "BSND", False, 0, 256, 0, 2.0, False),
+    # data_type=bfloat16, is_causal=True, cache_mode=0, layout=BSND, is_varied=False, num_splits=0
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=B, (q_seqlen,kv_seqlen)=seqB, (window_left,window_right)=winB
+    (torch.bfloat16, 2, 6, 6, 1, 16383, 128, 0, 128, True, "BSND", False, 542, 647, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 6, 128, 128, 192, 0, 128, True, "BSND", False, 542, 647, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 3, 64, 2048, 128, 0, 128, True, "BSND", False, 0, 256, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 1, 1, 339, 192, 0, 128, True, "BSND", False, 0, 256, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 3, 64, 800, 192, 0, 128, True, "BSND", False, 0, 256, 0, 2.0, False),
+    (torch.bfloat16, 2, 6, 1, 16, 4096, 128, 0, 128, True, "BSND", False, 542, 647, 0, 2.0, False),
+    # ================ 2) dense varlen TND (varlen, only bwd): cache_mode=0, layout=TND, varlen, num_splits=0 ================
+    # data_type=float16, is_causal=False, cache_mode=0, layout=TND, is_varied=True, num_splits=0
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=A, (q_seqlen,kv_seqlen)=seqA, (window_left,window_right)=winA
+    (torch.float16, 2, 6, 3, 3, 799, 32, 0, 128, False, "TND", True, 512, 0, 0, 0.0, False),
+    (torch.float16, 2, 6, 3, 16, 8192, 64, 0, 128, False, "TND", True, -1, -1, 0, 0.0, False),
+    (torch.float16, 2, 6, 1, 3, 1024, 64, 0, 128, False, "TND", True, 512, 0, 0, 0.0, False),
+    (torch.float16, 2, 6, 6, 1, 128, 32, 0, 128, False, "TND", True, -1, -1, 0, 0.0, False),
+    (torch.float16, 2, 6, 1, 16, 4096, 64, 0, 128, False, "TND", True, 512, 0, 0, 2.0, False),
+    (torch.float16, 2, 6, 6, 64, 256, 32, 0, 128, False, "TND", True, -1, -1, 0, 2.0, False),
+    # data_type=float16, is_causal=True, cache_mode=0, layout=TND, is_varied=True, num_splits=0
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=A, (q_seqlen,kv_seqlen)=seqA, (window_left,window_right)=winA
+    (torch.float16, 2, 6, 6, 3, 799, 32, 0, 128, True, "TND", True, 512, 0, 0, 0.0, False),
+    (torch.float16, 2, 6, 3, 1, 128, 32, 0, 128, True, "TND", True, 512, 0, 0, 0.0, False),
+    (torch.float16, 2, 6, 6, 16, 4096, 64, 0, 128, True, "TND", True, 512, 0, 0, 0.0, False),
+    (torch.float16, 2, 6, 3, 16, 8192, 64, 0, 128, True, "TND", True, -1, -1, 0, 0.0, False),
+    (torch.float16, 2, 6, 1, 3, 1024, 32, 0, 128, True, "TND", True, -1, -1, 0, 2.0, False),
+    (torch.float16, 2, 6, 1, 64, 256, 64, 0, 128, True, "TND", True, -1, -1, 0, 2.0, False),
+    # data_type=float16, is_causal=False, cache_mode=0, layout=TND, is_varied=True, num_splits=0
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=B, (q_seqlen,kv_seqlen)=seqB, (window_left,window_right)=winB
+    (torch.float16, 2, 6, 1, 64, 800, 128, 0, 128, False, "TND", True, 0, 256, 0, 0.0, True),
+    (torch.float16, 2, 6, 6, 16, 2000, 192, 0, 128, False, "TND", True, 542, 647, 0, 0.0, True),
+    (torch.float16, 2, 6, 3, 1, 339, 192, 0, 128, False, "TND", True, 0, 256, 0, 0.0, True),
+    (torch.float16, 2, 6, 3, 64, 2048, 192, 0, 128, False, "TND", True, 542, 647, 0, 0.0, True),
+    (torch.float16, 2, 6, 6, 16, 4096, 128, 0, 128, False, "TND", True, 542, 647, 0, 2.0, True),
+    (torch.float16, 2, 6, 1, 128, 128, 128, 0, 128, False, "TND", True, 0, 256, 0, 2.0, True),
+    # data_type=float16, is_causal=True, cache_mode=0, layout=TND, is_varied=True, num_splits=0
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=B, (q_seqlen,kv_seqlen)=seqB, (window_left,window_right)=winB
+    (torch.float16, 2, 6, 3, 1, 339, 192, 0, 128, True, "TND", True, 0, 256, 0, 0.0, True),
+    (torch.float16, 2, 6, 6, 16, 2000, 192, 0, 128, True, "TND", True, 542, 647, 0, 0.0, True),
+    (torch.float16, 2, 6, 3, 64, 2048, 128, 0, 128, True, "TND", True, 0, 256, 0, 0.0, True),
+    (torch.float16, 2, 6, 1, 64, 800, 128, 0, 128, True, "TND", True, 542, 647, 0, 0.0, True),
+    (torch.float16, 2, 6, 1, 16, 4096, 192, 0, 128, True, "TND", True, 542, 647, 0, 2.0, True),
+    (torch.float16, 2, 6, 6, 128, 128, 128, 0, 128, True, "TND", True, 0, 256, 0, 2.0, True),
+    # data_type=bfloat16, is_causal=False, cache_mode=0, layout=TND, is_varied=True, num_splits=0
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=A, (q_seqlen,kv_seqlen)=seqA, (window_left,window_right)=winA
+    (torch.bfloat16, 2, 6, 1, 1, 128, 64, 0, 128, False, "TND", True, 512, 0, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 1, 64, 256, 32, 0, 128, False, "TND", True, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 6, 16, 8192, 64, 0, 128, False, "TND", True, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 3, 3, 799, 32, 0, 128, False, "TND", True, 512, 0, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 3, 3, 1024, 32, 0, 128, False, "TND", True, -1, -1, 0, 2.0, False),
+    (torch.bfloat16, 2, 6, 6, 16, 4096, 64, 0, 128, False, "TND", True, 512, 0, 0, 2.0, False),
+    # data_type=bfloat16, is_causal=True, cache_mode=0, layout=TND, is_varied=True, num_splits=0
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=A, (q_seqlen,kv_seqlen)=seqA, (window_left,window_right)=winA
+    (torch.bfloat16, 2, 6, 1, 16, 4096, 64, 0, 128, True, "TND", True, 512, 0, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 6, 64, 256, 32, 0, 128, True, "TND", True, 512, 0, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 3, 1, 128, 32, 0, 128, True, "TND", True, 512, 0, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 6, 3, 1024, 64, 0, 128, True, "TND", True, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 1, 3, 799, 64, 0, 128, True, "TND", True, -1, -1, 0, 2.0, False),
+    (torch.bfloat16, 2, 6, 3, 16, 8192, 32, 0, 128, True, "TND", True, -1, -1, 0, 2.0, False),
+    # data_type=bfloat16, is_causal=False, cache_mode=0, layout=TND, is_varied=True, num_splits=0
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=B, (q_seqlen,kv_seqlen)=seqB, (window_left,window_right)=winB
+    (torch.bfloat16, 2, 6, 1, 1, 339, 192, 0, 128, False, "TND", True, 542, 647, 0, 0.0, True),
+    (torch.bfloat16, 2, 6, 6, 64, 2048, 128, 0, 128, False, "TND", True, 0, 256, 0, 0.0, True),
+    (torch.bfloat16, 2, 6, 3, 128, 128, 192, 0, 128, False, "TND", True, 0, 256, 0, 0.0, True),
+    (torch.bfloat16, 2, 6, 1, 16, 2000, 128, 0, 128, False, "TND", True, 0, 256, 0, 0.0, True),
+    (torch.bfloat16, 2, 6, 6, 64, 800, 128, 0, 128, False, "TND", True, 542, 647, 0, 2.0, True),
+    (torch.bfloat16, 2, 6, 3, 16, 4096, 192, 0, 128, False, "TND", True, 542, 647, 0, 2.0, True),
+    # data_type=bfloat16, is_causal=True, cache_mode=0, layout=TND, is_varied=True, num_splits=0
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=B, (q_seqlen,kv_seqlen)=seqB, (window_left,window_right)=winB
+    (torch.bfloat16, 2, 6, 6, 128, 128, 192, 0, 128, True, "TND", True, 542, 647, 0, 0.0, True),
+    (torch.bfloat16, 2, 6, 3, 16, 4096, 128, 0, 128, True, "TND", True, 0, 256, 0, 0.0, True),
+    (torch.bfloat16, 2, 6, 1, 1, 339, 192, 0, 128, True, "TND", True, 542, 647, 0, 0.0, True),
+    (torch.bfloat16, 2, 6, 6, 16, 2000, 192, 0, 128, True, "TND", True, 0, 256, 0, 0.0, True),
+    (torch.bfloat16, 2, 6, 1, 64, 2048, 128, 0, 128, True, "TND", True, 0, 256, 0, 2.0, True),
+    (torch.bfloat16, 2, 6, 3, 64, 800, 128, 0, 128, True, "TND", True, 542, 647, 0, 2.0, True),
+    # ================ 3) paged KV cache (TriDao kvcache): cache_mode=1, layout=TND, varlen, num_splits=1 ================
+    # data_type=float16, is_causal=False, cache_mode=1, layout=TND, is_varied=True, num_splits=1
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=A, (q_seqlen,kv_seqlen)=seqA, (window_left,window_right)=winA
+    (torch.float16, 2, 6, 1, 16, 16383, 64, 1, 128, False, "TND", True, -1, -1, 1, 0.0, False),
+    (torch.float16, 2, 6, 6, 64, 256, 32, 1, 128, False, "TND", True, 59, 571, 1, 0.0, False),
+    (torch.float16, 2, 6, 3, 3, 799, 59, 1, 128, False, "TND", True, 460, 62, 1, 0.0, False),
+    (torch.float16, 2, 6, 1, 1, 128, 80, 1, 128, False, "TND", True, -1, -1, 1, 0.0, False),
+    (torch.float16, 2, 6, 3, 3, 1024, 32, 1, 128, False, "TND", True, 0, 256, 1, 2.0, False),
+    # Known unresolved issue: kv=20000 + window=(0,256) + paged TND triggers
+    # kernel NaNs (formerly data_type101/103). Trigger: non-causal,
+    # window_left=0, and long KV (kv around 19980). Middle output rows become
+    # NaN while LSE remains valid. Temporarily disabled pending kernel analysis.
+    # (torch.float16, 2, 6, 6, 16, 20000, 59, 1, 128, False, "TND", True, 0, 256, 1),
+    # data_type=float16, is_causal=True, cache_mode=1, layout=TND, is_varied=True, num_splits=1
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=A, (q_seqlen,kv_seqlen)=seqA, (window_left,window_right)=winA
+    (torch.float16, 2, 6, 1, 1, 128, 32, 1, 128, True, "TND", True, 460, 62, 1, 0.0, False),
+    # (torch.float16, 2, 6, 6, 16, 20000, 59, 1, 128, True, "TND", True, 0, 256, 1),
+    (torch.float16, 2, 6, 6, 16, 131072, 32, 1, 128, True, "TND", True, 59, 571, 1, 0.0, False),
+    (torch.float16, 2, 6, 3, 3, 799, 80, 1, 128, True, "TND", True, -1, -1, 1, 0.0, False),
+    (torch.float16, 2, 6, 3, 3, 1024, 64, 1, 128, True, "TND", True, -1, -1, 1, 0.0, False),
+    (torch.float16, 2, 6, 1, 64, 256, 59, 1, 128, True, "TND", True, 0, 256, 1, 2.0, False),
+    # data_type=float16, is_causal=False, cache_mode=1, layout=TND, is_varied=True, num_splits=1
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=B, (q_seqlen,kv_seqlen)=seqB, (window_left,window_right)=winB
+    (torch.float16, 2, 6, 6, 64, 2048, 256, 1, 128, False, "TND", True, 536, 462, 1, 0.0, True),
+    (torch.float16, 2, 6, 3, 16, 4096, 256, 1, 128, False, "TND", True, 563, 425, 1, 0.0, True),
+    (torch.float16, 2, 6, 3, 128, 128, 128, 1, 128, False, "TND", True, 563, 425, 1, 0.0, True),
+    (torch.float16, 2, 6, 6, 64, 800, 256, 1, 128, False, "TND", True, 746, 16, 1, 0.0, True),
+    (torch.float16, 2, 6, 1, 1, 16383, 128, 1, 128, False, "TND", True, 536, 462, 1, 0.0, True),
+    (torch.float16, 2, 6, 1, 1, 339, 128, 1, 128, False, "TND", True, 746, 16, 1, 2.0, True),
+    # data_type=float16, is_causal=True, cache_mode=1, layout=TND, is_varied=True, num_splits=1
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=B, (q_seqlen,kv_seqlen)=seqB, (window_left,window_right)=winB
+    (torch.float16, 2, 6, 1, 1, 339, 128, 1, 128, True, "TND", True, 536, 462, 1, 0.0, True),
+    (torch.float16, 2, 6, 1, 1, 131072, 256, 1, 128, True, "TND", True, 563, 425, 1, 0.0, True),
+    (torch.float16, 2, 6, 6, 64, 800, 256, 1, 128, True, "TND", True, 746, 16, 1, 0.0, True),
+    (torch.float16, 2, 6, 3, 64, 2048, 128, 1, 128, True, "TND", True, 536, 462, 1, 0.0, True),
+    (torch.float16, 2, 6, 3, 128, 128, 128, 1, 128, True, "TND", True, 746, 16, 1, 0.0, True),
+    (torch.float16, 2, 6, 6, 16, 4096, 256, 1, 128, True, "TND", True, 563, 425, 1, 2.0, True),
+    # data_type=bfloat16, is_causal=False, cache_mode=1, layout=TND, is_varied=True, num_splits=1
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=A, (q_seqlen,kv_seqlen)=seqA, (window_left,window_right)=winA
+    (torch.bfloat16, 2, 6, 6, 16, 20000, 64, 1, 128, False, "TND", True, -1, -1, 1, 0.0, False),
+    (torch.bfloat16, 2, 6, 3, 1, 128, 80, 1, 128, False, "TND", True, 0, 256, 1, 0.0, False),
+    (torch.bfloat16, 2, 6, 1, 3, 1024, 32, 1, 128, False, "TND", True, 59, 571, 1, 0.0, False),
+    (torch.bfloat16, 2, 6, 3, 16, 16383, 32, 1, 128, False, "TND", True, 460, 62, 1, 0.0, False),
+    (torch.bfloat16, 2, 6, 1, 3, 799, 59, 1, 128, False, "TND", True, 0, 256, 1, 0.0, False),
+    (torch.bfloat16, 2, 6, 6, 64, 256, 59, 1, 128, False, "TND", True, -1, -1, 1, 2.0, False),
+    # data_type=bfloat16, is_causal=True, cache_mode=1, layout=TND, is_varied=True, num_splits=1
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=A, (q_seqlen,kv_seqlen)=seqA, (window_left,window_right)=winA
+    (torch.bfloat16, 2, 6, 6, 3, 1024, 59, 1, 128, True, "TND", True, 0, 256, 1, 0.0, False),
+    (torch.bfloat16, 2, 6, 1, 16, 20000, 32, 1, 128, True, "TND", True, 460, 62, 1, 0.0, False),
+    (torch.bfloat16, 2, 6, 6, 1, 128, 59, 1, 128, True, "TND", True, 59, 571, 1, 0.0, False),
+    (torch.bfloat16, 2, 6, 3, 3, 799, 32, 1, 128, True, "TND", True, 0, 256, 1, 0.0, False),
+    (torch.bfloat16, 2, 6, 3, 64, 256, 64, 1, 128, True, "TND", True, -1, -1, 1, 0.0, False),
+    (torch.bfloat16, 2, 6, 1, 16, 16383, 80, 1, 128, True, "TND", True, -1, -1, 1, 2.0, False),
+    # data_type=bfloat16, is_causal=False, cache_mode=1, layout=TND, is_varied=True, num_splits=1
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=B, (q_seqlen,kv_seqlen)=seqB, (window_left,window_right)=winB
+    (torch.bfloat16, 2, 6, 6, 64, 800, 256, 1, 128, False, "TND", True, 536, 462, 1, 0.0, True),
+    (torch.bfloat16, 2, 6, 1, 1, 131072, 256, 1, 128, False, "TND", True, 536, 462, 1, 0.0, True),
+    (torch.bfloat16, 2, 6, 1, 1, 339, 128, 1, 128, False, "TND", True, 563, 425, 1, 0.0, True),
+    (torch.bfloat16, 2, 6, 3, 64, 2048, 128, 1, 128, False, "TND", True, 746, 16, 1, 0.0, True),
+    (torch.bfloat16, 2, 6, 3, 16, 4096, 256, 1, 128, False, "TND", True, 746, 16, 1, 0.0, True),
+    (torch.bfloat16, 2, 6, 6, 128, 128, 128, 1, 128, False, "TND", True, 563, 425, 1, 2.0, True),
+    # data_type=bfloat16, is_causal=True, cache_mode=1, layout=TND, is_varied=True, num_splits=1
+    #   num_heads,kv_heads in {(6,6),(6,1),(6,3)}, head_size=B, (q_seqlen,kv_seqlen)=seqB, (window_left,window_right)=winB
+    (torch.bfloat16, 2, 6, 3, 64, 800, 128, 1, 128, True, "TND", True, 536, 462, 1, 0.0, True),
+    (torch.bfloat16, 2, 6, 1, 16, 4096, 128, 1, 128, True, "TND", True, 563, 425, 1, 0.0, True),
+    (torch.bfloat16, 2, 6, 6, 128, 128, 256, 1, 128, True, "TND", True, 536, 462, 1, 0.0, True),
+    (torch.bfloat16, 2, 6, 3, 1, 339, 256, 1, 128, True, "TND", True, 563, 425, 1, 0.0, True),
+    (torch.bfloat16, 2, 6, 6, 1, 16383, 128, 1, 128, True, "TND", True, 746, 16, 1, 0.0, True),
+    (torch.bfloat16, 2, 6, 1, 64, 2048, 256, 1, 128, True, "TND", True, 746, 16, 1, 2.0, True),
+    # ========== Special cases: tiny head_size, large-GQA decode, num_splits=2, and special SWA windows ==========
+    (torch.bfloat16, 2, 4, 2, 513, 129, 160, 0, 128, False, "TND", True, 127, 864, 1, 2.0, True),
+    # Flash Decode with the maximum supported head dim. These cases keep the
+    # default scheduler behavior and exercise the host FD decision directly.
+    (torch.bfloat16, 1, 1, 1, 1, 4096, 256, 1, 128, False, "TND", True, -1, -1, 0, 2.0, True),
+    (torch.float16, 1, 8, 1, 16, 4096, 256, 1, 128, True, "TND", True, -1, -1, 1, 0.0, False),
+    (torch.bfloat16, 1, 8, 1, 1, 4096, 256, 1, 128, False, "TND", True, -1, -1, 2, 2.0, False),
+    (torch.bfloat16, 2, 6, 6, 256, 512, 1, 0, 128, True, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 6, 256, 512, 2, 0, 128, True, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 6, 256, 512, 4, 0, 128, True, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 2, 64, 8, 1, 2048, 128, 1, 128, True, "TND", True, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 2, 128, 16, 1, 2048, 128, 1, 128, True, "TND", True, -1, -1, 0, 0.0, False),
+    (torch.float16, 2, 512, 1, 1, 1024, 128, 1, 128, True, "TND", True, -1, -1, 0, 0.0, False),
+    # fp16 paged TND, B1 H96x2 Sq4 Sk8191 D1 causal ns0
+    (torch.float16, 1, 96, 2, 4, 8191, 1, 1, 128, True, "TND", False, -1, -1, 0, 0.0, False),
+    # Active FD with the same Q-head merge policy as normal FA.
+    # Full merged block: group_size=8, qNBlockTile=8.
+    (torch.bfloat16, 1, 8, 1, 4, 4096, 64, 1, 128, False, "TND", False, -1, -1, 4, 2.0, False),
+    # Tail merged block: group_size=5, qNBlockTile=4, block sizes are 4 and 1.
+    (torch.float16, 1, 10, 2, 3, 4096, 192, 1, 128, False, "TND", False, -1, -1, 3, 0.0, False),
+    # Non-16-aligned head dim exercises packed Partial O DMA.
+    (torch.float16, 1, 6, 1, 3, 4096, 59, 1, 128, False, "TND", False, -1, -1, 4, 0.0, False),
+    # Maximum merged-M tile: q_seqlen=16 * 8 Q heads = 128 rows.
+    (torch.bfloat16, 1, 8, 1, 16, 4096, 64, 1, 128, False, "TND", False, -1, -1, 4, 0.0, False),
+    # Auto-split FD with Q-head merging and causal masking.
+    (torch.float16, 1, 8, 1, 1, 4096, 128, 1, 128, True, "TND", False, -1, -1, 0, 0.0, False),
+    # q_seqlen is outside the FD gate, so explicit splits fall back to normal FA.
+    (torch.bfloat16, 2, 6, 6, 1024, 1024, 128, 1, 128, True, "TND", True, -1, -1, 2, 0.0, False),
+    (torch.float16, 2, 6, 6, 1024, 2048, 128, 1, 128, False, "TND", True, -1, -1, 2, 2.0, False),
+    (torch.float16, 2, 6, 6, 512, 1024, 128, 0, 128, True, "BSND", False, 826, 973, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 6, 512, 512, 128, 0, 128, True, "BSND", False, 127, 0, 0, 0.0, False),
+    (torch.float16, 2, 6, 6, 512, 512, 128, 0, 128, False, "BSND", False, 65, 412, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 6, 256, 512, 128, 0, 128, False, "BSND", False, 59, 571, 0, 0.0, False),
+    (torch.float16, 2, 6, 6, 512, 1024, 128, 1, 128, True, "TND", True, 746, 16, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 6, 1024, 1024, 128, 1, 128, True, "TND", True, 512, 0, 0, 0.0, False),
+    (
+        torch.bfloat16,
+        2,
+        6,
+        6,
+        512,
+        512,
+        128,
+        1,
+        128,
+        False,
+        "BSND",
+        False,
+        508,
+        -256,
+        0,
+        0.0,
+        False,
+    ),
+    (torch.bfloat16, 1, 13, 1, 17, 1, 1, 1, 128, False, "BSND", False, 0, 0, 0, 2.0, False),
+    (torch.float16, 2, 6, 6, 512, 512, 128, 1, 128, True, "BSND", False, -128, 864, 0, 0.0, False),
+    # SWA Sq>>Sk (empty-prefix / neg-empty / overlong-wR).
+    (torch.bfloat16, 4, 1, 1, 512, 32, 16, 0, 128, False, "BSND", False, 8, -1, 0, 0.0, False),
+    (torch.bfloat16, 4, 1, 1, 512, 32, 16, 1, 128, False, "TND", False, 8, -1, 0, 0.0, False),
+    (torch.bfloat16, 1, 8, 8, 64, 1, 64, 0, 128, False, "BSND", False, 0, -1, 0, 0.0, False),
+    (torch.float16, 2, 8, 8, 255, 64, 128, 0, 128, False, "BSND", False, 23, -1, 0, 0.0, False),
+    (torch.float16, 2, 8, 8, 255, 64, 128, 1, 128, False, "TND", False, 23, -1, 0, 0.0, False),
+    # 2) negative right window with empty prefix (EndLen<=0)
+    (torch.bfloat16, 1, 8, 4, 512, 7, 16, 0, 128, False, "BSND", False, 3, -3, 0, 0.0, False),
+    (torch.bfloat16, 1, 8, 4, 512, 7, 16, 1, 128, False, "TND", False, 3, -3, 0, 0.0, False),
+    # 3) overlong wR (>=Sk collapses to infinite, then to Sk)
+    (torch.bfloat16, 2, 4, 2, 1024, 1, 16, 0, 128, False, "BSND", False, 0, 2, 0, 0.0, False),
+    (torch.bfloat16, 2, 4, 2, 1024, 1, 16, 1, 128, False, "TND", False, 0, 2, 0, 0.0, False),
+    # 4) GQA + medium Sq>>Sk
+    (torch.bfloat16, 2, 16, 4, 256, 8, 32, 0, 128, False, "BSND", False, 4, -1, 0, 0.0, False),
+    (torch.float16, 2, 16, 4, 256, 8, 32, 1, 128, False, "TND", False, 4, -1, 0, 0.0, False),
+    # 5) Sk>>Sq left-infinite band (complement; no empty prefix)
+    (torch.bfloat16, 1, 4, 4, 7, 2048, 64, 0, 128, False, "BSND", False, -1, 100, 0, 0.0, False),
+    (torch.bfloat16, 1, 4, 4, 7, 2048, 64, 1, 128, False, "TND", False, -1, 100, 0, 0.0, False),
+    # Normal paged+BSND: dtype, causal, heads, odd Sq, unaligned D, and batch crossings.
+    (torch.float16, 1, 8, 4, 1, 2048, 32, 1, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 3, 6, 2, 3, 1024, 59, 1, 128, True, "BSND", False, -1, -1, 1, 0.0, False),
+    (torch.float16, 5, 4, 4, 16, 4096, 64, 1, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 7, 8, 1, 64, 2048, 80, 1, 128, True, "BSND", False, -1, -1, 1, 0.0, False),
+    (torch.float16, 2, 16, 2, 128, 512, 128, 1, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 4, 32, 4, 513, 1024, 192, 1, 128, True, "BSND", False, -1, -1, 1, 0.0, False),
+    (torch.float16, 1, 6, 6, 7, 799, 256, 1, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 3, 10, 2, 11, 2048, 128, 1, 128, True, "BSND", False, -1, -1, 1, 0.0, False),
+    (torch.float16, 5, 14, 2, 13, 4096, 64, 1, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 7, 18, 2, 15, 2048, 128, 1, 128, True, "BSND", False, -1, -1, 1, 0.0, False),
+    (torch.float16, 8, 64, 8, 32, 1024, 101, 1, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 16, 8, 8, 16, 64, 35, 1, 128, True, "BSND", False, -1, -1, 1, 0.0, False),
+    # Dense BSND/TND boundary tails and large-batch scheduling.
+    (torch.bfloat16, 1, 4, 2, 127, 511, 128, 0, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.float16, 3, 6, 2, 129, 513, 64, 0, 128, True, "TND", True, -1, -1, 1, 2.0, False),
+    (torch.float16, 3, 6, 2, 129, 513, 64, 0, 128, True, "TND", True, -1, -1, 1, 2.0, True),
+    (torch.bfloat16, 5, 8, 2, 65, 2048, 192, 1, 128, False, "TND", True, -1, -1, 1, 0.0, False),
+    (torch.float16, 7, 4, 4, 513, 1024, 59, 0, 128, True, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 8, 64, 8, 11, 4096, 101, 0, 128, False, "TND", True, -1, -1, 1, 0.0, True),
+    (torch.float16, 16, 8, 8, 16, 1024, 201, 1, 128, True, "TND", True, -1, -1, 1, 0.0, False),
+    # 910-only active split-KV: odd Q, Sq/Sk asymmetry, and aligned/unaligned D.
+    (torch.bfloat16, 1, 8, 2, 1, 1024, 35, 1, 128, False, "TND", True, -1, -1, 2, 0.0, False),
+    (torch.float16, 2, 16, 2, 3, 2048, 64, 1, 128, True, "TND", True, -1, -1, 2, 0.0, False),
+    (torch.bfloat16, 3, 32, 4, 16, 4096, 101, 1, 128, False, "TND", True, -1, -1, 2, 0.0, False),
+    (torch.float16, 1, 8, 2, 65, 2048, 128, 1, 128, True, "TND", True, -1, -1, 2, 0.0, False),
+    (torch.float16, 1, 32, 8, 513, 1024, 256, 1, 128, True, "TND", True, -1, -1, 2, 0.0, False),
+    # 127/129 and 511/513 boundaries across dense BSND and varied TND.
+    (torch.float16, 3, 10, 2, 127, 129, 35, 0, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 5, 24, 4, 129, 127, 59, 1, 128, True, "BSND", False, -1, -1, 1, 0.0, False),
+    (torch.float16, 7, 40, 8, 511, 513, 101, 0, 128, True, "TND", True, -1, -1, 0, 0.0, False),
+    (torch.float16, 7, 40, 8, 511, 513, 101, 0, 128, True, "TND", True, -1, -1, 0, 0.0, True),
+    (torch.bfloat16, 8, 48, 4, 513, 511, 111, 1, 128, False, "TND", True, -1, -1, 1, 2.0, False),
+    # 8K KV MQA/GQA dtype symmetry.
+    (torch.float16, 3, 5, 1, 15, 8192, 151, 0, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 4, 10, 1, 65, 8192, 201, 1, 128, True, "TND", True, -1, -1, 1, 0.0, False),
+    # Paged+TND split-KV at 129/513 and 513/1023 boundaries.
+    (torch.bfloat16, 1, 40, 8, 513, 1023, 256, 1, 128, True, "TND", True, -1, -1, 2, 0.0, False),
+    # Tiny D=1/2 with large non-default batches and MHA/GQA.
+    (torch.float16, 16, 6, 3, 32, 64, 1, 0, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 32, 4, 4, 7, 2048, 2, 1, 128, False, "BSND", False, -1, -1, 1, 0.0, False),
+    # Generator maximum batch tier with the smallest dense tensor footprint.
+    (torch.float16, 256, 1, 1, 1, 1, 1, 0, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
+    # GQA empty-prefix O-clear (causal window=(0,0), two O tiles)
+    (torch.float16, 9, 86, 1, 9, 1, 172, 0, 128, True, "BSND", False, 0, 0, 0, 2.0, False),
+    # GQA empty-prefix O-clear (bidir window=(0,1), paged TND, two O tiles)
+    (torch.bfloat16, 1, 15, 1, 15, 3, 192, 1, 128, False, "TND", False, 0, 1, 0, 0.0, False),
+    # ================ head_dim = 512 (splitfuse head-dim slice path) ================
+    # BSND dense: decode GQA / prefill MHA / non-causal / MQA.
+    (torch.float16, 2, 6, 3, 1, 1024, 512, 0, 128, True, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 3, 1, 2048, 512, 0, 128, True, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.float16, 2, 6, 6, 16, 1024, 512, 0, 128, True, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.bfloat16, 2, 6, 6, 64, 2048, 512, 0, 128, False, "BSND", False, -1, -1, 0, 0.0, False),
+    (torch.float16, 1, 8, 1, 32, 4096, 512, 0, 128, True, "BSND", False, -1, -1, 0, 0.0, False),
+    # TND paged: decode / prefill / split-KV / MHA.
+    (torch.float16, 2, 6, 3, 1, 1024, 512, 1, 128, True, "TND", True, -1, -1, 1, 0.0, False),
+    (torch.bfloat16, 2, 6, 3, 16, 2048, 512, 1, 128, True, "TND", True, -1, -1, 1, 0.0, False),
+    (torch.float16, 1, 16, 2, 64, 4096, 512, 1, 128, True, "TND", True, -1, -1, 2, 0.0, False),
+    (torch.bfloat16, 1, 32, 8, 1, 2048, 512, 1, 128, True, "TND", True, -1, -1, 1, 0.0, False),
+    (torch.float16, 2, 6, 6, 32, 1024, 512, 1, 128, False, "TND", True, -1, -1, 1, 0.0, False),
+]
+
+
+@pytest.mark.golden_api("flash_attn_varlen_func")
+@pytest.mark.parametrize(
+    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, num_splits, softcap, add_unused_qkv",
+    test_cases,
+)
+def test_fa_kvcache_ops(
+    data_type,
+    batch_size,
+    num_heads,
+    kv_heads,
+    q_seqlen,
+    kv_seqlen,
+    head_size,
+    cache_mode,
+    block_size,
+    is_causal,
+    layout,
+    is_varied,
+    window_size_left,
+    window_size_right,
+    num_splits,
+    softcap,
+    add_unused_qkv,
+    *,
+    seqused_k_as_int=False,
+    disable_scheduler_metadata=False,
+):
+
+    # num_splits>1 (active KV split) is currently only wired for paged KV + varlen-q (TND).
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+    is_950 = "Ascend950" in name
+    if head_size == 512 and is_950:
+        pytest.skip("head_dim=512 is supported only on Ascend910")
+    if num_splits > 1 and not (cache_mode == 1 and layout == "TND"):
+        pytest.skip("num_splits>1 requires paged KV cache and TND (varlen-q) layout")
+    if not (1 <= head_size <= 256) and head_size != 512:
+        pytest.skip("head_size must be in [1, 256] or exactly 512")
+
+    if is_varied and layout != "TND":
+        pytest.skip("is_varied requires TND (varlen-q) layout")
+    block_size = 128
+    if add_unused_qkv:
+        q_sequences, kv_sequences, used_q_lengths, used_k_lengths = make_varlen_seqlens_with_unused(
+            batch_size, q_seqlen, kv_seqlen, is_causal
+        )
+    elif is_varied:
+        q_sequences, kv_sequences = make_varlen_seqlens(batch_size, q_seqlen, kv_seqlen, seed=1234)
+    else:
+        q_sequences = [q_seqlen] * batch_size
+        kv_sequences = [kv_seqlen] * batch_size
+    if seqused_k_as_int:
+        assert not add_unused_qkv
+        kv_sequences = [kv_seqlen] * batch_size
+    if not add_unused_qkv:
+        used_q_lengths, used_k_lengths = q_sequences, kv_sequences
+    t_q_sum = sum(q_sequences)
+    if layout == "BSND":
+        query = make_random_tensor(
+            (batch_size, q_seqlen, num_heads, head_size),
+            data_type,
+            device="npu",
+            requires_grad=True,
+        )
+    elif layout == "TND":
+        query = make_packed_random_tensor(
+            q_sequences, q_seqlen, num_heads, head_size, data_type, device="npu", requires_grad=True
+        )
+    key_cache = None
+    value_cache = None
+    block_tables = None
+    if cache_mode == 1:
+        # make_paged_kv_cache allocates physical blocks from kv_seqlen so long
+        # KV cases cannot make block_table reference nonexistent blocks and
+        # trigger an AICore DDR overrun.
+        key_cache, value_cache = make_paged_kv_cache(
+            batch_size,
+            kv_seqlen,
+            block_size,
+            kv_heads,
+            head_size,
+            data_type,
+            device="npu",
+            requires_grad=True,
+        )
+        block_tables = make_block_table(batch_size, kv_seqlen, block_size).npu()
+    else:
+        if layout == "BSND":
+            key_cache = make_random_tensor(
+                (batch_size, kv_seqlen, kv_heads, head_size),
+                data_type,
+                device="npu",
+                requires_grad=True,
+            )
+            value_cache = make_random_tensor(
+                (batch_size, kv_seqlen, kv_heads, head_size),
+                data_type,
+                device="npu",
+                requires_grad=True,
+            )
+        else:
+            key_cache = make_packed_random_tensor(
+                kv_sequences,
+                kv_seqlen,
+                kv_heads,
+                head_size,
+                data_type,
+                device="npu",
+                requires_grad=True,
+            )
+            value_cache = make_packed_random_tensor(
+                kv_sequences,
+                kv_seqlen,
+                kv_heads,
+                head_size,
+                data_type,
+                device="npu",
+                requires_grad=True,
+            )
+        block_tables = None
+    if layout == "BSND":
+        kv_seqlen_list = [kv_seqlen] * batch_size
+    else:
+        kv_seqlen_list = kv_sequences
+    scale = 1.0 / (head_size**0.5)
+    kv_seqlen_list = torch.tensor(kv_seqlen_list, dtype=torch.int32).npu()
+    new_q_seqlen_list = None
+    new_kv_seqlen_list = None
+    new_q_seqlen_list_cpu = None
+    new_kv_seqlen_list_cpu = None
+    if layout == "TND":
+        new_q_seqlen_list_cpu = [0]
+        pre_seq_sum = 0
+        for i in range(batch_size):
+            pre_seq_sum += q_sequences[i]
+            new_q_seqlen_list_cpu.append(pre_seq_sum)
+        new_q_seqlen_list = torch.tensor(new_q_seqlen_list_cpu, dtype=torch.int32).npu()
+        if cache_mode == 0:
+            new_kv_seqlen_list_cpu = [0]
+            pre_seq_sum = 0
+            for i in range(batch_size):
+                pre_seq_sum += kv_sequences[i]
+                new_kv_seqlen_list_cpu.append(pre_seq_sum)
+            new_kv_seqlen_list = torch.tensor(new_kv_seqlen_list_cpu, dtype=torch.int32).npu()
+    no_swa = window_size_left == -1 and window_size_right == -1
+    dense_varlen = layout == "TND" and cache_mode == 0
+    bwd_supported = dense_varlen and num_splits <= 1 and (not is_950 or no_swa)
+    cu_seqlens_k_for_api = new_kv_seqlen_list if dense_varlen else None
+    max_seqlen_k_for_api = kv_seqlen if dense_varlen else None
+    cache_seqlens_for_api = None if dense_varlen else kv_seqlen_list
+    seqused_q = torch.tensor(used_q_lengths, dtype=torch.int32).npu() if add_unused_qkv else None
+    if add_unused_qkv:
+        cache_seqlens_for_api = torch.tensor(used_k_lengths, dtype=torch.int32).npu()
+    if seqused_k_as_int:
+        cache_seqlens_for_api = kv_seqlen
+    out_out, softmax_lse, *rest = flash_attn_varlen_func(
+        query,
+        key_cache,
+        value_cache,
+        qv=None,
+        cu_seqlens_q=new_q_seqlen_list,
+        cu_seqlens_k=cu_seqlens_k_for_api,
+        max_seqlen_q=q_seqlen,
+        max_seqlen_k=max_seqlen_k_for_api,
+        seqused_q=seqused_q,
+        seqused_k=cache_seqlens_for_api,
+        page_table=block_tables,
+        softmax_scale=None,
+        causal=is_causal,
+        window_size=[window_size_left, window_size_right],  # -1 means infinite context window
+        softcap=softcap,  # 0.0 means deactivated
+        num_splits=num_splits,  # Can be tuned for speed
+        pack_gqa=None,  # Can be tuned for speed
+        return_lse=True,
+        disable_scheduler_metadata=disable_scheduler_metadata,
+    )
+    query_ref = query.detach().cpu()
+    key_ref = key_cache.detach().cpu()
+    value_ref = value_cache.detach().cpu()
+    if bwd_supported:
+        # Only the TND backward path differentiates through these leaves; every
+        # other case returns earlier, and grad-free inputs let the reference
+        # come from the persistent cache instead.
+        query_ref.requires_grad_(True)
+        key_ref.requires_grad_(True)
+        value_ref.requires_grad_(True)
+    block_tables_cpu = block_tables.cpu() if cache_mode == 1 else None
+
+    if layout == "BSND":
+        golden_lseL_gpu_ref = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
+        golden_lseL_gpu_pt = torch.empty_like(golden_lseL_gpu_ref)
+    else:
+        golden_lseL_gpu_ref = torch.empty((num_heads, t_q_sum), dtype=torch.float32)
+        golden_lseL_gpu_pt = torch.empty_like(golden_lseL_gpu_ref)
+    if layout == "BSND":
+        atten_mask, _, _ = make_golden_attention_mask(
+            q_seqlen, kv_seqlen, is_causal, window_size_left, window_size_right
+        )
+        if cache_mode == 1:
+            key_batched, value_batched = gather_paged_kv_batch(
+                key_ref, value_ref, block_tables_cpu, kv_seqlen, block_size
+            )
+        else:
+            key_batched, value_batched = key_ref, value_ref
+        golden_out_gpu_ref, golden_lseL_gpu_ref, golden_out_gpu_pt, golden_lseL_gpu_pt = (
+            ref_flash_attention_pair(
+                query_ref,
+                key_batched,
+                value_batched,
+                scale,
+                atten_mask,
+                data_type,
+                softcap=softcap,
+                rescale_threshold=4.0,
+            )
+        )
+        if atten_mask is not None:
+            fully_masked = atten_mask.all(dim=-1)
+            golden_out_gpu_ref[:, fully_masked] = 0
+            golden_out_gpu_pt[:, fully_masked] = 0
+            golden_lseL_gpu_ref[:, :, fully_masked] = torch.inf
+            golden_lseL_gpu_pt[:, :, fully_masked] = torch.inf
+        assert_fa_close(out_out, golden_out_gpu_ref, golden_out_gpu_pt, softcap=softcap, name="out")
+        assert_fa_close(
+            softmax_lse,
+            golden_lseL_gpu_ref,
+            golden_lseL_gpu_pt,
+            softcap=softcap,
+            name="softmax_lse",
+        )
+        return
+    q_valid, k_valid, atten_mask = make_padded_varlen_mask(
+        used_q_lengths,
+        used_k_lengths,
+        q_seqlen,
+        kv_seqlen,
+        is_causal,
+        window_size_left,
+        window_size_right,
+    )
+
+    def reference_pair(query_ref, key_ref, value_ref, differentiable=False):
+        """Reference values for this case, ``out_ref``/``out_pt`` first.
+
+        Shared by the forward check and the ``rebuild=`` fallback of
+        ``cached_autograd_grads``, so the post-processing stays in the graph.
+        """
+        query_padded = pad_packed_tensor(query_ref, q_sequences, q_seqlen)
+        if cache_mode == 1:
+            key_padded, value_padded = gather_paged_kv_batch(
+                key_ref, value_ref, block_tables_cpu, kv_seqlen, block_size
+            )
+        else:
+            key_padded = pad_packed_tensor(key_ref, kv_sequences, kv_seqlen)
+            value_padded = pad_packed_tensor(value_ref, kv_sequences, kv_seqlen)
+        golden_out_gpu_ref, golden_lse_gpu_ref, golden_out_gpu_pt, golden_lse_gpu_pt = (
+            ref_flash_attention_pair(
+                query_padded,
+                key_padded,
+                value_padded,
+                scale,
+                atten_mask,
+                data_type,
+                softcap=softcap,
+                rescale_threshold=4.0,
+                differentiable=differentiable,
+            )
+        )
+        fully_masked = atten_mask.all(dim=-1)
+        golden_out_gpu_ref[fully_masked] = 0
+        golden_out_gpu_pt[fully_masked] = 0
+        golden_lse_gpu_ref = golden_lse_gpu_ref.masked_fill(fully_masked[:, None, :], torch.inf)
+        golden_lse_gpu_pt = golden_lse_gpu_pt.masked_fill(fully_masked[:, None, :], torch.inf)
+        return (
+            golden_out_gpu_ref[q_valid],
+            golden_out_gpu_pt[q_valid],
+            golden_lse_gpu_ref.permute(0, 2, 1)[q_valid].transpose(0, 1),
+            golden_lse_gpu_pt.permute(0, 2, 1)[q_valid].transpose(0, 1),
+        )
+
+    golden_out_gpu_ref, golden_out_gpu_pt, golden_lse_gpu_ref, golden_lse_gpu_pt = reference_pair(
+        query_ref, key_ref, value_ref
+    )
+    # Compare/slice output: unused rows have unspecified values and gradients.
+    output_compare = out_out
+    output_lse_compare = softmax_lse
+    if add_unused_qkv:
+        output_compare = torch.cat(
+            [
+                out_out[
+                    int(new_q_seqlen_list_cpu[i]) : int(new_q_seqlen_list_cpu[i])
+                    + used_q_lengths[i]
+                ]
+                for i in range(batch_size)
+            ]
+        )
+        output_lse_compare = torch.cat(
+            [
+                softmax_lse[
+                    :,
+                    int(new_q_seqlen_list_cpu[i]) : int(new_q_seqlen_list_cpu[i])
+                    + used_q_lengths[i],
+                ]
+                for i in range(batch_size)
+            ],
+            dim=1,
+        )
+    assert_fa_close(
+        output_compare, golden_out_gpu_ref, golden_out_gpu_pt, softcap=softcap, name="out"
+    )
+    assert_fa_close(
+        output_lse_compare,
+        golden_lse_gpu_ref,
+        golden_lse_gpu_pt,
+        softcap=softcap,
+        name="softmax_lse",
+    )
+    if bwd_supported:
+        dout = make_random_tensor(
+            output_compare.shape, out_out.dtype, low=-0.5, high=0.5, device="npu"
+        )
+        dq_ag, dk_ag, dv_ag = torch.autograd.grad(
+            output_compare, (query, key_cache, value_cache), dout
+        )
+        dq_ref, dk_ref, dv_ref, dq_pt, dk_pt, dv_pt = cached_autograd_grads(
+            os.environ.get("GOLDEN_CACHE_NODEID", "v4"),
+            (golden_out_gpu_ref, golden_out_gpu_pt),
+            (query_ref, key_ref, value_ref),
+            dout,
+            metadata={"version": 4, "add_unused_qkv": add_unused_qkv},
+            rebuild=reference_pair,
+        )
+        # Gradients outside the used prefixes are unspecified; compare used rows only.
+        if add_unused_qkv:
+            dq_ag, dq_ref, dq_pt = [
+                torch.cat(
+                    [
+                        grad[start : start + length]
+                        for start, length in zip(new_q_seqlen_list_cpu, used_q_lengths)
+                    ]
+                )
+                for grad in (dq_ag, dq_ref, dq_pt)
+            ]
+            dk_ag, dk_ref, dk_pt, dv_ag, dv_ref, dv_pt = [
+                torch.cat(
+                    [
+                        grad[start : start + length]
+                        for start, length in zip(new_kv_seqlen_list_cpu, used_k_lengths)
+                    ]
+                )
+                for grad in (dk_ag, dk_ref, dk_pt, dv_ag, dv_ref, dv_pt)
+            ]
+        assert_fa_close(dq_ag, dq_ref, dq_pt, softcap=softcap, name="dQ")
+        assert_fa_close(dk_ag, dk_ref, dk_pt, softcap=softcap, name="dK")
+        assert_fa_close(dv_ag, dv_ref, dv_pt, softcap=softcap, name="dV")
+    return
+
+
+# flash_attn_func test parameters (dense BSND; supports backward).
+# Ascend950: no SWA in FAG bwd (window must be -1,-1).
+# data_type: [torch.float16, torch.bfloat16]
+# num_heads,kv_heads: cover MHA (6,6)/(4,4)/(8,8) and GQA (6,3)/(6,1)/(8,2)
+# window: (-1,-1) no window, causal via is_causal, and SWA/local windows (910).
+flash_attn_func_cases = [
+    # data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size, softcap
+    (torch.float16, 2, 6, 6, 128, 128, 64, False, (-1, -1), 0.0),
+    (torch.float16, 2, 6, 6, 128, 128, 64, True, (-1, -1), 0.0),
+    (torch.float16, 2, 6, 3, 64, 256, 64, True, (-1, -1), 0.0),
+    (torch.float16, 2, 6, 1, 128, 128, 128, False, (64, 64), 0.0),
+    (torch.float16, 1, 8, 2, 256, 512, 128, True, (-1, -1), 0.0),
+    (torch.bfloat16, 2, 6, 6, 128, 128, 64, True, (-1, -1), 0.0),
+    (torch.bfloat16, 2, 6, 3, 256, 256, 128, False, (-1, -1), 0.0),
+    (torch.bfloat16, 2, 6, 1, 512, 512, 128, True, (512, 0), 0.0),
+    (torch.bfloat16, 2, 4, 4, 128, 192, 192, False, (0, 64), 0.0),
+    (torch.bfloat16, 2, 6, 6, 256, 512, 128, True, (128, 128), 0.0),
+    # Softcap (tanh) with backward: 30.0 saturates most logits, 2.0 keeps tanh
+    # near-linear. Windows stay (-1,-1) because the Ascend950 FAG bwd has no SWA.
+    (torch.float16, 2, 6, 6, 128, 128, 64, False, (-1, -1), 30.0),
+    (torch.float16, 2, 6, 3, 64, 256, 64, True, (-1, -1), 30.0),
+    (torch.bfloat16, 2, 6, 1, 128, 128, 128, False, (-1, -1), 2.0),
+    (torch.bfloat16, 1, 8, 2, 256, 512, 128, True, (-1, -1), 30.0),
+    (torch.bfloat16, 2, 4, 4, 192, 192, 64, False, (-1, -1), 2.0),
+]
+
+
+@pytest.mark.golden_api("flash_attn_func")
+@pytest.mark.parametrize(
+    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size, softcap",
+    flash_attn_func_cases,
+)
+def test_flash_attn_func(
+    data_type,
+    batch_size,
+    num_heads,
+    kv_heads,
+    q_seqlen,
+    kv_seqlen,
+    head_size,
+    is_causal,
+    window_size,
+    softcap,
+):
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+    if "Ascend910" not in name and "Ascend950" not in name:
+        pytest.skip("flash_attn_func only supports Ascend910/Ascend950")
+    window_size_left, window_size_right = window_size
+    if "Ascend950" in name and (window_size_left != -1 or window_size_right != -1):
+        pytest.skip("Ascend950 FAG bwd does not support SWA")
+    query = make_random_tensor(
+        (batch_size, q_seqlen, num_heads, head_size), data_type, device="npu", requires_grad=True
+    )
+    key = make_random_tensor(
+        (batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu", requires_grad=True
+    )
+    value = make_random_tensor(
+        (batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu", requires_grad=True
+    )
+    scale = 1.0 / (head_size**0.5)
+
+    atten_mask, _, _ = make_golden_attention_mask(
+        q_seqlen, kv_seqlen, is_causal, window_size_left, window_size_right
+    )
+
+    out, softmax_lse = flash_attn_func(
+        query,
+        key,
+        value,
+        softmax_scale=scale,
+        causal=is_causal,
+        window_size=window_size,
+        softcap=softcap,
+        return_lse=True,
+    )
+
+    query_ref = query.detach().cpu().requires_grad_(True)
+    key_ref = key.detach().cpu().requires_grad_(True)
+    value_ref = value.detach().cpu().requires_grad_(True)
+
+    def reference_pair(query_ref, key_ref, value_ref, differentiable=False):
+        """Reference values for this case, ``out_ref``/``out_pt`` first.
+
+        Shared by the forward check and the ``rebuild=`` fallback of
+        ``cached_autograd_grads``, so the post-processing stays in the graph.
+        """
+        golden_out_ref, golden_lse_ref, golden_out_pt, golden_lse_pt = ref_flash_attention_pair(
+            query_ref,
+            key_ref,
+            value_ref,
+            scale,
+            atten_mask,
+            data_type,
+            softcap=softcap,
+            differentiable=differentiable,
+        )
+        if atten_mask is not None:
+            fully_masked = atten_mask.all(dim=-1)
+            golden_out_ref[:, fully_masked] = 0
+            golden_out_pt[:, fully_masked] = 0
+            golden_lse_ref[:, :, fully_masked] = torch.inf
+            golden_lse_pt[:, :, fully_masked] = torch.inf
+        return golden_out_ref, golden_out_pt, golden_lse_ref, golden_lse_pt
+
+    golden_out_ref, golden_out_pt, golden_lse_ref, golden_lse_pt = reference_pair(
+        query_ref, key_ref, value_ref
+    )
+    assert_fa_close(out, golden_out_ref, golden_out_pt, name="out")
+    assert_fa_close(softmax_lse, golden_lse_ref, golden_lse_pt, name="softmax_lse")
+
+    dout = make_random_tensor(out.shape, out.dtype, low=-0.5, high=0.5, device="npu")
+    dq_ag, dk_ag, dv_ag = torch.autograd.grad(out, (query, key, value), dout)
+    dq_ref, dk_ref, dv_ref, dq_pt, dk_pt, dv_pt = cached_autograd_grads(
+        os.environ.get("GOLDEN_CACHE_NODEID", "v4-func"),
+        (golden_out_ref, golden_out_pt),
+        (query_ref, key_ref, value_ref),
+        dout,
+        metadata={"version": 4, "kind": "bsnd"},
+        rebuild=reference_pair,
+    )
+    assert_fa_close(dq_ag, dq_ref, dq_pt, name="dQ")
+    assert_fa_close(dk_ag, dk_ref, dk_pt, name="dK")
+    assert_fa_close(dv_ag, dv_ref, dv_pt, name="dV")
+
+
+# flash_attn_varlen_func test parameters (Ascend950 head_dim<=256 coverage, NPU only)
+# Single-option parameters: fixed values
+# data_type: [torch.bfloat16]
+# kv_heads: [8]
+# block_size: [128]
+# softcap: [0.0]
+# window_size_left,window_size_right: [(-1,-1)]
+
+# Two-option parameters
+# is_causal: [False, True]
+# cache_mode: [0, 1]
+# layout: [BSND, TND]
+# num_heads: baseline coverage [32], dedicated S/N axis-fusion coverage [8, 64]
+
+# Multi-option parameters: grouped values
+# head_size: A=[35, 64, 101, 128], B=[151, 192, 201, 256]
+# batch_size,q_seqlen,kv_seqlen: A=[(1,256,128), (1,130,128), (2,256,256), (4,128,256), (2,128,128)], B=[(1,384,128), (1,256,384), (1,128,128), (1,256,512), (1,256,192)]
+# num_splits: A=[0, 1, 2] for cache=1 with layout=TND; B=[0, 1] otherwise
+# Dedicated S/N axis-fusion cases also cover batch=[8,16],
+# q_seqlen=[16,32,64], and kv_seqlen=[16,32,64,1024]
+# Targeted supplements cover D=[1,2,4,8,16,31,32,59,63,111,127,224,255,256],
+# MHA/MQA/non-standard GQA, odd batch=[3,5,7], and 127/129/511/513 boundaries.
+
+hd_cases = [
+    # data_type=torch.bfloat16, is_causal=False, cache_mode=0, layout=BSND
+    # head_size=A, (batch_size,q_seqlen,kv_seqlen)=A, num_splits=[0,1]
+    (torch.bfloat16, 2, 32, 8, 128, 128, 64, 0, 128, False, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 128, 101, 0, 128, False, "BSND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 130, 128, 128, 0, 128, False, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 8, 128, 256, 35, 0, 128, False, "BSND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 2, 32, 8, 256, 256, 64, 0, 128, False, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 2, 32, 8, 128, 128, 101, 0, 128, False, "BSND", 1, -1, -1, 0.0),
+    # data_type=torch.bfloat16, is_causal=True, cache_mode=0, layout=BSND
+    # head_size=A, (batch_size,q_seqlen,kv_seqlen)=B, num_splits=[0,1]
+    (torch.bfloat16, 1, 32, 8, 256, 384, 128, 0, 128, True, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 128, 128, 101, 0, 128, True, "BSND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 384, 128, 35, 0, 128, True, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 192, 64, 0, 128, True, "BSND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 512, 128, 0, 128, True, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 384, 101, 0, 128, True, "BSND", 1, -1, -1, 0.0),
+    # data_type=torch.bfloat16, is_causal=False, cache_mode=1, layout=BSND
+    # head_size=B, (batch_size,q_seqlen,kv_seqlen)=A, num_splits=[0,1]
+    (torch.bfloat16, 4, 32, 8, 128, 256, 192, 1, 128, False, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 130, 128, 201, 1, 128, False, "BSND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 128, 256, 1, 128, False, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 2, 32, 8, 256, 256, 151, 1, 128, False, "BSND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 2, 32, 8, 128, 128, 192, 1, 128, False, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 8, 128, 256, 201, 1, 128, False, "BSND", 1, -1, -1, 0.0),
+    # data_type=torch.bfloat16, is_causal=True, cache_mode=1, layout=BSND
+    # head_size=B, (batch_size,q_seqlen,kv_seqlen)=B, num_splits=[0,1]
+    (torch.bfloat16, 1, 32, 8, 256, 512, 201, 1, 128, True, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 128, 128, 256, 1, 128, True, "BSND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 384, 151, 1, 128, True, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 192, 192, 1, 128, True, "BSND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 384, 128, 201, 1, 128, True, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 512, 256, 1, 128, True, "BSND", 1, -1, -1, 0.0),
+    # data_type=torch.bfloat16, is_causal=False, cache_mode=0, layout=TND
+    # head_size=A, (batch_size,q_seqlen,kv_seqlen)=A, num_splits=[0,1]
+    (torch.bfloat16, 4, 32, 8, 128, 256, 101, 0, 128, False, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 2, 32, 8, 256, 256, 128, 0, 128, False, "TND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 128, 64, 0, 128, False, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 2, 32, 8, 128, 128, 35, 0, 128, False, "TND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 130, 128, 101, 0, 128, False, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 8, 128, 256, 128, 0, 128, False, "TND", 1, -1, -1, 0.0),
+    # data_type=torch.bfloat16, is_causal=True, cache_mode=0, layout=TND
+    # head_size=A, (batch_size,q_seqlen,kv_seqlen)=B, num_splits=[0,1]
+    (torch.bfloat16, 1, 32, 8, 384, 128, 64, 0, 128, True, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 192, 101, 0, 128, True, "TND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 128, 128, 35, 0, 128, True, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 512, 128, 0, 128, True, "TND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 384, 64, 0, 128, True, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 384, 128, 101, 0, 128, True, "TND", 1, -1, -1, 0.0),
+    # data_type=torch.bfloat16, is_causal=False, cache_mode=1, layout=TND
+    # head_size=B, (batch_size,q_seqlen,kv_seqlen)=A, num_splits=[0,1,2]
+    (torch.bfloat16, 2, 32, 8, 128, 128, 192, 1, 128, False, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 128, 201, 1, 128, False, "TND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 8, 128, 256, 256, 1, 128, False, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 2, 32, 8, 256, 256, 151, 1, 128, False, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 130, 128, 192, 1, 128, False, "TND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 2, 32, 8, 128, 128, 201, 1, 128, False, "TND", 1, -1, -1, 0.0),
+    # data_type=torch.bfloat16, is_causal=True, cache_mode=1, layout=TND
+    # head_size=B, (batch_size,q_seqlen,kv_seqlen)=B, num_splits=[0,1,2]
+    (torch.bfloat16, 1, 32, 8, 256, 384, 192, 1, 128, True, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 512, 151, 1, 128, True, "TND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 384, 128, 201, 1, 128, True, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 128, 128, 256, 1, 128, True, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 192, 192, 1, 128, True, "TND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 384, 151, 1, 128, True, "TND", 1, -1, -1, 0.0),
+    # Ascend950 S/N axis-fusion coverage: large batch, small S, many query
+    # heads, and unaligned head_size
+    (torch.bfloat16, 16, 8, 8, 64, 64, 35, 0, 128, False, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 16, 64, 8, 32, 32, 101, 0, 128, True, "BSND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 16, 8, 8, 16, 16, 151, 1, 128, False, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 8, 64, 8, 64, 1024, 192, 1, 128, True, "TND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 8, 8, 8, 16, 1024, 201, 0, 128, False, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 384, 128, 201, 0, 128, False, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 128, 384, 256, 0, 128, False, "BSND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 130, 128, 35, 0, 128, True, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 8, 128, 256, 64, 0, 128, True, "BSND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 128, 35, 1, 128, False, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 8, 128, 256, 64, 1, 128, False, "BSND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 384, 128, 101, 1, 128, True, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 128, 384, 128, 1, 128, True, "BSND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 384, 128, 201, 0, 128, False, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 8, 128, 256, 256, 0, 128, False, "TND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 192, 151, 0, 128, True, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 128, 384, 192, 0, 128, True, "TND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 256, 128, 35, 1, 128, False, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 8, 128, 256, 64, 1, 128, False, "TND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 384, 128, 101, 1, 128, True, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 128, 384, 128, 1, 128, True, "TND", 1, -1, -1, 0.0),
+    # Tiny HD tiers crossed with MHA/MQA/GQA, odd batches, and split boundaries.
+    (torch.bfloat16, 3, 4, 4, 127, 129, 1, 0, 128, False, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 5, 8, 1, 129, 127, 2, 1, 128, True, "BSND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 7, 16, 4, 511, 513, 4, 0, 128, False, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 3, 32, 2, 513, 511, 8, 1, 128, True, "TND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 5, 24, 1, 128, 512, 16, 1, 128, False, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 7, 8, 8, 512, 128, 32, 0, 128, True, "TND", 1, -1, -1, 0.0),
+    # Unaligned/upper HD tiers with MQA, MHA, and non-standard GQA groups.
+    (torch.bfloat16, 1, 40, 1, 127, 513, 59, 0, 128, True, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 2, 48, 4, 129, 511, 111, 1, 128, False, "TND", 1, -1, -1, 0.0),
+    (torch.bfloat16, 4, 8, 8, 511, 513, 224, 1, 128, True, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 64, 1, 513, 127, 256, 0, 128, False, "TND", 1, -1, -1, 0.0),
+    # Power-of-two-minus-one HD boundaries paired with adjacent Sq/Sk cuts.
+    (torch.bfloat16, 3, 10, 2, 127, 128, 31, 0, 128, False, "BSND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 7, 40, 1, 511, 512, 127, 0, 128, False, "TND", 0, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 512, 513, 255, 1, 128, True, "BSND", 1, -1, -1, 0.0),
+    # Softcap (tanh) coverage across the fwd dispatch: causal rows drive the
+    # masked pre/invert paths, non-causal rows the maskless (DN) path, and the
+    # paged rows the paged cache modes. 30.0 saturates most logits, 2.0 keeps
+    # tanh near-linear.
+    (torch.bfloat16, 2, 32, 8, 128, 128, 64, 0, 128, False, "BSND", 0, -1, -1, 30.0),
+    (torch.bfloat16, 1, 32, 8, 130, 128, 128, 0, 128, True, "BSND", 0, -1, -1, 30.0),
+    (torch.float16, 4, 32, 8, 128, 256, 101, 0, 128, False, "BSND", 1, -1, -1, 2.0),
+    (torch.bfloat16, 4, 32, 8, 128, 256, 101, 1, 128, False, "BSND", 0, -1, -1, 30.0),
+    (torch.bfloat16, 1, 32, 8, 256, 192, 192, 1, 128, True, "TND", 1, -1, -1, 2.0),
+    (torch.bfloat16, 4, 32, 8, 128, 256, 64, 1, 128, True, "TND", 1, -1, -1, 30.0),
+    # Decode-shaped paged TND row: max_seqlen_q <= 16 and max_seqlen_k >= 1024
+    # enables FlashDecode, so the softcapped partials go through the combine.
+    (torch.bfloat16, 1, 32, 8, 1, 2048, 128, 1, 128, False, "TND", 0, -1, -1, 30.0),
+    # Tail tiles: kv_seqlen below/around the 64-column split picks the *64
+    # softmax variants.
+    (torch.bfloat16, 2, 32, 8, 64, 64, 64, 0, 128, False, "BSND", 0, -1, -1, 2.0),
+    (torch.bfloat16, 1, 32, 8, 33, 35, 128, 0, 128, True, "BSND", 0, -1, -1, 30.0),
+]
+
+
+@pytest.mark.golden_api("flash_attn_varlen_func")
+@pytest.mark.parametrize(
+    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, num_splits, window_size_left, window_size_right, softcap",
+    hd_cases,
+)
+def test_fa_kvcache_ops_with_hd_le_256(
+    data_type,
+    batch_size,
+    num_heads,
+    kv_heads,
+    q_seqlen,
+    kv_seqlen,
+    head_size,
+    cache_mode,
+    block_size,
+    is_causal,
+    layout,
+    num_splits,
+    window_size_left,
+    window_size_right,
+    softcap,
+):
+    is_varied = layout == "TND"
+    test_fa_kvcache_ops(
+        data_type,
+        batch_size,
+        num_heads,
+        kv_heads,
+        q_seqlen,
+        kv_seqlen,
+        head_size,
+        cache_mode,
+        block_size,
+        is_causal,
+        layout,
+        is_varied,
+        window_size_left,
+        window_size_right,
+        num_splits,
+        softcap=softcap,
+        add_unused_qkv=False,
+    )
+
+
+@pytest.mark.golden_api("flash_attn_varlen_func")
+@pytest.mark.parametrize("data_type", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["BSND", "TND"])
+@pytest.mark.parametrize("host_tiling", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,q_seqlen,kv_seqlen,head_size",
+    [
+        (1, 129, 257, 64),
+        (2, 129, 257, 128),
+        (2, 257, 65, 256),
+    ],
+)
+def test_fa_kvcache_ops_scalar_seqused_k(
+    data_type, layout, host_tiling, batch_size, q_seqlen, kv_seqlen, head_size
+):
+    if "Ascend950" not in torch_npu.npu.get_device_name():
+        pytest.skip("Ascend950 only")
+    test_fa_kvcache_ops(
+        data_type=data_type,
+        batch_size=batch_size,
+        num_heads=4,
+        kv_heads=1,
+        q_seqlen=q_seqlen,
+        kv_seqlen=kv_seqlen,
+        head_size=head_size,
+        cache_mode=0,
+        block_size=128,
+        is_causal=False,
+        layout=layout,
+        is_varied=layout == "TND" and batch_size > 1,
+        window_size_left=31,
+        window_size_right=17,
+        num_splits=0,
+        softcap=0.0,
+        add_unused_qkv=False,
+        seqused_k_as_int=True,
+        disable_scheduler_metadata=host_tiling,
+    )
+
+
+# ---------------------------------------------------------------------------
+# flash_attn_combine
+# ---------------------------------------------------------------------------
+
+
+def _combine_ref(out_partial, lse_partial):
+    lse = torch.logsumexp(lse_partial, dim=0)
+    scale = torch.exp(lse_partial - lse)
+    scale = torch.where(torch.isfinite(scale), scale, torch.zeros_like(scale))
+    return (scale.unsqueeze(-1) * out_partial).sum(0), lse
+
+
+def _assert_combine_close(out, lse, out_ref, lse_ref, data_type):
+    torch.testing.assert_close(lse.float(), lse_ref, atol=1e-4, rtol=1e-4)
+    cast_ref = out_ref.to(data_type)
+    cast_err = (cast_ref.float() - out_ref).abs().max().item()
+    diff = (out.float() - out_ref).abs().max().item()
+    assert diff <= 2.0 * cast_err + 1e-3, f"out max diff {diff:.6f} vs cast err {cast_err:.6f}"
+
+
+# data_type, num_splits, head_dim
+flash_attn_combine_dense_cases = [
+    # data_type=torch.float16
+    (torch.float16, 2, 64),
+    (torch.float16, 2, 96),
+    (torch.float16, 2, 128),
+    (torch.float16, 2, 256),
+    (torch.float16, 5, 64),
+    (torch.float16, 5, 96),
+    (torch.float16, 5, 128),
+    (torch.float16, 5, 256),
+    (torch.float16, 16, 64),
+    (torch.float16, 16, 96),
+    (torch.float16, 16, 128),
+    (torch.float16, 16, 256),
+    # data_type=torch.bfloat16
+    (torch.bfloat16, 2, 64),
+    (torch.bfloat16, 2, 96),
+    (torch.bfloat16, 2, 128),
+    (torch.bfloat16, 2, 256),
+    (torch.bfloat16, 5, 64),
+    (torch.bfloat16, 5, 96),
+    (torch.bfloat16, 5, 128),
+    (torch.bfloat16, 5, 256),
+    (torch.bfloat16, 16, 64),
+    (torch.bfloat16, 16, 96),
+    (torch.bfloat16, 16, 128),
+    (torch.bfloat16, 16, 256),
+]
+
+
+@pytest.mark.parametrize(
+    "data_type, num_splits, head_dim",
+    flash_attn_combine_dense_cases,
+)
+def test_combine_dense_with_seqused(
+    data_type,
+    num_splits,
+    head_dim,
+):
+    batch, seqlen, heads = 3, 64, 4
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.float32,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        batch,
+        heads,
+        seqlen,
+        device="npu",
+        dtype=torch.float32,
+    ).transpose(-1, -2)
+    seqused = torch.tensor([64, 33, 1], device="npu", dtype=torch.int32)
+    lse_partial[num_splits // 2 :, 1] = float("-inf")
+
+    # seqused is accepted for API parity, but currently does not limit rows.
+    out, lse = flash_attn_combine(
+        out_partial,
+        lse_partial,
+        out_dtype=data_type,
+        seqused=seqused,
+    )
+    assert out.shape == (batch, seqlen, heads, head_dim)
+    assert lse.shape == (batch, seqlen, heads)
+    out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+    _assert_combine_close(out, lse, out_ref, lse_ref, data_type)
+
+
+# data_type, num_splits
+flash_attn_combine_varlen_cases = [
+    # data_type=torch.float16
+    (torch.float16, 2),
+    (torch.float16, 3),
+    (torch.float16, 32),
+    # data_type=torch.bfloat16
+    (torch.bfloat16, 2),
+    (torch.bfloat16, 3),
+    (torch.bfloat16, 32),
+]
+
+
+@pytest.mark.parametrize(
+    "data_type, num_splits",
+    flash_attn_combine_varlen_cases,
+)
+def test_combine_varlen_with_cu_seqlens(
+    data_type,
+    num_splits,
+):
+    seqlens = [17, 1, 64, 33]
+    heads, head_dim = 2, 128
+    cu = torch.tensor([0, 17, 18, 82, 115], device="npu", dtype=torch.int32)
+    total_q = int(cu[-1].item())
+    out_partial = torch.randn(
+        num_splits,
+        total_q,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.float32,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        heads,
+        total_q,
+        device="npu",
+        dtype=torch.float32,
+    ).transpose(-1, -2)
+    lse_partial[num_splits // 2 :, : total_q // 4] = float("-inf")
+    seqused = torch.tensor(seqlens, device="npu", dtype=torch.int32)
+
+    # cu_seqlens/seqused are accepted for API parity, but do not alter row processing.
+    out, lse = flash_attn_combine(
+        out_partial,
+        lse_partial,
+        out_dtype=data_type,
+        cu_seqlens=cu,
+        seqused=seqused,
+    )
+    assert out.shape == (total_q, heads, head_dim)
+    assert lse.shape == (total_q, heads)
+    out_ref, lse_ref = _combine_ref(
+        out_partial.unsqueeze(1),
+        lse_partial.unsqueeze(1),
+    )
+    _assert_combine_close(
+        out,
+        lse,
+        out_ref.squeeze(0),
+        lse_ref.squeeze(0),
+        data_type,
+    )
+
+
+def test_combine_return_lse_false_and_inplace():
+    num_splits, batch, seqlen, heads, head_dim = 4, 1, 32, 2, 64
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.float32,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        batch,
+        heads,
+        seqlen,
+        device="npu",
+        dtype=torch.float32,
+    ).transpose(-1, -2)
+    out = torch.empty(
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.bfloat16,
+    )
+    ptr = out.data_ptr()
+
+    result, lse = flash_attn_combine(
+        out_partial,
+        lse_partial,
+        out=out,
+        return_lse=False,
+    )
+    assert result.data_ptr() == ptr
+    assert lse is None
+    out_ref, _ = _combine_ref(out_partial, lse_partial)
+    cast_ref = out_ref.to(torch.bfloat16)
+    cast_err = (cast_ref.float() - out_ref).abs().max().item()
+    assert (result.float() - out_ref).abs().max().item() <= 2.0 * cast_err + 1e-3
+
+
+@pytest.mark.parametrize("data_type", [torch.float16, torch.bfloat16])
+def test_combine_low_precision_partial(data_type):
+    num_splits, batch, seqlen, heads, head_dim = 3, 2, 17, 4, 96
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=data_type,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        device="npu",
+        dtype=torch.float32,
+    )
+    out, lse = flash_attn_combine(
+        out_partial,
+        lse_partial,
+    )
+    out_ref, lse_ref = _combine_ref(out_partial.float(), lse_partial)
+    _assert_combine_close(out, lse, out_ref, lse_ref, data_type)
+
+
+@pytest.mark.parametrize("layout", ["BSND", "TND"])
+def test_combine_accepts_standard_lse_layout(layout):
+    num_splits, batch, seqlen, heads, head_dim = 3, 2, 17, 4, 96
+    if layout == "BSND":
+        out_partial = torch.randn(
+            num_splits,
+            batch,
+            seqlen,
+            heads,
+            head_dim,
+            device="npu",
+            dtype=torch.float32,
+        )
+        lse_partial = torch.randn(
+            num_splits,
+            batch,
+            seqlen,
+            heads,
+            device="npu",
+            dtype=torch.float32,
+        )
+        out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+    else:
+        out_partial = torch.randn(
+            num_splits,
+            seqlen,
+            heads,
+            head_dim,
+            device="npu",
+            dtype=torch.float32,
+        )
+        lse_partial = torch.randn(
+            num_splits,
+            seqlen,
+            heads,
+            device="npu",
+            dtype=torch.float32,
+        )
+        out_ref, lse_ref = _combine_ref(
+            out_partial.unsqueeze(1),
+            lse_partial.unsqueeze(1),
+        )
+        out_ref = out_ref.squeeze(0)
+        lse_ref = lse_ref.squeeze(0)
+
+    out, lse = flash_attn_combine(out_partial, lse_partial, out_dtype=torch.bfloat16)
+    _assert_combine_close(out, lse, out_ref, lse_ref, torch.bfloat16)
+
+
+def test_combine_virtual_batch_idx():
+    num_splits, batch, seqlen, heads, head_dim = 2, 3, 8, 2, 64
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.float32,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        batch,
+        heads,
+        seqlen,
+        device="npu",
+        dtype=torch.float32,
+    ).transpose(-1, -2)
+    virtual_batch_idx = torch.tensor([2, 0, 1], device="npu", dtype=torch.int32)
+    out, lse = flash_attn_combine(
+        out_partial,
+        lse_partial,
+        virtual_batch_idx=virtual_batch_idx,
+    )
+    out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+    _assert_combine_close(out, lse, out_ref, lse_ref, torch.float32)
+
+
+def test_combine_fake_tensor():
+    with FakeTensorMode():
+        out_partial = torch.empty(
+            2,
+            1,
+            8,
+            2,
+            64,
+            device="npu",
+            dtype=torch.bfloat16,
+        )
+        lse_partial = torch.empty(
+            2,
+            1,
+            8,
+            2,
+            device="npu",
+            dtype=torch.float32,
+        )
+        out, lse = flash_attn_combine(out_partial, lse_partial)
+    assert out.shape == (1, 8, 2, 64)
+    assert out.dtype == torch.bfloat16
+    assert lse.shape == (1, 8, 2)
+
+
+def test_combine_torch_compile():
+    num_splits, batch, seqlen, heads, head_dim = 2, 1, 8, 2, 64
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.bfloat16,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        device="npu",
+        dtype=torch.float32,
+    )
+    compiled = torch.compile(
+        flash_attn_combine,
+        backend="aot_eager",
+        fullgraph=True,
+        dynamic=False,
+    )
+    out, lse = compiled(out_partial, lse_partial)
+    out_ref, lse_ref = _combine_ref(out_partial.float(), lse_partial)
+    _assert_combine_close(out, lse, out_ref, lse_ref, torch.bfloat16)
+
+
+def test_combine_error_contract():
+    num_splits, batch, seqlen, heads, head_dim = 2, 1, 8, 2, 64
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.float32,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        batch,
+        heads,
+        seqlen,
+        device="npu",
+        dtype=torch.float32,
+    ).transpose(-1, -2)
+    with pytest.raises(RuntimeError, match="fp16, bf16, or fp32"):
+        flash_attn_combine(
+            out_partial.to(torch.int32),
+            lse_partial,
+            out_dtype=torch.bfloat16,
+        )
+    with pytest.raises(RuntimeError, match="shape"):
+        flash_attn_combine(
+            out_partial,
+            torch.randn(
+                num_splits,
+                batch,
+                seqlen + 1,
+                heads,
+                device="npu",
+                dtype=torch.float32,
+            ),
+            out_dtype=torch.bfloat16,
+        )
+    with pytest.raises(RuntimeError, match="virtual_batch_idx"):
+        flash_attn_combine(
+            out_partial,
+            lse_partial,
+            virtual_batch_idx=torch.arange(
+                batch + 1,
+                device="npu",
+                dtype=torch.int32,
+            ),
+        )
+
+    oversized_partial = torch.randn(
+        1,
+        1,
+        1,
+        1,
+        1024,
+        device="npu",
+        dtype=torch.float32,
+    )
+    oversized_lse = torch.randn(1, 1, 1, 1, device="npu", dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="UB budget"):
+        flash_attn_combine(oversized_partial, oversized_lse, out_dtype=torch.float16)
+
+
+# data_type, layout, num_splits, head_dim, seqlen, return_lse
+flash_attn_combine_additional_cases = [
+    (torch.float16, "BSND", 256, 64, 1, True),
+    (torch.float16, "TND", 256, 64, 17, True),
+    (torch.bfloat16, "BSND", 256, 64, 1, True),
+    (torch.bfloat16, "TND", 256, 64, 17, True),
+    (torch.float16, "BSND", 1, 113, 7, True),
+    (torch.float16, "TND", 1, 200, 3, True),
+    (torch.bfloat16, "BSND", 1, 113, 9, True),
+    (torch.bfloat16, "TND", 1, 200, 5, True),
+    (torch.float16, "BSND", 8, 113, 17, False),
+    (torch.float16, "TND", 8, 200, 17, False),
+    (torch.bfloat16, "BSND", 8, 113, 13, False),
+    (torch.bfloat16, "TND", 8, 200, 13, False),
+    (torch.float16, "BSND", 32, 256, 17, True),
+    (torch.float16, "TND", 32, 256, 17, True),
+    (torch.bfloat16, "BSND", 32, 256, 17, True),
+    (torch.bfloat16, "TND", 32, 256, 17, True),
+]
+
+
+@pytest.mark.parametrize(
+    "data_type, layout, num_splits, head_dim, seqlen, return_lse",
+    flash_attn_combine_additional_cases,
+)
+def test_combine_additional_coverage(
+    data_type,
+    layout,
+    num_splits,
+    head_dim,
+    seqlen,
+    return_lse,
+):
+    heads = 3
+    if layout == "BSND":
+        batch = 2
+        out_partial = torch.randn(
+            num_splits,
+            batch,
+            seqlen,
+            heads,
+            head_dim,
+            device="npu",
+            dtype=torch.float32,
+        )
+        lse_partial = torch.randn(
+            num_splits,
+            batch,
+            heads,
+            seqlen,
+            device="npu",
+            dtype=torch.float32,
+        ).transpose(-1, -2)
+        seqused = torch.tensor(
+            [seqlen, max(1, seqlen - 1)],
+            device="npu",
+            dtype=torch.int32,
+        )
+        cu_seqlens = None
+        out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+        expected_shape = (batch, seqlen, heads, head_dim)
+    else:
+        batch = 1
+        out_partial = torch.randn(
+            num_splits,
+            seqlen,
+            heads,
+            head_dim,
+            device="npu",
+            dtype=torch.float32,
+        )
+        lse_partial = torch.randn(
+            num_splits,
+            heads,
+            seqlen,
+            device="npu",
+            dtype=torch.float32,
+        ).transpose(-1, -2)
+        seqused = torch.tensor([seqlen], device="npu", dtype=torch.int32)
+        cu_seqlens = torch.tensor([0, seqlen], device="npu", dtype=torch.int32)
+        out_ref, lse_ref = _combine_ref(
+            out_partial.unsqueeze(1),
+            lse_partial.unsqueeze(1),
+        )
+        out_ref = out_ref.squeeze(0)
+        lse_ref = lse_ref.squeeze(0)
+        expected_shape = (seqlen, heads, head_dim)
+
+    if num_splits > 1:
+        if layout == "BSND":
+            lse_partial[num_splits // 2 :, 1, : max(1, seqlen // 3)] = float("-inf")
+        else:
+            lse_partial[num_splits // 2 :, : max(1, seqlen // 3)] = float("-inf")
+        if layout == "BSND":
+            out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+        else:
+            out_ref, lse_ref = _combine_ref(
+                out_partial.unsqueeze(1),
+                lse_partial.unsqueeze(1),
+            )
+            out_ref = out_ref.squeeze(0)
+            lse_ref = lse_ref.squeeze(0)
+
+    out, lse = flash_attn_combine(
+        out_partial,
+        lse_partial,
+        out_dtype=data_type,
+        cu_seqlens=cu_seqlens,
+        seqused=seqused,
+        return_lse=return_lse,
+    )
+    assert tuple(out.shape) == expected_shape
+    assert out.dtype == data_type
+    if return_lse:
+        assert tuple(lse.shape) == expected_shape[:-1]
+        torch.testing.assert_close(lse.float(), lse_ref, atol=1e-4, rtol=1e-4)
+    else:
+        assert lse is None
+    cast_ref = out_ref.to(data_type)
+    cast_err = (cast_ref.float() - out_ref).abs().max().item()
+    assert (out.float() - out_ref).abs().max().item() <= 2.0 * cast_err + 1e-3
+
+
+# data_type, layout, num_splits, head_dim, seqlen, return_lse
+flash_attn_combine_extra_cases = [
+    (torch.float16, "BSND", 64, 59, 31, True),
+    (torch.float16, "TND", 64, 111, 65, True),
+    (torch.float16, "BSND", 128, 160, 127, True),
+    (torch.float16, "TND", 128, 192, 65, True),
+    (torch.float16, "BSND", 256, 255, 31, True),
+    (torch.float16, "TND", 256, 59, 31, True),
+    (torch.bfloat16, "BSND", 64, 111, 65, True),
+    (torch.bfloat16, "TND", 64, 160, 127, True),
+    (torch.bfloat16, "BSND", 128, 192, 31, True),
+    (torch.bfloat16, "TND", 128, 255, 65, True),
+    (torch.bfloat16, "BSND", 256, 111, 31, False),
+    (torch.bfloat16, "TND", 256, 160, 31, False),
+    (torch.float32, "BSND", 5, 160, 31, True),
+    (torch.float32, "TND", 5, 192, 65, True),
+    (torch.float32, "BSND", 1, 255, 1, False),
+]
+
+
+@pytest.mark.parametrize(
+    "data_type, layout, num_splits, head_dim, seqlen, return_lse",
+    flash_attn_combine_extra_cases,
+)
+def test_combine_extra_coverage(
+    data_type,
+    layout,
+    num_splits,
+    head_dim,
+    seqlen,
+    return_lse,
+):
+    heads = 2
+    if layout == "BSND":
+        batch = 2
+        out_partial = torch.randn(
+            num_splits,
+            batch,
+            seqlen,
+            heads,
+            head_dim,
+            device="npu",
+            dtype=torch.float32,
+        )
+        lse_partial = torch.randn(
+            num_splits,
+            batch,
+            heads,
+            seqlen,
+            device="npu",
+            dtype=torch.float32,
+        ).transpose(-1, -2)
+        seqused = torch.tensor(
+            [seqlen, max(1, seqlen - 1)],
+            device="npu",
+            dtype=torch.int32,
+        )
+        cu_seqlens = None
+        expected_shape = (batch, seqlen, heads, head_dim)
+    else:
+        out_partial = torch.randn(
+            num_splits,
+            seqlen,
+            heads,
+            head_dim,
+            device="npu",
+            dtype=torch.float32,
+        )
+        lse_partial = torch.randn(
+            num_splits,
+            heads,
+            seqlen,
+            device="npu",
+            dtype=torch.float32,
+        ).transpose(-1, -2)
+        seqused = torch.tensor([seqlen], device="npu", dtype=torch.int32)
+        cu_seqlens = torch.tensor([0, seqlen], device="npu", dtype=torch.int32)
+        expected_shape = (seqlen, heads, head_dim)
+
+    if num_splits > 1:
+        if layout == "BSND":
+            lse_partial[num_splits // 2 :, 1, : max(1, seqlen // 3)] = float("-inf")
+        else:
+            lse_partial[num_splits // 2 :, : max(1, seqlen // 3)] = float("-inf")
+
+    if layout == "BSND":
+        out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+    else:
+        out_ref, lse_ref = _combine_ref(
+            out_partial.unsqueeze(1),
+            lse_partial.unsqueeze(1),
+        )
+        out_ref = out_ref.squeeze(0)
+        lse_ref = lse_ref.squeeze(0)
+
+    out, lse = flash_attn_combine(
+        out_partial,
+        lse_partial,
+        out_dtype=data_type,
+        cu_seqlens=cu_seqlens,
+        seqused=seqused,
+        return_lse=return_lse,
+    )
+    assert tuple(out.shape) == expected_shape
+    assert out.dtype == data_type
+    if return_lse:
+        assert tuple(lse.shape) == expected_shape[:-1]
+        torch.testing.assert_close(lse.float(), lse_ref, atol=1e-4, rtol=1e-4)
+    else:
+        assert lse is None
+    cast_ref = out_ref.to(data_type)
+    cast_err = (cast_ref.float() - out_ref).abs().max().item()
+    assert (out.float() - out_ref).abs().max().item() <= 2.0 * cast_err + 1e-3
+
+
+def _bnsd_inputs(batch, sq, sk, dtype, num_heads, num_heads_kv, head_size, seed=2026):
+    gen = torch.Generator().manual_seed(seed)
+    shapes = (
+        (batch, num_heads, sq, head_size),
+        (batch, num_heads_kv, sk, head_size),
+        (batch, num_heads_kv, sk, head_size),
+    )
+    return tuple(
+        make_random_tensor(
+            shape, dtype, generator=gen, device="npu", requires_grad=False
+        ).transpose(1, 2)
+        for shape in shapes
+    )
+
+
+def _bnsd_golden(q, k, v, dtype, scale, causal=False):
+    q, k, v = (t.contiguous().cpu() for t in (q, k, v))
+    mask, _, _ = make_golden_attention_mask(q.shape[1], k.shape[1], causal, -1, -1)
+    return ref_flash_attention_pair(q, k, v, scale, mask, dtype, 0.0)
+
+
+# BNSD (B, H, S, D) QKV layout gate cases (v4 exposes ``flash_attn_func`` only).
+# batch, data_type, num_heads, kv_heads, head_size, q_seqlen, kv_seqlen, is_causal
+flash_attn_func_bnsd_cases = [
+    (2, torch.float16, 8, 2, 128, 64, 128, False),
+    (2, torch.bfloat16, 8, 2, 128, 64, 128, False),
+    (2, torch.float16, 8, 2, 128, 64, 128, True),
+    (2, torch.bfloat16, 8, 2, 128, 64, 128, True),
+    (2, torch.bfloat16, 16, 4, 128, 64, 128, False),
+    (2, torch.bfloat16, 8, 2, 256, 64, 128, False),
+    (2, torch.bfloat16, 8, 2, 128, 100, 192, False),
+]
+
+
+@pytest.mark.golden_api("flash_attn_func")
+@pytest.mark.parametrize(
+    "batch, data_type, num_heads, kv_heads, head_size, q_seqlen, kv_seqlen, is_causal",
+    flash_attn_func_bnsd_cases,
+)
+def test_v4_bnsd_flash_attn_func(
+    batch, data_type, num_heads, kv_heads, head_size, q_seqlen, kv_seqlen, is_causal
+):
+    scale = 1.0 / (head_size**0.5)
+    q, k, v = _bnsd_inputs(batch, q_seqlen, kv_seqlen, data_type, num_heads, kv_heads, head_size)
+    out_ref, lse_ref, out_pt, lse_pt = _bnsd_golden(q, k, v, data_type, scale, causal=is_causal)
+
+    out, lse = flash_attn_func(q, k, v, softmax_scale=scale, causal=is_causal, return_lse=True)
+    assert tuple(out.shape) == (batch, q_seqlen, num_heads, head_size)
+    assert_fa_close(out, out_ref, out_pt, name="v4_bnsd_func_out")
+    assert_fa_close(lse, lse_ref, lse_pt, name="v4_bnsd_lse")
+
+
+# --- MLA (Multi-head Latent Attention) simple gate cases ---------------------
+# Ascend910 only; Ascend950 does not support MLA.
+_NPU_910 = torch_npu.npu.is_available() and "Ascend910" in torch_npu.npu.get_device_name()
+skip_unless_910_mla = pytest.mark.skipif(not _NPU_910, reason="MLA is Ascend910 only")
+
+# form, data_type, batch, q_seqlen, kv_seqlen, num_heads, kv_heads,
+# head_size_qk, head_size_v, is_causal
+#   prefill (unabsorbed): q/k head dim 192, v head dim 128
+#   decode  (absorbed)  : q head dim 64 (rope) + qv head dim 512 (nope),
+#                         k head dim 64, v head dim 512, kv_heads == 1
+mla_cases = [
+    ("prefill", torch.bfloat16, 1, 198, 198, 32, 32, 192, 128, True),
+    ("decode", torch.bfloat16, 1, 1, 1025, 32, 1, 64, 512, False),
+]
+
+
+def _mla_inputs(case, seed=2026):
+    form, data_type, batch, sq, sk, heads, heads_k, dq, dv, _ = case
+    gen = torch.Generator().manual_seed(seed)
+
+    def rnd(shape):
+        return make_random_tensor(shape, data_type, generator=gen, device="npu")
+
+    q = rnd((batch, sq, heads, dq))
+    k = rnd((batch, sk, heads_k, dq))
+    v = rnd((batch, sk, heads_k, dv))
+    qv = rnd((batch, sq, heads, dv)) if form == "decode" else None
+    return q, k, v, qv
+
+
+def _mla_scale(case):
+    form, _, _, _, _, _, _, dq, dv, _ = case
+    return (dq + (dv if form == "decode" else 0)) ** -0.5
+
+
+def _mla_golden(case, q, k, v, qv, scale):
+    form, data_type, _, sq, sk, _, _, _, _, is_causal = case
+    q_cpu = q.contiguous().cpu()
+    k_cpu = k.contiguous().cpu()
+    v_cpu = v.contiguous().cpu()
+    if form == "decode":
+        # absorbed score = scale * (q @ k^T + qv @ v^T): merge into a 576-wide
+        # q/k pair so the plain prefill reference applies unchanged.
+        q_cpu = torch.cat([q_cpu, qv.contiguous().cpu()], dim=-1)
+        k_cpu = torch.cat([k_cpu, v_cpu], dim=-1)
+    mask, _, _ = make_golden_attention_mask(sq, sk, is_causal, -1, -1)
+    return ref_flash_attention_pair(q_cpu, k_cpu, v_cpu, scale, mask, data_type, 0.0)
+
+
+@pytest.mark.golden_api("flash_attn_func")
+@skip_unless_910_mla
+@pytest.mark.parametrize("case", mla_cases, ids=["mla_prefill", "mla_decode"])
+def test_v4_mla_flash_attn_func(case):
+    _, _, batch, sq, _, heads, _, _, dv, is_causal = case
+    scale = _mla_scale(case)
+    q, k, v, qv = _mla_inputs(case)
+    out_ref, _, out_pt, _ = _mla_golden(case, q, k, v, qv, scale)
+
+    out = flash_attn_func(q, k, v, qv=qv, softmax_scale=scale, causal=is_causal)
+    assert tuple(out.shape) == (batch, sq, heads, dv)
+    assert_fa_close(out, out_ref, out_pt, name="v4_mla_func_out")
+
+
+@pytest.mark.golden_api("flash_attn_varlen_func")
+@skip_unless_910_mla
+@pytest.mark.parametrize("case", mla_cases, ids=["mla_prefill", "mla_decode"])
+def test_v4_mla_flash_attn_varlen_func(case):
+    _, _, _, sq, sk, heads, _, _, dv, is_causal = case
+    scale = _mla_scale(case)
+    q, k, v, qv = _mla_inputs(case)
+    out_ref, _, out_pt, _ = _mla_golden(case, q, k, v, qv, scale)
+
+    out = flash_attn_varlen_func(
+        q[0],
+        k[0],
+        v[0],
+        qv=None if qv is None else qv[0],
+        cu_seqlens_q=make_cu_seqlens([sq]).npu(),
+        cu_seqlens_k=make_cu_seqlens([sk]).npu(),
+        max_seqlen_q=sq,
+        max_seqlen_k=sk,
+        softmax_scale=scale,
+        causal=is_causal,
+    )
+    assert tuple(out.shape) == (sq, heads, dv)
+    assert_fa_close(out, out_ref[0], out_pt[0], name="v4_mla_varlen_out")

@@ -1,0 +1,72 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# IDE
+.vscode/
+.idea/
+.cache/
+
+# python
+__pycache__/
+*.egg-info
+dist/
+site/
+# data bin
+*.bin
+*.dat
+*.pt
+
+# user define
+build/
+output/
+
+# tests/optest 构建产物（torch-catlass / scikit-build）
+tests/optest/_build/
+tests/optest/_skbuild/
+tests/optest/out/
+tests/optest/torch_catlass/lib/
+tests/optest/torch_catlass/jit/
+tests/optest/torch_catlass/include/
+tests/optest/torch_catlass/_version.py
+
+# msprof
+OPPROF*/
+
+# log文件
+*.log
+
+# OAT pre-commit (oat_check.sh 也会按需追加)
+oat_reports/
+log/
+**/.DS_Store
+python/tla_dsl/catlass/_version.py

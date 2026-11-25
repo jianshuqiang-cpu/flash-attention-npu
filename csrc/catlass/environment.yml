@@ -1,0 +1,14 @@
+---
+name: catlass-dev
+
+channels:
+  - defaults
+  - conda-forge
+  - ascend
+
+dependencies:
+  - python>=3.8,<3.12
+  - gcc>=7.5.0
+  - gxx>=7.5.0
+  - cmake>=3.16.0
+  - ascend::cann-toolkit>=8.5.0

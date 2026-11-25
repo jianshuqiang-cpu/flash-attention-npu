@@ -1,0 +1,235 @@
+name: NPU CI Full
+
+# 全量测试 workflow。手动触发, 不需要 PR。
+# 选择测试文件、arch、workers, 跑该文件的全量用例 (原始 test_cases)。
+#
+# 触发: Actions -> NPU CI Full -> Run workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_file:
+        description: "测试文件 (tests/ 下的文件名, 如 test_flash_attn_npu_v3.py)"
+        required: true
+        type: choice
+        default: ALL
+        options:
+          - ALL
+          - test_flash_attn_npu_v2.py
+          - test_flash_attn_npu_v2_metadata.py
+          - test_flash_attn_npu_v3.py
+          - test_flash_attn_npu_v4.py
+          - test_flash_attn_npu_v3_metadata.py
+          - test_flash_attn_npu_v3_graph.py
+      test_filter:
+        description: "pytest -k 过滤表达式 (留空跑全量, 如 test_fa_fwd_custom_ops)"
+        required: false
+        type: string
+        default: ""
+      arch:
+        description: "跑哪个架构 (910 只跑910B, 950 只跑950, both 都跑)"
+        required: false
+        type: choice
+        default: both
+        options:
+          - both
+          - 910
+          - 950
+      workers:
+        description: "pytest-xdist 并行进程数 (默认 2)"
+        required: false
+        type: string
+        default: "2"
+      build_npu:
+        description: "编译目标 (auto 按本机 NPU 编译, all 同时编译 910 和 950)"
+        required: false
+        type: choice
+        default: auto
+        options:
+          - auto
+          - all
+      ref:
+        description: "git ref (分支名/tag/commit, 默认 main)"
+        required: false
+        type: string
+        default: "main"
+
+jobs:
+  run:
+    name: Full CI (${{ matrix.arch_label }})
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - arch_label: x86_64-950
+            runs_on: '["self-hosted", "linux", "x64", "npu", "flash-attention-npu"]'
+            docker_image: fa-npu-ci:950-cann9.1-torch2.9
+            require_healthy: "true"
+            max_tasks: "6"
+          - arch_label: aarch64-910B
+            runs_on: '["self-hosted", "linux", "arm64", "npu", "flash-attention-npu"]'
+            docker_image: fa-npu-ci:910b-cann9.1-torch2.9
+            require_healthy: "false"
+            max_tasks: "4"
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    timeout-minutes: 600
+    env:
+      CI_DOCKER_IMAGE: ${{ matrix.docker_image }}
+      CI_DOCKER_CPUS: ${{ matrix.arch_label == 'x86_64-950' && '16' || '' }}
+      CI_REQUIRE_HEALTHY_NPU: ${{ matrix.require_healthy }}
+      CI_NPU_MAX_TASKS: ${{ matrix.max_tasks }}
+      CI_TEST_DIRECT_FILE: >-
+        ${{ github.event.inputs.test_file == 'ALL' && 'tests/' ||
+        format('tests/{0}', github.event.inputs.test_file) }}
+      CI_TEST_DIRECT_FILTER: ${{ github.event.inputs.test_filter }}
+      CI_TEST_WORKERS: ${{ github.event.inputs.workers }}
+      FLASH_ATTN_BUILD_NPU: ${{ github.event.inputs.build_npu }}
+      CI_MODE: full
+      CI_REF: ${{ github.event.inputs.ref }}
+      CI_CONTAINER_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}
+      CI_TEST_LOG_DIR_HOST: >-
+        /tmp/ci_test_logs/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-
+        ${{ matrix.arch_label }}
+      GOLDEN_CACHE_HOST_DIR: /home/FA_NPU_CI_DATA
+      GOLDEN_CACHE_DIR: /var/cache/flash-attention-npu/golden_cache
+      GOLDEN_CACHE_MODE: cache
+    steps:
+      - name: Check arch match
+        id: arch
+        run: |
+          arch="${{ github.event.inputs.arch }}"
+          label="${{ matrix.arch_label }}"
+          if [ "$arch" = "both" ] ||
+            { [ "$arch" = "910" ] && [ "$label" = "aarch64-910B" ]; } ||
+            { [ "$arch" = "950" ] && [ "$label" = "x86_64-950" ]; }; then
+            echo "match=true" >> "$GITHUB_OUTPUT"
+            echo "arch matches ($arch / $label), proceeding"
+          else
+            echo "match=false" >> "$GITHUB_OUTPUT"
+            echo "arch mismatch ($arch / $label), skipping"
+          fi
+
+      - name: Clone repo
+        if: steps.arch.outputs.match == 'true'
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$PWD"
+          REPO_URL="https://github.com/${GITHUB_REPOSITORY}.git"
+          unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy || true
+          git_proxy=""
+          git_proxy_hosts="github.com,gist.github.com,api.github.com,raw.githubusercontent.com,codeload.github.com,objects.githubusercontent.com"
+          case " $(hostname -I 2>/dev/null || true) " in
+            *" 192.168.13.241 "*) git_proxy=http://127.0.0.1:18790 ;;
+            *" 192.168.9.226 "*) git_proxy=http://127.0.0.1:17890 ;;
+          esac
+          proxy_file="${PROXY_CONFIG_FILE:-${GOLDEN_CACHE_HOST_DIR:-/home/FA_NPU_CI_DATA}/proxy.conf}"
+          if [ -f "$proxy_file" ]; then
+            while IFS='=' read -r proxy_key proxy_value || [ -n "$proxy_key" ]; do
+              proxy_key="${proxy_key#"${proxy_key%%[![:space:]]*}"}"
+              proxy_key="${proxy_key%"${proxy_key##*[![:space:]]}"}"
+              [[ -z "$proxy_key" || "$proxy_key" == \#* ]] && continue
+              proxy_value="${proxy_value#"${proxy_value%%[![:space:]]*}"}"
+              proxy_value="${proxy_value%"${proxy_value##*[![:space:]]}"}"
+              case "$proxy_key" in
+                GIT_PROXY|HTTPS_PROXY|HTTP_PROXY|https_proxy|http_proxy) git_proxy="$proxy_value" ;;
+                GIT_PROXY_WHITELIST|PROXY_WHITELIST) git_proxy_hosts="$proxy_value" ;;
+              esac
+            done < "$proxy_file"
+          fi
+          [ "${CI_GIT_PROXY+x}" = x ] && git_proxy="$CI_GIT_PROXY"
+          [ "${CI_GIT_PROXY_WHITELIST+x}" = x ] && git_proxy_hosts="$CI_GIT_PROXY_WHITELIST"
+          git_proxy_conf="$(mktemp /tmp/ci-git-proxy.XXXXXX.conf)"
+          : > "$git_proxy_conf"
+          if [ -n "$git_proxy" ]; then
+            git_proxy_hosts="${git_proxy_hosts//,/ }"
+            for git_proxy_host in $git_proxy_hosts; do
+              git_proxy_host="${git_proxy_host#"${git_proxy_host%%[![:space:]]*}"}"
+              git_proxy_host="${git_proxy_host%"${git_proxy_host##*[![:space:]]}"}"
+              [ -n "$git_proxy_host" ] || continue
+              if [[ "$git_proxy_host" == *"://"* ]]; then
+                printf '[http "%s"]\n\tproxy = %s\n' "$git_proxy_host" "$git_proxy" >> "$git_proxy_conf"
+              else
+                printf '[http "https://%s"]\n\tproxy = %s\n' "$git_proxy_host" "$git_proxy" >> "$git_proxy_conf"
+                printf '[http "https://%s/"]\n\tproxy = %s\n' "$git_proxy_host" "$git_proxy" >> "$git_proxy_conf"
+                printf '[http "http://%s"]\n\tproxy = %s\n' "$git_proxy_host" "$git_proxy" >> "$git_proxy_conf"
+                printf '[http "http://%s/"]\n\tproxy = %s\n' "$git_proxy_host" "$git_proxy" >> "$git_proxy_conf"
+              fi
+            done
+          fi
+          chmod 644 "$git_proxy_conf" 2>/dev/null || true
+          proxy_args=()
+          if [ -s "$git_proxy_conf" ]; then
+            proxy_args+=(
+              -v "$git_proxy_conf:/tmp/ci-git-proxy.conf:ro"
+              -e GIT_CONFIG_COUNT=1
+              -e GIT_CONFIG_KEY_0=include.path
+              -e GIT_CONFIG_VALUE_0=/tmp/ci-git-proxy.conf
+            )
+          fi
+          docker_cpu_args=()
+          if [ -n "$CI_DOCKER_CPUS" ]; then
+            docker_cpu_args+=(--cpus="$CI_DOCKER_CPUS")
+          fi
+          docker run --rm \
+            "${docker_cpu_args[@]}" \
+            --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
+            "${proxy_args[@]}" \
+            --network host \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            "$CI_DOCKER_IMAGE" \
+            bash -c '
+              set -e
+              git config --global --add safe.directory /workspace
+              git config --global http.postBuffer 524288000
+              REPO_URL="https://github.com/'"${GITHUB_REPOSITORY}"'.git"
+              CI_REF="'"$CI_REF"'"
+              for i in 1 2 3; do
+                echo "[clone][docker] attempt $i/3"
+                rm -rf /workspace/.git /workspace/csrc/catlass 2>/dev/null || true
+                git init -q
+                git remote remove origin 2>/dev/null || true
+                git remote add origin "$REPO_URL"
+                if git fetch --depth=50 origin "$CI_REF"; then
+                  rm -rf /workspace/csrc/catlass 2>/dev/null || true
+                  git clean -fdx -e .git
+                  git checkout -q FETCH_HEAD
+                  echo "[clone][docker] success"
+                  chmod -R a+rw /workspace 2>/dev/null || true
+                  exit 0
+                fi
+                echo "[clone][docker] attempt $i/3 failed, retry in 15s..."
+                sleep 15
+              done
+              echo "[clone][docker] all 3 attempts failed"
+              exit 1
+            '
+
+          ls -la ci/run_ci_container.sh
+          git log --oneline -3
+
+      - name: Build + Test
+        if: steps.arch.outputs.match == 'true'
+        run: |
+          set -euo pipefail
+          bash ci/run_ci_container.sh
+
+      - name: Upload test logs
+        if: always() && steps.arch.outputs.match == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.arch_label }}
+          path: >-
+            /tmp/ci_test_logs/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-
+            ${{ matrix.arch_label }}/
+          retention-days: 7
+
+      - name: Clean up this job's CI containers
+        if: always() && steps.arch.outputs.match == 'true'
+        run: |
+          if [ -f ci/cleanup_ci_containers.sh ]; then
+            bash ci/cleanup_ci_containers.sh
+          else
+            echo "cleanup script not found; skipping cleanup"
+          fi

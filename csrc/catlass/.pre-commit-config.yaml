@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ---------------------------------------------------------------------------------------------------------
+minimum_pre_commit_version: 4.0.0
+exclude: ^LICENSES/|\.(html|csv|svg)$|^\.[^/]+/|(^|/)build/|(^|/)tests/|(^|/)3rdparty/|^experimental/|^tools/
+
+default_stages: [pre-commit]
+ci:
+  autofix_prs: false
+  autoupdate_schedule: monthly
+
+repos:
+  # pre-commit 基础检查
+  - repo: https://gitcode.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: ["--allow-multiple-documents"]
+        exclude: ^mkdocs\.yml$
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-json
+
+  # C++ 代码格式化检查
+  - repo: https://gitcode.com/pre-commit-clang/mirrors-clang-format
+    rev: v18.1.8
+    hooks:
+      - id: clang-format
+        files: \.(c|h|cpp|hpp|cc|hh|cxx|hxx|asc)$
+        args:
+          - "--style=file"
+          - "--verbose"
+          - "-i"
+
+  # Python 代码检查
+  - repo: https://gitcode.com/gh_mirrors/ru/ruff-pre-commit
+    rev: v0.14.14
+    hooks:
+      - id: ruff-check
+        args: ["--output-format", "github", "--fix", "--line-length", "120"]
+        types: [python]
+        exclude: gen_data.py
+
+      - id: ruff-format
+        types: [python]
+        exclude: gen_data.py
+
+  # 敏感词拦截
+  - repo: local
+    hooks:
+      - id: check-unrelated-npu-model
+        name: check-unrelated-npu-model
+        language: pygrep
+        entry: '[Aa]scend(?:910_93|950(?:DT|PR))[A-Za-z0-9_]+'
+        types: [text]
+        # TLA DSL C310/hivmc 合法 target 与文档示例；运行时字符串不可改，此处按文件屏蔽。
+        exclude: |
+          (?x)^(
+            python/tla_dsl/catlass/execution\.py|
+            python/tla_dsl/csrc/mlir/lib/Passes/PassesCommon\.h|
+            python/tla_dsl/docs/zh/bc-backend-integration\.md|
+            python/tla_dsl/docs/zh/evaluation/dsl_performance_tools\.md
+          )$

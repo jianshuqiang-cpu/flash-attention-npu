@@ -1,0 +1,225 @@
+// Copyright (c) 2026, Minghua Shen.
+
+#ifndef CSRC_ASCENDC950_FLASH_ATTN_NPU_v4_TILING_FROM_TENSORS_HPP
+#define CSRC_ASCENDC950_FLASH_ATTN_NPU_v4_TILING_FROM_TENSORS_HPP
+
+#include <cstdint>
+#include <vector>
+
+#include <ATen/ATen.h>
+#include <c10/util/Optional.h>
+
+#include "tilingdata.h"
+
+namespace flash_attn_npu_950_v4 {
+struct SeqlenScratch {
+    std::vector<int64_t> q;  // Q seqlen list (cumulative for TND, per-batch for BSND)
+    std::vector<int64_t> kv; // KV seqlen list (per-batch for paged/BSND, cumulative for TND+non-paged)
+};
+
+// Decumulate `cu` (size = batch + 1, int32) into per-batch seqlen
+// (size = batch, int64). Used for varlen Q where PyTorch only hands us
+// the cumulative-sum form.
+inline std::vector<int64_t> decumulate_int32_to_int64(const at::Tensor& cu_int32_cpu, int batch_size)
+{
+    TORCH_CHECK(cu_int32_cpu.dtype() == at::kInt, "decumulate_int32_to_int64: expected int32 tensor");
+    TORCH_CHECK(cu_int32_cpu.numel() == batch_size + 1, "decumulate_int32_to_int64: expected ", batch_size + 1,
+                " elements, got ", cu_int32_cpu.numel());
+    const int32_t* p = cu_int32_cpu.data_ptr<int32_t>();
+    std::vector<int64_t> out(batch_size);
+    for (int i = 0; i < batch_size; ++i) {
+        out[i] = static_cast<int64_t>(p[i + 1] - p[i]);
+    }
+    return out;
+}
+
+// Widen seqused-style int32 tensor (size = batch) to int64.
+inline std::vector<int64_t> widen_int32_to_int64(const at::Tensor& int32_cpu, int batch_size)
+{
+    TORCH_CHECK(int32_cpu.dtype() == at::kInt, "widen_int32_to_int64: expected int32 tensor");
+    TORCH_CHECK(int32_cpu.numel() == batch_size, "widen_int32_to_int64: expected ", batch_size, " elements, got ",
+                int32_cpu.numel());
+    const int32_t* p = int32_cpu.data_ptr<int32_t>();
+    std::vector<int64_t> out(batch_size);
+    for (int i = 0; i < batch_size; ++i) {
+        out[i] = static_cast<int64_t>(p[i]);
+    }
+    return out;
+}
+
+// Widen cumulative cu_seqlens int32 tensor (size = batch + 1) to int64
+// WITHOUT decumulating. The 950 tiling code expects cumulative form for
+// TND layout (see FAInferTiling::FillSplitCoreTilingData).
+inline std::vector<int64_t> widen_cu_seqlens_int32_to_int64(const at::Tensor& cu_int32_cpu, int batch_size)
+{
+    TORCH_CHECK(cu_int32_cpu.dtype() == at::kInt, "widen_cu_seqlens_int32_to_int64: expected int32 tensor");
+    TORCH_CHECK(cu_int32_cpu.numel() == batch_size + 1, "widen_cu_seqlens_int32_to_int64: expected ", batch_size + 1,
+                " elements, got ", cu_int32_cpu.numel());
+    const int32_t* p = cu_int32_cpu.data_ptr<int32_t>();
+    std::vector<int64_t> out(batch_size + 1);
+    for (int i = 0; i < batch_size + 1; ++i) {
+        out[i] = static_cast<int64_t>(p[i]);
+    }
+    return out;
+}
+
+// Build cumulative seqlen list (batch+1 elements) from per-batch
+// seqlens. Used for kvSeqlenList in TND + non-paged mode where we only
+// have per-batch seqused_k but the tiling code expects cumulative form.
+inline std::vector<int64_t> cumulate_int64(const std::vector<int64_t>& per_batch)
+{
+    std::vector<int64_t> out(per_batch.size() + 1);
+    out[0] = 0;
+    for (size_t i = 0; i < per_batch.size(); ++i) {
+        out[i + 1] = out[i] + per_batch[i];
+    }
+    return out;
+}
+
+inline void
+fill_inference_context(optiling::FAInferContext& ctx, SeqlenScratch& scratch, const at::Tensor& q, const at::Tensor& k,
+                       const at::Tensor& v,
+                       const at::Tensor* cu_seqlens_q_cpu_int32, // nullable: !is_varlen_q
+                       const at::Tensor* seqused_q_cpu_int32,    // nullable: *used* Q lengths, region cu when absent
+                       const at::Tensor* seqused_k_cpu_int32,    // nullable: caller must pass per-batch seqlen
+                       bool paged_KV, int page_block_size, int num_blocks, int max_num_blocks_per_seq, bool is_causal,
+                       bool is_local, int64_t window_size_left, int64_t window_size_right, bool is_varlen_q,
+                       bool is_bf16, int batch_size, int seqlen_q, int num_heads, int num_heads_k, int head_size_q,
+                       int head_size_v, float softmax_scale, float softcapValue, bool lse_flag, FwdLayout layout,
+                       uint32_t quantMode = 0) // TND (varlen), BSND (B,S,H,D) or BNSD (B,H,S,D)
+{
+    if (is_varlen_q) {
+        TORCH_CHECK(cu_seqlens_q_cpu_int32 != nullptr, "fill_inference_context: varlen Q requires cu_seqlens_q");
+        if (seqused_q_cpu_int32 != nullptr) {
+            // Tiling follows the *used* lengths; offsets stay on the cu region.
+            auto q_per_batch = widen_int32_to_int64(*seqused_q_cpu_int32, batch_size);
+            if (layout == FwdLayout::TND) {
+                scratch.q.assign(batch_size + 1, 0);
+                for (int i = 0; i < batch_size; ++i) {
+                    scratch.q[i + 1] = scratch.q[i] + q_per_batch[i];
+                }
+            } else {
+                scratch.q = std::move(q_per_batch);
+            }
+        } else if (layout == FwdLayout::TND) {
+            scratch.q = widen_cu_seqlens_int32_to_int64(*cu_seqlens_q_cpu_int32, batch_size);
+        } else {
+            scratch.q = decumulate_int32_to_int64(*cu_seqlens_q_cpu_int32, batch_size);
+        }
+    } else {
+        if (layout == FwdLayout::TND) {
+            scratch.q.resize(batch_size + 1);
+            scratch.q[0] = 0;
+            for (int i = 0; i < batch_size; ++i) {
+                scratch.q[i + 1] = scratch.q[i] + seqlen_q;
+            }
+        } else {
+            scratch.q.assign(batch_size, static_cast<int64_t>(seqlen_q));
+        }
+    }
+    TORCH_CHECK(seqused_k_cpu_int32 != nullptr,
+                "fill_inference_context: per-batch KV seqlen (seqused_k / cache_seqlens) is required");
+
+    if (layout == FwdLayout::BNSD) {
+        // BNSD KV always uses a per-batch length list; a cumulative (batch+1)
+        // cu-packed list has no meaning for this layout.
+        TORCH_CHECK(seqused_k_cpu_int32->numel() == batch_size,
+                    "fill_inference_context: BNSD KV requires per-batch KV lengths (size = batch), "
+                    "not a cumulative batch+1 list");
+    }
+    if (seqused_k_cpu_int32->numel() == batch_size + 1) {
+        scratch.kv = widen_cu_seqlens_int32_to_int64(*seqused_k_cpu_int32, batch_size);
+    } else if (seqused_k_cpu_int32->numel() == batch_size) {
+        auto kv_per_batch = widen_int32_to_int64(*seqused_k_cpu_int32, batch_size);
+        if (layout == FwdLayout::TND && !paged_KV) {
+            scratch.kv = cumulate_int64(kv_per_batch);
+        } else {
+            scratch.kv = std::move(kv_per_batch);
+        }
+    } else {
+        TORCH_CHECK(false, "fill_inference_context: seqused_k has unexpected size ", seqused_k_cpu_int32->numel(),
+                    ", expected ", batch_size, " or ", batch_size + 1);
+    }
+
+    ctx.batch = batch_size;
+    ctx.numHeads = num_heads;
+    ctx.kvHeads = num_heads_k;
+    ctx.embeddingSize = head_size_q;
+    ctx.embeddingSizeV = head_size_v;
+    ctx.numBlocks = paged_KV ? num_blocks : 0;
+    ctx.blockSize = paged_KV ? page_block_size : 0;
+    ctx.maxNumBlocksPerBatch = paged_KV ? max_num_blocks_per_seq : 0;
+
+    int64_t maxQ = 0, maxKV = 0;
+    if (layout == FwdLayout::TND) {
+        for (int i = 0; i < batch_size; ++i) {
+            int64_t qLen = scratch.q[i + 1] - scratch.q[i];
+            if (qLen > maxQ)
+                maxQ = qLen;
+        }
+    } else {
+        for (int i = 0; i < batch_size; ++i) {
+            if (scratch.q[i] > maxQ)
+                maxQ = scratch.q[i];
+        }
+    }
+    if (layout == FwdLayout::TND && !paged_KV) {
+        for (int i = 0; i < batch_size; ++i) {
+            int64_t kvLen = scratch.kv[i + 1] - scratch.kv[i];
+            if (kvLen > maxKV)
+                maxKV = kvLen;
+        }
+    } else {
+        for (int i = 0; i < batch_size; ++i) {
+            if (scratch.kv[i] > maxKV)
+                maxKV = scratch.kv[i];
+        }
+    }
+    ctx.maxQSeqlen = maxQ;
+    ctx.maxKvSeqlen = maxKV;
+    ctx.qSeqlenList = scratch.q.data();
+    ctx.kvSeqlenList = scratch.kv.data();
+
+    // With softcap the kernel folds the scale into the softcap input:
+    // logits = softcap * tanh(softmax_scale * qk / softcap), so the epilogue
+    // scales S by softmax_scale / softcap and then applies tanh * softcap.
+    if (softcapValue > 0.0f) {
+        ctx.scaleValue = softmax_scale / softcapValue;
+    } else {
+        ctx.scaleValue = softmax_scale;
+    }
+    ctx.softcapValue = softcapValue;
+    if (is_local) {
+        ctx.maskType = optiling::MaskType::MASK_BAND;
+        ctx.windowSizeLeft = window_size_left;
+        ctx.windowSizeRight = window_size_right;
+    } else if (is_causal) {
+        ctx.maskType = optiling::MaskType::MASK_SPEC;
+        ctx.windowSizeLeft = 0;
+        ctx.windowSizeRight = 0;
+    } else {
+        ctx.maskType = optiling::MaskType::NO_MASK;
+        ctx.windowSizeLeft = 0;
+        ctx.windowSizeRight = 0;
+    }
+    ctx.dataType =
+        quantMode == 1 ? optiling::DataType::FP8 : (is_bf16 ? optiling::DataType::BF16 : optiling::DataType::FP16);
+    ctx.pagedCacheFlag = paged_KV;
+    ctx.lseFlag = lse_flag;
+    ctx.layout = layout; // TND (varlen), BSND (B,S,H,D) or BNSD (B,H,S,D)
+
+    ctx.innerPrecise = 0; // fixed FP32 accumulation
+    ctx.isTilingSink = false;
+    ctx.learnableSinkFlag = false;
+    ctx.flashDecodeFlag = false; // disables FlashDecode multi-split
+    ctx.kvcacheNzFlag = false;
+    ctx.pagedShapeFlag = false;
+    ctx.preToken = 0;
+    ctx.nextToken = 0;
+    ctx.sparseMode = 0;
+    ctx.numTokens = 0; // not used by DoTiling on this path
+}
+
+} // namespace flash_attn_npu_950_v4
+
+#endif // CSRC_ASCENDC950_FLASH_ATTN_NPU_v4_TILING_FROM_TENSORS_HPP

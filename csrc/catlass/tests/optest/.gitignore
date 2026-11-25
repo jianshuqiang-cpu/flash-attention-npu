@@ -1,0 +1,28 @@
+# 构建
+build/
+_build/
+_skbuild/
+out/
+compile_commands.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+
+# 开发环境
+.envrc
+*.swp
+*.swo
+
+# 运行时生成的文件（pip install / build.sh 产生）
+torch_catlass/_version.py
+torch_catlass/include/
+torch_catlass/jit/
+torch_catlass/lib/
+torch_catlass/__pycache__/
+
+# JIT 缓存
+.cache/

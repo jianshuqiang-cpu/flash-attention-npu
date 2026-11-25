@@ -1,0 +1,994 @@
+# flash-attention-npu
+
+<div align="center">
+  <a href="#"><img src="https://img.shields.io/badge/English-README.md-blue?style=flat-square" alt="English"></a> <a href="README.zh.md"><img src="https://img.shields.io/badge/中文-README.zh.md-green?style=flat-square" alt="中文"></a>
+</div>
+
+## Introduction
+
+FlashAttention significantly improves training and inference efficiency for modern large language models through tiling and memory-aware algorithms. The current mainstream implementation is [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention), which is primarily designed for NVIDIA GPU architectures. During Ascend platform migration, we found the lack of an API-compatible implementation with [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention) increased adaptation complexity. To address this gap, this repository implements FlashAttention algorithms adapted for Ascend NPU by following the core design of [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention) and building upon the [CANN/CATLASS](https://gitcode.com/cann/catlass) framework and its sample code. We provide an API consistent with [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention) to facilitate model migration and enable future attention algorithm optimizations for Ascend NPU.
+
+**This project is under active development, and discussions and contributions are highly welcome.**
+
+## Getting Started
+
+### Prerequisites
+
+- Hardware: Ascend 910B / 910C / 950 NPU
+- OS: Linux
+- Python: >= 3.9
+- CANN: Install the Toolkit, driver, and firmware supporting the target NPU.
+
+### Python Dependencies
+
+- `torch` (>= 2.4)
+- `torch_npu` (matching the PyTorch release version)
+- `setuptools` (>= 70.1, build)
+- `packaging` (build)
+- `pytest`, `numpy` (tests)
+- `pytest-xdist` (optional, parallel tests)
+
+```bash
+python -m pip install "setuptools>=70.1" packaging
+```
+
+FA4 Flex attention requires ascend-catlass-dsl >=2.1 only when the native DSL backend is used.
+
+- CANN environment variables
+```bash
+source [PATH_TO_ASCEND_HOME]/cann/set_env.sh
+# e.g.:
+# source /usr/local/Ascend/cann/set_env.sh
+```
+
+### Installation
+
+#### Quick Install
+
+```bash
+pip install flash-attn-npu --no-build-isolation
+```
+
+#### Build from Source
+
+1. Clone the repository:
+```bash
+git clone https://github.com/MinghuasLab/flash-attention-npu.git
+cd flash-attention-npu
+git submodule update --init --recursive
+```
+
+2. Build and install:
+
+```bash
+pip install -e . --no-build-isolation --no-deps --config-settings editable_mode=compat
+
+# Or build in place in the source directory
+python setup.py build_ext --inplace
+```
+
+  Build specific version:
+
+```bash
+# Build v2 only
+FLASH_ATTN_BUILD_VERSION=v2 python setup.py build_ext --inplace
+
+# Build v3 only
+FLASH_ATTN_BUILD_VERSION=v3 python setup.py build_ext --inplace
+
+# Build v4 only
+FLASH_ATTN_BUILD_VERSION=v4 python setup.py build_ext --inplace
+```
+
+  Build for specific NPU:
+
+```bash
+# Build 910 only
+FLASH_ATTN_BUILD_NPU=910 python setup.py build_ext --inplace
+
+# Build 950 only
+FLASH_ATTN_BUILD_NPU=950 python setup.py build_ext --inplace
+```
+
+## Testing
+
+Install test dependencies in the prepared NPU environment:
+
+```bash
+python -m pip install pytest numpy
+# Optional: parallel tests, as used by CI
+python -m pip install pytest-xdist
+```
+
+Run test scripts after building and installing the corresponding API version.
+FlashAttention v2 is supported only on Ascend 910B/C:
+
+```bash
+# Test FlashAttention v2
+pytest -q -s tests/test_flash_attn_npu_v2.py
+
+# Test FlashAttention v3
+pytest -q -s tests/test_flash_attn_npu_v3.py
+
+# Test FlashAttention v4
+pytest -q -s tests/test_flash_attn_npu_v4.py
+```
+
+## Memory Checking with msSanitizer
+
+Set `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE` at compile time and launch tests through `mssanitizer`:
+
+```bash
+# Build with memory checking enabled
+FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_BUILD_VERSION=v3 python setup.py build_ext --inplace
+
+# Ascend 910 / 950: launch through msSanitizer (note the `--` separator)
+mssanitizer --tool=memcheck -- python -m pytest -q -s tests/test_flash_attn_npu_v3.py
+
+# Optional: skip golden/precision compares so memcheck only launches kernels
+FLASH_ATTN_MEMCHECK=TRUE mssanitizer --tool=memcheck -- \
+  python -m pytest -q -s tests/test_flash_attn_npu_v3.py
+```
+Use a separate build without static instrumentation for graph execution:
+
+```bash
+# Repeat with v4 for FA4. Keep static eager-check artifacts in a separate location.
+FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_MSSANITIZER_MODE=runtime \
+  FLASH_ATTN_BUILD_NPU=910 FLASH_ATTN_BUILD_VERSION=v3 python setup.py build_ext --inplace
+python -m pytest -q -s tests/test_flash_attn_npu_v3_graph.py
+```
+
+`FLASH_ATTN_MSSANITIZER_MODE` accepts `auto` (default: static on 910, runtime on 950), `static` (910 only), and `runtime` (`-g -fno-jump-tables`, no static stubs). This option takes effect only with `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE`.
+
+## Usage
+
+### FlashAttention v2
+
+#### flash_attn_with_kvcache
+
+```python
+def flash_attn_with_kvcache(
+    q,
+    k_cache,
+    v_cache,
+    k=None,
+    v=None,
+    rotary_cos=None,
+    rotary_sin=None,
+    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+    cache_batch_idx: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    rotary_interleaved=True,
+    alibi_slopes=None,
+):
+    """
+    If k and v are not None, k_cache and v_cache will be updated *in-place* with the new values
+    from k and v. This is useful for incremental decoding: you can pass in the cached key/value
+    from the previous step, update them with the new key/value from the current step, and in
+    the same kernel perform attention with the updated cache.
+
+    If you pass in k / v, you must make sure that the cache is large enough to hold the new values.
+    For example, the KV cache can be pre-allocated with the max sequence length, and you can use
+    cache_seqlens to keep track of the current sequence length for each sequence in the batch.
+
+    If rotary_cos and rotary_sin are passed in, rotary positional embedding will be applied.
+    key @k will be rotated by rotary_cos and rotary_sin at positions cache_seqlens, cache_seqlens + 1, etc.
+    If causal or local (i.e., window_size != (-1, -1)), query @q will be rotated at positions
+    cache_seqlens, cache_seqlens + 1, etc.
+    If neither causal nor local, query @q will be rotated only at position cache_seqlens
+    (i.e., we assume that all tokens in @q are at position cache_seqlens).
+
+    Multi-query and grouped-query attention (MQA/GQA) are supported by passing in fewer KV heads
+    than Q heads. Q head count must be divisible by KV head count.
+    For example, if Q has 6 heads and K, V have 2 heads, then Q heads 0, 1, 2 will attend to
+    K, V head 0, and Q heads 3, 4, 5 will attend to K, V head 1.
+
+    If causal=True, the causal mask is aligned to the bottom-right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = mask) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If a row of the mask is all zeros, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention.
+    Query at position i will only attend to keys in [i + seqlen_k - seqlen_q - window_size[0],
+    i + seqlen_k - seqlen_q + window_size[1]].
+
+    Warning: Does not support backward pass.
+
+    Arguments:
+        q: (batch_size, seqlen, nheads, headdim)
+        k_cache: If no block_table, shape (batch_size_cache, seqlen_cache, nheads_k, headdim);
+            if block_table (i.e., paged KV cache), shape (num_blocks, page_block_size, nheads_k, headdim)
+            page_block_size must be a multiple of 256.
+        v_cache: If no block_table, shape (batch_size_cache, seqlen_cache, nheads_k, headdim);
+            if block_table (i.e., paged KV cache), shape (num_blocks, page_block_size, nheads_k, headdim)
+        k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate k to k_cache
+            starting at the position specified by cache_seqlens.
+        v [optional]: (batch_size, seqlen_new, nheads_k, headdim). Similar to k.
+        rotary_cos [optional]: (seqlen_ro, rotary_dim / 2). If not None, we apply rotary positional
+            embedding to k and q. Only applies if k and v are passed in. rotary_dim must be divisible by 16.
+        rotary_sin [optional]: (seqlen_ro, rotary_dim / 2). Same as rotary_cos.
+        cache_seqlens: int or (batch_size,), dtype torch.int32. The sequence length of the KV cache.
+        block_table [optional]: (batch_size, max_num_blocks_per_seq), dtype torch.int32.
+        cache_batch_idx: (batch_size,), dtype torch.int32. Indices to index into the KV cache.
+            If None, we assume that the batch indices are [0, 1, 2, ..., batch_size - 1].
+            If indices are not unique and k and v are provided, the updated values in the cache
+            might be from any of the duplicate indices.
+        softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for autoregressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        rotary_interleaved: bool. Only applies if rotary_cos and rotary_sin are passed in.
+            If True, rotary positional embedding combines dimensions 0 & 1, 2 & 3, etc.
+            If False, rotary positional embedding combines dimensions 0 & rotary_dim / 2,
+            1 & rotary_dim / 2 + 1 (i.e., GPT-NeoX style).
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32.
+            Add bias to the attention scores of query i and key j of (-alibi_slope * |i + seqlen_k - seqlen_q - j|).
+
+    Constraints:
+        - 1 <= headdim <= 256.
+        - nheads % nheads_k == 0.
+        - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
+        - Q, K, V must have contiguous last dimension (stride(-1) == 1).
+        - batch_size > 0.
+        - softcap >= 0 (0.0 disables; not supported on Ascend 950).
+        - alibi_slopes / rotary_cos / rotary_sin not supported.
+        - cache_seqlens / block_table must be int32 when provided.
+        - No backward pass.
+
+    Returns:
+        out: (batch_size, seqlen, nheads, headdim).
+    """
+```
+
+#### flash_attn_func
+
+```python
+def flash_attn_func(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softcap=0.0,  # <=0.0 means deactivated
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+):
+    """
+    dropout_p should be set to 0.0 during evaluation.
+
+    Multi-query and grouped-query attention (MQA/GQA) are supported by passing in K, V with fewer
+    heads than Q. Q head count must be divisible by K, V head count.
+    For example, if Q has 6 heads and K, V have 2 heads, then Q heads 0, 1, 2 will attend to
+    K, V head 0, and Q heads 3, 4, 5 will attend to K, V head 1.
+
+    If causal=True, the causal mask is aligned to the bottom-right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = mask) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If a row of the mask is all zeros, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention.
+    Query at position i will only attend to keys in [i + seqlen_k - seqlen_q - window_size[0],
+    i + seqlen_k - seqlen_q + window_size[1]].
+
+    Arguments:
+        q: (batch_size, seqlen, nheads, headdim)
+        k: (batch_size, seqlen, nheads_k, headdim)
+        v: (batch_size, seqlen, nheads_k, headdim)
+        dropout_p: float. Dropout probability.
+        softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for autoregressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        softcap: float. Activates softcapping attention if > 0.
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32.
+            Add bias to the attention scores of query i and key j of
+            (-alibi_slope * |i + seqlen_k - seqlen_q - j|).
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
+            testing only. The returned probabilities are not guaranteed to be correct
+            (they might not have the right scaling).
+
+    Constraints:
+        - 1 <= headdim <= 256.
+        - nheads % nheads_k == 0.
+        - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
+        - Q, K, V must have contiguous last dimension (stride(-1) == 1).
+        - batch_size > 0.
+        - softcap >= 0 (0.0 disables; not supported on Ascend 950).
+        - 0.0 <= dropout_p < 1.0; 0.0 disables dropout.
+        - alibi_slopes not supported.
+        - Backward: headdim in (0, 256]; Q and K must share the same headdim.
+
+    Returns:
+        out: (batch_size, seqlen, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen).
+            The logsumexp of each row of QK^T * scaling (e.g., log of the softmax normalization factor).
+        S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
+            The output of softmax (possibly with different scaling). It also encodes the dropout
+            pattern (negative means that location was dropped, nonnegative means it was kept).
+    """
+```
+
+#### flash_attn_varlen_func
+
+```python
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softcap=0.0,  # <=0.0 means deactivated
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    block_table=None,
+):
+    """
+    dropout_p should be set to 0.0 during evaluation.
+
+    Supports variable-length sequences: Q, K, V are stored as concatenated tokens, indexed by
+    cu_seqlens for sequence boundaries.
+    Multi-query and grouped-query attention (MQA/GQA) are supported by passing in K, V with fewer
+    heads than Q. Q head count must be divisible by K, V head count.
+
+    If causal=True, the causal mask is aligned to the bottom-right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = mask) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If a row of the mask is all zeros, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention.
+    Query at position i will only attend to keys in [i + seqlen_k - seqlen_q - window_size[0],
+    i + seqlen_k - seqlen_q + window_size[1]].
+
+    Arguments:
+        q: (total_q, nheads, headdim), where total_q is the total number of query tokens in the batch.
+        k: (total_k, nheads_k, headdim), where total_k is the total number of key tokens in the batch.
+        v: (total_k, nheads_k, headdim), where total_k is the total number of value tokens in the batch.
+        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. Cumulative sequence lengths used to index q.
+        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. Cumulative sequence lengths used to index k, v.
+        max_seqlen_q: int. Maximum query sequence length in the batch.
+        max_seqlen_k: int. Maximum key sequence length in the batch.
+        dropout_p: float. Dropout probability.
+        softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for autoregressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        softcap: float. Activates softcapping attention if > 0.
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32.
+            Add bias to the attention scores of query i and key j of
+            (-alibi_slope * |i + seqlen_k - seqlen_q - j|).
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for testing only.
+        block_table [optional]: Block table for paged KV cache.
+
+    Constraints:
+        - 1 <= headdim <= 256.
+        - nheads % nheads_k == 0.
+        - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
+        - Q, K, V must have contiguous last dimension (stride(-1) == 1).
+        - batch_size > 0.
+        - total_q > 0; Q must contain at least one query token.
+        - softcap >= 0 (0.0 disables; not supported on Ascend 950).
+        - 0.0 <= dropout_p < 1.0; 0.0 disables dropout.
+        - alibi_slopes not supported.
+        - cu_seqlens_q / cu_seqlens_k / block_table must be int32 when provided.
+        - Backward: headdim in (0, 256]; Q and K must share the same headdim.
+
+    Returns:
+        out: (total_q, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q).
+            The logsumexp of each row of QK^T * scaling.
+        S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
+            The output of softmax, also encoding the dropout pattern.
+    """
+```
+
+### FlashAttention v3
+
+#### flash_attn_with_kvcache
+
+```python
+def flash_attn_with_kvcache(
+    q,
+    k_cache,
+    v_cache,
+    k=None,
+    v=None,
+    qv=None,
+    rotary_cos=None,
+    rotary_sin=None,
+    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+    cache_batch_idx: Optional[torch.Tensor] = None,
+    cache_leftpad: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    rotary_seqlens: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    attention_chunk=0,
+    softcap=0.0,
+    rotary_interleaved=True,
+    scheduler_metadata=None,
+    num_splits=0,
+    pack_gqa=None,
+    sm_margin=0,
+    return_softmax_lse=False,
+):
+    """
+    v3 version of the KV cache interface, with more features compared to v2.
+
+    If k and v are not None, k_cache and v_cache will be updated *in-place* with the new values
+    from k and v. This is useful for incremental decoding.
+
+    Multi-query and grouped-query attention (MQA/GQA) are supported.
+
+    If causal=True, the causal mask is aligned to the bottom-right corner of the attention matrix.
+
+    If window_size != (-1, -1), implements sliding window local attention.
+
+    Warning: Does not support backward pass.
+
+    Arguments:
+        q: (batch_size, seqlen, nheads, headdim)
+        k_cache: If no page_table, shape (batch_size_cache, seqlen_cache, nheads_k, headdim);
+            if page_table (i.e., paged KV cache), shape (num_blocks, page_block_size, nheads_k, headdim)
+            page_block_size can be any value (e.g., 1, 2, 3, 64, etc).
+        v_cache: If no page_table, shape (batch_size_cache, seqlen_cache, nheads_k, headdim_v);
+            if page_table, shape (num_blocks, page_block_size, nheads_k, headdim_v).
+        k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, concatenate k to k_cache
+            starting at the position specified by cache_seqlens.
+        v [optional]: (batch_size, seqlen_new, nheads_k, headdim_v). Similar to k.
+        qv [optional]: (batch_size, seqlen, nheads, headdim_v).
+        rotary_cos [optional]: (seqlen_ro, rotary_dim / 2). Cosine values for rotary positional embedding.
+        rotary_sin [optional]: (seqlen_ro, rotary_dim / 2). Sine values for rotary positional embedding.
+        cache_seqlens: int or (batch_size,), dtype torch.int32. The sequence length of the KV cache.
+        cache_batch_idx: (batch_size,), dtype torch.int32. Indices to index into the KV cache.
+        cache_leftpad: (batch_size,), dtype torch.int32. KV cache starting index.
+        page_table [optional]: (batch_size, max_num_blocks_per_seq), dtype torch.int32.
+        cu_seqlens_q [optional]: Cumulative sequence lengths of queries in ragged mode.
+        cu_seqlens_k_new [optional]: Cumulative sequence lengths of new keys in ragged mode.
+        max_seqlen_q [optional]: Maximum query sequence length in ragged mode.
+        rotary_seqlens [optional]: Sequence lengths for rotary positional embedding.
+        q_descale, k_descale, v_descale: Optional dequantization scales for FP8 quantization.
+        softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask.
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        attention_chunk: int. Attention chunk size.
+        softcap: float. Activates softcapping attention if > 0.
+        rotary_interleaved: bool. Rotary positional embedding mode.
+        scheduler_metadata: Optional scheduler metadata.
+        num_splits: int. If > 1, split key/value along the sequence dimension into this many chunks.
+            If num_splits == 1, no splitting. If num_splits == 0, automatically selected.
+        pack_gqa: bool. Whether to pack GQA for better performance.
+        sm_margin: int. SM margin for tuning.
+        return_softmax_lse: bool. Whether to return logsumexp of attention scores.
+
+    Constraints:
+        - 1 <= headdim <= 256.
+        - FP8_E4M3FN requires Q/K/V headdim=128.
+        - nheads % nheads_k == 0.
+        - dtype: float16 / bfloat16 / FP8_E4M3FN (Ascend 950 only); Q, K, V must share the same dtype.
+        - Q, K, V must have contiguous last dimension (stride(-1) == 1).
+        - batch_size > 0.
+        - softcap >= 0 (0.0 disables).
+        - alibi_slopes / rotary / attention_chunk / pack_gqa not supported.
+        - cache_seqlens / page_table / cu_seqlens_* must be int32 when provided.
+        - No backward pass.
+
+    Returns:
+        out: (batch_size, seqlen, nheads, headdim).
+        softmax_lse [optional]: (batch_size, nheads, seqlen). The logsumexp of each row of QK^T * scaling.
+    """
+```
+
+#### flash_attn_func
+
+```python
+def flash_attn_func(
+    q,
+    k,
+    v,
+    softmax_scale=None,
+    causal=False,
+    qv=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    window_size=(-1, -1),
+    attention_chunk=0,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    deterministic=False,
+    sm_margin=0,
+    return_attn_probs=False,
+):
+    """
+    v3 version of the standard attention interface, with additional parameters such as FP8
+    dequantization and attention_chunk compared to v2.
+
+    Multi-query and grouped-query attention (MQA/GQA) are supported by passing in K, V with fewer
+    heads than Q. Q head count must be divisible by K, V head count.
+
+    If causal=True, the causal mask is aligned to the bottom-right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = mask) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If a row of the mask is all zeros, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention.
+    Query at position i will only attend to keys in [i + seqlen_k - seqlen_q - window_size[0],
+    i + seqlen_k - seqlen_q + window_size[1]].
+
+    Arguments:
+        q: (batch_size, seqlen, nheads, headdim)
+        k: (batch_size, seqlen, nheads_k, headdim)
+        v: (batch_size, seqlen, nheads_k, headdim)
+        softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for autoregressive modeling).
+        qv [optional]: (batch_size, seqlen, nheads, headdim_v).
+        q_descale, k_descale, v_descale: Optional dequantization scales for FP8 quantization.
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        attention_chunk: int. Attention chunk size.
+        softcap: float. Activates softcapping attention if > 0.
+        num_splits: int. If > 1, split key/value along the sequence dimension into this many chunks.
+            If num_splits == 1, no splitting. If num_splits == 0, automatically selected.
+        pack_gqa: bool. Whether to pack GQA for better performance.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass.
+        sm_margin: int. SM margin for tuning.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for testing only.
+
+    Constraints:
+        - 1 <= headdim <= 256.
+        - FP8_E4M3FN requires Q/K/V headdim=128 and supports forward only.
+        - nheads % nheads_k == 0.
+        - dtype: float16 / bfloat16 / FP8_E4M3FN (Ascend 950 only); Q, K, V must share the same dtype.
+        - Q, K, V must have contiguous last dimension (stride(-1) == 1).
+        - batch_size > 0.
+        - softcap >= 0 (0.0 disables).
+        - alibi_slopes / attention_chunk / pack_gqa not supported.
+        - Backward: headdim in (0, 256]; Q and K must share the same headdim; seqused_* not supported in bwd.
+
+    Returns:
+        out: (batch_size, seqlen, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen).
+            The logsumexp of each row of QK^T * scaling.
+    """
+```
+
+#### flash_attn_varlen_func
+
+```python
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    seqused_q=None,
+    seqused_k=None,
+    softmax_scale=None,
+    causal=False,
+    qv=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    window_size=(-1, -1),
+    attention_chunk=0,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    deterministic=False,
+    sm_margin=0,
+    return_attn_probs=False,
+):
+    """
+    v3 version of the variable-length sequence attention interface.
+
+    Supports variable-length sequences: Q, K, V are stored as concatenated tokens, indexed by
+    cu_seqlens for sequence boundaries.
+    Multi-query and grouped-query attention (MQA/GQA) are supported.
+
+    If causal=True, the causal mask is aligned to the bottom-right corner of the attention matrix.
+
+    If window_size != (-1, -1), implements sliding window local attention.
+
+    Arguments:
+        q: (total_q, nheads, headdim), where total_q is the total number of query tokens in the batch.
+        k: (total_k, nheads_k, headdim), where total_k is the total number of key tokens in the batch.
+        v: (total_k, nheads_k, headdim), where total_k is the total number of value tokens in the batch.
+        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. Cumulative sequence lengths used to index q.
+        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. Cumulative sequence lengths used to index k, v.
+        max_seqlen_q: int. Maximum query sequence length in the batch.
+        max_seqlen_k: int. Maximum key sequence length in the batch.
+        seqused_q [optional]: Actual query sequence lengths used.
+        seqused_k [optional]: Actual key sequence lengths used.
+        softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask.
+        qv [optional]: Additional query value tensor.
+        q_descale, k_descale, v_descale: Optional dequantization scales for FP8 quantization.
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        attention_chunk: int. Attention chunk size.
+        softcap: float. Activates softcapping attention if > 0.
+        num_splits: int. Number of chunks to split key/value along the sequence dimension.
+        pack_gqa: bool. Whether to pack GQA for better performance.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass.
+        sm_margin: int. SM margin for tuning.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for testing only.
+
+    Constraints:
+        - 1 <= headdim <= 256.
+        - FP8_E4M3FN requires Q/K/V headdim=128 and supports forward only.
+        - nheads % nheads_k == 0.
+        - dtype: float16 / bfloat16 / FP8_E4M3FN (Ascend 950 only); Q, K, V must share the same dtype.
+        - Q, K, V must have contiguous last dimension (stride(-1) == 1).
+        - batch_size > 0.
+        - total_q > 0; Q must contain at least one query token.
+        - softcap >= 0 (0.0 disables).
+        - alibi_slopes / attention_chunk / pack_gqa not supported.
+        - cu_seqlens_q / cu_seqlens_k must be int32 when provided.
+        - Backward: headdim in (0, 256]; Q and K must share the same headdim; seqused_* not supported in bwd.
+
+    Returns:
+        out: (total_q, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q).
+            The logsumexp of each row of QK^T * scaling.
+    """
+```
+
+#### flash_attn_combine
+
+```python
+def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
+    """
+    Merge the partial outputs of a split-KV attention computation:
+        lse = logsumexp_s(lse_partial)
+        out = sum_s exp(lse_s - lse) * O_s
+
+    Arguments:
+        out_partial: fp32 partial outputs.
+            BSND: (num_splits, batch, seqlen, nheads, headdim)
+            TND:  (num_splits, total_q, nheads, headdim)
+        lse_partial: fp32 partial logsumexp in logical (..., seqlen, heads) order.
+            BSND: (num_splits, batch, seqlen, nheads)
+            TND:  (num_splits, total_q, nheads)
+        out [optional]: preallocated output, written in place.
+            When provided, its dtype is authoritative.
+        out_dtype [optional]: fp16 / bf16 / fp32. Defaults to out_partial.dtype
+            (fp32), matching flash-attention.
+
+    Returns:
+        (out, softmax_lse). softmax_lse is fp32 shaped (batch, seqlen, nheads)
+        or (total_q, nheads) - it is contiguous along seqlen, unlike
+        flash_attn_func's (batch, nheads, seqlen).
+
+    The in-tree v3 forward does not currently expose real split accumulators;
+    callers must obtain out_partial/lse_partial from an external split-attention
+    producer.
+    """
+```
+
+> The public v3 Python wrapper currently accepts only the four arguments above
+> and always returns the combined LSE. The lower-level `fwd_combine` also
+> supports `cu_seqlens`, `seqused`, and `return_lse`, but those arguments are not
+> currently forwarded by the public wrapper and should not be treated as a
+> stable public API. When supplied to the lower layer, `cu_seqlens` / `seqused`
+> are only validated and do not limit the rows that are processed.
+
+### FlashAttention v4
+
+#### flash_attn_varlen_func
+```python
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    qv=None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    min_seqlen_k: Optional[int] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    gather_kv_indices: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    learnable_sink: Optional[torch.Tensor] = None,
+    softcap=0.0, # 0.0 means deactivated
+    num_splits=0,    # Can be tuned for speed
+    pack_gqa: Optional[bool] = None,
+    deterministic: bool = False,
+    score_mod: Optional[Callable] = None,
+    score_mod_bwd: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
+    block_sparse_tensors=None,
+    aux_tensors: Optional[list] = None,
+    aux_scalars: Optional[tuple] = None,
+    return_lse: bool = False,
+):
+    """
+    FlashAttention for variable-length sequences with optional paged KV cache.
+
+    If cu_seqlens_q is provided, the input is treated as varlen (packed) format,
+    where all sequences are concatenated along the sequence dimension. Otherwise,
+    q, k, v are treated as dense tensors of shape (batch_size, seqlen, nheads, headdim).
+
+    For paged KV cache, pass page_table and shape k/v as
+    (num_pages, page_size, nheads_k, headdim).
+    For physical BNBD storage shaped (num_pages, nheads_k, page_size, headdim), pass `k.transpose(1, 2)`
+    and `v.transpose(1, 2)`. The transpose is a metadata-only view; FA3 and FA4 recognize its
+    token/head strides and read the original BNBD storage directly.
+    Appending new K/V into a physical BNBD cache is not supported yet.
+    The physical-page axis may be non-contiguous: `stride(0)` is honored independently
+    for K and V, while the selected layout's inner dimensions must be dense. TND batches
+    may contain zero-length Q or KV sequences; an all-zero-Q batch returns empty
+    output/LSE tensors without launching a kernel.
+
+    Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
+    than Q. The number of heads in Q must be divisible by the number of heads in KV.
+
+    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If the row of the mask is all zero, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention. Query at position i
+    will only attend to keys between
+    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
+
+    Arguments:
+        q: (batch_size, seqlen, nheads, headdim) or (total_q, nheads, headdim) if cu_seqlens_q
+            is provided.
+        k: (batch_size, seqlen, nheads_k, headdim) or (total_k, nheads_k, headdim) if cu_seqlens_k
+            is provided, or (num_pages, page_size, nheads_k, headdim) if page_table is provided.
+        v: (batch_size, seqlen, nheads_k, headdim_v) or (total_k, nheads_k, headdim_v) if
+            cu_seqlens_k is provided, or (num_pages, page_size, nheads_k, headdim_v) if page_table
+            is provided.
+        qv [optional]: (batch_size, seqlen, nheads, headdim_v). Used for cross-attention.
+        cu_seqlens_q [optional]: (batch_size + 1,), dtype torch.int32. Cumulative sequence lengths
+            of q.
+        cu_seqlens_k [optional]: (batch_size + 1,), dtype torch.int32. Cumulative sequence lengths
+            of k.
+        max_seqlen_q [optional]: Maximum sequence length of q.
+        max_seqlen_k [optional]: Maximum sequence length of k.
+        min_seqlen_k [optional]: Minimum sequence length of k. (Not supported on NPU)
+        seqused_q [optional]: (batch_size,), dtype torch.int32. If given, only this many elements
+            of each batch element's queries are used.
+        seqused_k [optional]: (batch_size,), dtype torch.int32. If given, only this many elements
+            of each batch element's keys are used. Equivalent to cache_seqlens in KV cache scenarios.
+        gather_kv_indices [optional]: (Not supported on NPU)
+        page_table [optional]: (batch_size, max_num_pages_per_seq), dtype torch.int32. Page table
+            for paged KV cache.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim + (headdim_v if qv is not None else 0)).
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        learnable_sink [optional]: (num_heads,), dtype bfloat16. Learnable sink token.
+            (Not supported on NPU)
+        softcap: float. Anything > 0 activates softcapping attention.
+        num_splits: int. If > 1, split the key/value into this many chunks along the sequence.
+            If num_splits == 0, use a heuristic to automatically determine the number of splits.
+        pack_gqa: bool. If True, pack GQA for better performance. (Not supported on NPU)
+        deterministic: bool. Whether to use deterministic backward pass.
+        score_mod: Optional callable. Custom score modification.
+        score_mod_bwd: Optional callable. Custom score modification for backward.
+        mask_mod: Optional callable. Custom attention mask.
+        block_sparse_tensors: Optional block sparse tensors.
+        aux_tensors: Optional list of tensors. Auxiliary tensors for score_mod.
+        aux_scalars: Optional tuple. Auxiliary scalars for score_mod/mask_mod.
+        return_lse: bool. Whether to return the logsumexp of the attention scores.
+
+    Constraints:
+        - 1 <= headdim <= 256.
+        - FP8_E4M3FN requires Q/K/V headdim=128 and supports forward only.
+        - nheads % nheads_k == 0.
+        - dtype: float16 / bfloat16 / FP8_E4M3FN (Ascend 950 only); Q, K, V must share the same dtype.
+        - Q, K, V must have contiguous last dimension (stride(-1) == 1).
+        - batch_size > 0.
+        - softcap >= 0 (0.0 disables).
+        - On Ascend 950, score_mod / mask_mod are routed to the native Flex backend.
+        - Flex backend: learnable_sink is not supported.
+        - pack_gqa / min_seqlen_k / gather_kv_indices are not supported.
+        - cu_seqlens_* / seqused_* / page_table must be int32 when provided.
+        - On Ascend 950, paged KV cache page_size must be one of 128, 256, 512, or 1024.
+        - Backward: headdim in (0, 256]; Q and K must share the same headdim; seqused_* not supported in bwd.
+
+    Return:
+        out: (batch_size, seqlen, nheads, headdim_v) or (total_q, nheads, headdim_v) if varlen.
+        softmax_lse [optional, if return_lse=True]: (batch_size, nheads, seqlen) or
+            (nheads, total_q) for varlen. The logsumexp of each row of the matrix
+            QK^T * scaling (e.g., log of the softmax normalization factor).
+    """
+```
+
+#### flash_attn_combine
+
+```python
+def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
+                       cu_seqlens=None, seqused=None, virtual_batch_idx=None,
+                       return_lse=True):
+    """
+    FA4 entry point for merging split attention partial outputs (same math as
+    the v3 helper). A 4-D out_partial selects the varlen (TND) layout; a 5-D
+    out_partial selects the batched (BSND) layout.
+
+    out_partial supports fp16, bf16, or fp32; lower-precision partials are
+    converted to fp32 for accumulation. out.dtype is authoritative when out is
+    provided.
+    cu_seqlens / seqused: optional int32 metadata accepted for API parity; they
+    are validated but do not currently limit the processed rows.
+    virtual_batch_idx: optional dense-layout mapping from virtual batch slots
+    to real batch indices.
+    return_lse=False returns (out, None).
+    """
+```
+
+> The public v4 Python wrapper exposes all arguments above. `cu_seqlens` /
+> `seqused` are still only validated and do not currently limit the processed
+> rows; `return_lse=False` skips allocation and return of the LSE.
+
+#### flash_attn_combine runtime constraints
+
+In the current implementation, v3 combine behaves identically on Ascend 910 and
+Ascend 950, as does v4. The public interfaces also have these constraints:
+
+- `1 <= num_splits <= 256`; the last dimension of `out_partial` must be
+  contiguous.
+- `lse_partial` must be fp32, have one dimension fewer than `out_partial`, and
+  match every non-LSE dimension of `out_partial`.
+- Kernel tiles must fit within 150 KiB of UB. For a given `num_splits` and output
+  dtype, this couples `head_dim` to `num_splits`; exceeding the limit raises
+  `combine tile exceeds 150 KiB UB budget for head_dim=...`. Representative
+  limits are:
+
+  | num_splits | max head_dim for fp16 / bf16 output | max head_dim for fp32 output |
+  | ---------: | ----------------------------------: | ---------------------------: |
+  |          1 |                                 864 |                          792 |
+  |          8 |                                 864 |                          792 |
+  |         16 |                                 848 |                          784 |
+  |         32 |                                 848 |                          776 |
+  |         64 |                                 816 |                          752 |
+  |        128 |                                 768 |                          712 |
+  |        192 |                                 720 |                          672 |
+  |        256 |                                 672 |                          624 |
+
+  The exact check aligns the split count with
+  `ceil(num_splits / 8) * 8`:
+
+  ```text
+  per_row = ns_align * 16 + (16 + out_bytes + 4) * HEAD_DIM_ALIGN
+  ```
+
+  For fp32 output, `out_bytes=4` and `HEAD_DIM_ALIGN` rounds up to a multiple of
+  8; for fp16 / bf16 output, `out_bytes=2` and `HEAD_DIM_ALIGN` rounds up to a
+  multiple of 16. The kernel selects the first of 32, 24, 16, or 8 rows that
+  satisfies `tile_rows * per_row <= 150 * 1024`; it raises if even 8 rows exceed
+  the budget.
+- If any of `seqlen`, `num_heads`, or `head_dim` is zero, the interface performs
+  the preceding shape and argument validation, then returns a shape-correct
+  `out` tensor (and LSE when requested) without launching the combine kernel.
+
+## Features
+
+#### flash_attn_with_kvcache
+| Feature | v2 | v3 |
+|---------|----|----|
+| FP16 (float16) | ✅ | ✅ |
+| BF16 (bfloat16) | ✅ | ✅ |
+| Causal Attention | ✅ | ✅ |
+| Sliding Window Attention | ✅ | ✅ |
+| MQA/GQA | ✅ | ✅ |
+| Paged KV Cache | ✅ | ✅ |
+| Rotary Positional Embedding (RoPE) | - | - |
+| ALiBi | ✅ | - |
+| Softcapping | ✅ | ✅ |
+| FP8 Quantization | - | ✅ |
+| Variable-length Sequences | ✅ | ✅ |
+
+#### flash_attn_func
+| Feature | v2 | v3 |
+|---------|----|----|
+| FP16 (float16) | ✅ | ✅ |
+| BF16 (bfloat16) | ✅ | ✅ |
+| Causal Attention | ✅ | ✅ |
+| Sliding Window Attention | ✅ | ✅ |
+| MQA/GQA | ✅ | ✅ |
+| Backward Pass | ✅ | ✅ |
+| ALiBi | ✅ | - |
+| Softcapping | ✅ | ✅ |
+| FP8 Quantization | - | ✅ |
+| Dropout | ✅ | - |
+
+#### flash_attn_varlen_func
+| Feature | v2 | v3 | v4 |
+|---------|----|----|----|
+| FP16 (float16) | ✅ | ✅ | ✅ |
+| BF16 (bfloat16) | ✅ | ✅ | ✅ |
+| Causal Attention | ✅ | ✅ | ✅ |
+| Sliding Window Attention | ✅ | ✅ | ✅ |
+| MQA/GQA | ✅ | ✅ | ✅ |
+| Backward Pass | ✅ | ✅ | ✅ |
+| Variable-length Sequences | ✅ | ✅ | ✅ |
+| Paged KV Cache | ✅ | ✅ | ✅ |
+| ALiBi | ✅ | - | - |
+| Softcapping | ✅ | ✅ | ✅ |
+| FP8 Quantization | - | ✅ | ✅ |
+| Dropout | ✅ | - | - |
+
+#### flash_attn_combine
+| Feature | v3 | v4 |
+|---------|----|----|
+| FP16 / BF16 / FP32 partial input | - | ✅ |
+| FP32 LSE input | ✅ | ✅ |
+| FP16 / BF16 / FP32 output | ✅ | ✅ |
+| Batched (BSND) partials | ✅ | ✅ |
+| Variable-length (TND) partials | ✅ | ✅ |
+| cu_seqlens / seqused | ⚠ lower layer validates; not exposed by Python API | ✅ accepted, currently ignored |
+| virtual_batch_idx | - | ✅ dense |
+| Combined LSE output | ✅ (always returned) | ✅ (`return_lse`) |
+| `return_lse` switch | - | ✅ |
+
+⚠ means the lower-level `fwd_combine` implements the validation, but the current
+public v3 Python wrapper does not forward these arguments.
+
+
+## License
+
+This project is licensed under the BSD 3-Clause License. See the [LICENSE](./LICENSE) file for details.

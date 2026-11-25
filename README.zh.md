@@ -1,0 +1,933 @@
+# flash-attention-npu
+
+<div align="center">
+  <a href="README.md"><img src="https://img.shields.io/badge/English-README.md-blue?style=flat-square" alt="English"></a> <a href="#"><img src="https://img.shields.io/badge/中文-README.zh.md-green?style=flat-square" alt="中文"></a>
+</div>
+
+## 介绍
+FlashAttention 通过分块计算和内存感知算法提升训练和推理效率。当前其主流实现为面向 NVIDIA GPU 架构的 [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention)。在昇腾平台迁移过程中，我们发现缺少与[Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention)接口兼容的实现，增加了适配难度。为此，本仓库参照 [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention) 的核心设计，基于 [CANN/CATLASS](https://gitcode.com/cann/catlass) 框架及其样例代码，实现了适配昇腾 NPU 的 FlashAttention 算法。我们提供与 [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention) 一致的调用接口，便于模型迁移，并支持后续面向昇腾 NPU 的大模型注意力算法改进和优化。
+
+**本项目正在活跃开发中，欢迎参与讨论与贡献！**
+
+
+## 准备
+
+### 环境要求
+
+- 硬件：昇腾 910B / 910C / 950 NPU
+- 系统：Linux
+- Python：>= 3.9
+- CANN：安装支持目标 NPU 的 Toolkit、驱动和固件。
+
+### Python 依赖包
+
+- `torch`（>= 2.4）
+- `torch_npu`（与 PyTorch 发布版本匹配）
+- `setuptools`（>= 70.1，构建）
+- `packaging`（构建）
+- `pytest`、`numpy`（测试）
+- `pytest-xdist`（可选，并行测试）
+
+```bash
+python -m pip install "setuptools>=70.1" packaging
+```
+
+FA4 的原生 Flex 后端要求 ascend-catlass-dsl >=2.1，仅在使用 DSL 时校验，普通 FA4 导入和 attention 调用不依赖 CATLASS DSL。
+
+- 设置 CANN 环境变量
+```bash
+source [PATH_TO_ASCEND_HOME]/cann/set_env.sh
+# 例如:
+# source /usr/local/Ascend/cann/set_env.sh
+```
+
+### 安装步骤
+
+#### 快速安装
+
+```bash
+pip install flash-attn-npu --no-build-isolation
+```
+
+#### 从源码编译
+
+1. 拉取源码：
+```bash
+git clone https://github.com/MinghuasLab/flash-attention-npu.git
+cd flash-attention-npu
+git submodule update --init --recursive
+```
+
+2. 编译安装：
+
+```bash
+pip install -e . --no-build-isolation --no-deps --config-settings editable_mode=compat
+
+# 或仅在源码目录原地编译
+python setup.py build_ext --inplace
+```
+
+  编译特定版本：
+
+```bash
+# 仅编译 v2
+FLASH_ATTN_BUILD_VERSION=v2 python setup.py build_ext --inplace
+
+# 仅编译 v3
+FLASH_ATTN_BUILD_VERSION=v3 python setup.py build_ext --inplace
+
+# 仅编译 v4
+FLASH_ATTN_BUILD_VERSION=v4 python setup.py build_ext --inplace
+```
+
+  编译面向特定NPU的版本：
+
+```bash
+# 仅编译 910 版本
+FLASH_ATTN_BUILD_NPU=910 python setup.py build_ext --inplace
+
+# 仅编译 950 版本
+FLASH_ATTN_BUILD_NPU=950 python setup.py build_ext --inplace
+```
+
+## 测试
+
+在已准备好的 NPU 环境中安装测试依赖：
+
+```bash
+python -m pip install pytest numpy
+# 可选：与 CI 一样启用并行测试
+python -m pip install pytest-xdist
+```
+
+编译安装对应 API 版本后运行测试脚本。FlashAttention v2 仅支持昇腾 910B/C：
+
+```bash
+# 测试 FlashAttention v2
+pytest -q -s tests/test_flash_attn_npu_v2.py
+
+# 测试 FlashAttention v3
+pytest -q -s tests/test_flash_attn_npu_v3.py
+
+# 测试 FlashAttention v4
+pytest -q -s tests/test_flash_attn_npu_v4.py
+```
+
+## 使用 msSanitizer 进行内存检测
+
+编译时设置环境变量 `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE`，运行时通过 `mssanitizer` 启动测试：
+
+```bash
+# 使能内存检测编译
+FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_BUILD_VERSION=v3 python setup.py build_ext --inplace
+
+# Ascend 910 / 950 均须通过 msSanitizer 启动（注意 `--` 分隔符）
+mssanitizer --tool=memcheck -- python -m pytest -q -s tests/test_flash_attn_npu_v3.py
+
+# 可选：跳过 golden / 精度比对，只 launch kernel 做内存检测
+FLASH_ATTN_MEMCHECK=TRUE mssanitizer --tool=memcheck -- \
+  python -m pytest -q -s tests/test_flash_attn_npu_v3.py
+```
+图执行请单独构建不含静态插桩的版本：
+
+```bash
+# FA4 将 v3 改为 v4。静态 eager 检测产物请另行保存。
+FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_MSSANITIZER_MODE=runtime \
+  FLASH_ATTN_BUILD_NPU=910 FLASH_ATTN_BUILD_VERSION=v3 python setup.py build_ext --inplace
+python -m pytest -q -s tests/test_flash_attn_npu_v3_graph.py
+```
+
+`FLASH_ATTN_MSSANITIZER_MODE` 支持 `auto`（默认：910 static、950 runtime）、`static`（仅 910）和 `runtime`（`-g -fno-jump-tables`，不链接静态桩），仅在 `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE` 时生效。
+
+## 使用方法
+
+### FlashAttention v2
+
+#### flash_attn_with_kvcache
+
+```python
+def flash_attn_with_kvcache(
+    q,
+    k_cache,
+    v_cache,
+    k=None,
+    v=None,
+    rotary_cos=None,
+    rotary_sin=None,
+    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+    cache_batch_idx: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 表示无限上下文窗口
+    rotary_interleaved=True,
+    alibi_slopes=None,
+):
+    """
+    如果 k 和 v 不为 None，k_cache 和 v_cache 将被 *原地更新* 为 k 和 v 的新值。
+    这对于增量解码非常有用：你可以传入上一步缓存的 key/value，
+    用当前步骤的新 key/value 更新它们，并在一个内核中完成对更新后缓存的注意力计算。
+
+    如果你传入 k / v，必须确保缓存足够大以容纳新值。
+    例如，KV 缓存可以预分配最大序列长度，你可以使用 cache_seqlens 来跟踪批次中每个序列的当前序列长度。
+
+    如果传入了 rotary_cos 和 rotary_sin，还会应用旋转位置编码。
+    key @k 将在 cache_seqlens, cache_seqlens + 1 等位置被 rotary_cos 和 rotary_sin 旋转。
+    如果是 causal 或 local（即 window_size != (-1, -1)），query @q 将在 cache_seqlens, cache_seqlens + 1 等位置被旋转。
+    如果既不是 causal 也不是 local，query @q 将仅在 cache_seqlens 位置被旋转
+    （即我们认为 @q 中的所有 token 都在位置 cache_seqlens）。
+
+    支持多查询注意力和分组查询注意力（MQA/GQA），通过传入比 Q 头数少的 KV 来实现。
+    注意 Q 的头数必须能被 KV 的头数整除。
+    例如，如果 Q 有 6 个头，K、V 有 2 个头，那么 Q 的头 0、1、2 将关注 K、V 的头 0，
+    Q 的头 3、4、5 将关注 K、V 的头 1。
+
+    如果 causal=True，因果掩码对齐到注意力矩阵的右下角。
+    例如，如果 seqlen_q = 2 且 seqlen_k = 5，因果掩码（1 = 保留，0 = 掩码）为：
+        1 1 1 1 0
+        1 1 1 1 1
+    如果 seqlen_q = 5 且 seqlen_k = 2，因果掩码为：
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    如果掩码的某一行全为零，输出将为零。
+
+    如果 window_size != (-1, -1)，实现滑动窗口局部注意力。
+    位置 i 的 query 只会关注 [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] 范围内的 key。
+
+    注意：不支持反向传播。
+
+    参数：
+        q: (batch_size, seqlen, nheads, headdim)
+        k_cache: 如果没有 block_table，形状为 (batch_size_cache, seqlen_cache, nheads_k, headdim)；
+            如果有 block_table（即分页 KV 缓存），形状为 (num_blocks, page_block_size, nheads_k, headdim)
+            page_block_size 必须是 256 的倍数。
+        v_cache: 如果没有 block_table，形状为 (batch_size_cache, seqlen_cache, nheads_k, headdim)；
+            如果有 block_table（即分页 KV 缓存），形状为 (num_blocks, page_block_size, nheads_k, headdim)
+        k [可选]: (batch_size, seqlen_new, nheads_k, headdim)。如果不为 None，我们将 k 从 cache_seqlens 指定的位置开始拼接到 k_cache。
+        v [可选]: (batch_size, seqlen_new, nheads_k, headdim)。与 k 类似。
+        rotary_cos [可选]: (seqlen_ro, rotary_dim / 2)。如果不为 None，我们对 k 和 q 应用旋转位置编码。
+            仅在传入 k 和 v 时适用。rotary_dim 必须能被 16 整除。
+        rotary_sin [可选]: (seqlen_ro, rotary_dim / 2)。与 rotary_cos 类似。
+        cache_seqlens: int 或 (batch_size,)，dtype 为 torch.int32。KV 缓存的序列长度。
+        block_table [可选]: (batch_size, max_num_blocks_per_seq)，dtype 为 torch.int32。
+        cache_batch_idx: (batch_size,)，dtype 为 torch.int32。用于索引 KV 缓存的索引。
+            如果为 None，我们假设批次索引为 [0, 1, 2, ..., batch_size - 1]。
+            如果索引不唯一，且提供了 k 和 v，缓存中更新的值可能来自任何重复索引。
+        softmax_scale: float。softmax 前对 QK^T 的缩放。默认为 1 / sqrt(headdim)。
+        causal: bool。是否应用因果注意力掩码（例如用于自回归建模）。
+        window_size: (left, right)。如果 != (-1, -1)，实现滑动窗口局部注意力。
+        rotary_interleaved: bool。仅在传入 rotary_cos 和 rotary_sin 时适用。
+            如果为 True，旋转位置编码将组合维度 0 & 1、2 & 3 等。如果为 False，
+            旋转位置编码将组合维度 0 & rotary_dim / 2、1 & rotary_dim / 2 + 1
+            （即 GPT-NeoX 风格）。
+        alibi_slopes: (nheads,) 或 (batch_size, nheads)，fp32。
+            将 (-alibi_slope * |i + seqlen_k - seqlen_q - j|) 的偏置加到
+            query i 和 key j 的注意力分数上。
+
+    约束：
+        - 1 <= headdim <= 256。
+        - nheads % nheads_k == 0。
+        - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
+        - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
+        - batch_size > 0。
+        - softcap >= 0（0.0 表示关闭；Ascend 950 不支持 softcap）。
+        - 不支持 alibi_slopes / rotary_cos / rotary_sin。
+        - cache_seqlens / block_table 若传入须为 int32。
+        - 不支持反向传播。
+
+    返回：
+        out: (batch_size, seqlen, nheads, headdim)。
+    """
+```
+
+#### flash_attn_func
+
+```python
+def flash_attn_func(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 表示无限上下文窗口
+    softcap=0.0,  # <=0.0 表示不启用
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+):
+    """
+    评估时应将 dropout_p 设为 0.0。
+
+    支持多查询注意力和分组查询注意力（MQA/GQA），通过传入比 Q 头数少的 K、V 来实现。
+    注意 Q 的头数必须能被 K、V 的头数整除。
+    例如，如果 Q 有 6 个头，K、V 有 2 个头，那么 Q 的头 0、1、2 将关注 K、V 的头 0，
+    Q 的头 3、4、5 将关注 K、V 的头 1。
+
+    如果 causal=True，因果掩码对齐到注意力矩阵的右下角。
+    例如，如果 seqlen_q = 2 且 seqlen_k = 5，因果掩码（1 = 保留，0 = 掩码）为：
+        1 1 1 1 0
+        1 1 1 1 1
+    如果 seqlen_q = 5 且 seqlen_k = 2，因果掩码为：
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    如果掩码的某一行全为零，输出将为零。
+
+    如果 window_size != (-1, -1)，实现滑动窗口局部注意力。
+    位置 i 的 query 只会关注 [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] 范围内的 key。
+
+    参数：
+        q: (batch_size, seqlen, nheads, headdim)
+        k: (batch_size, seqlen, nheads_k, headdim)
+        v: (batch_size, seqlen, nheads_k, headdim)
+        dropout_p: float。Dropout 概率。
+        softmax_scale: float。softmax 前对 QK^T 的缩放。默认为 1 / sqrt(headdim)。
+        causal: bool。是否应用因果注意力掩码（例如用于自回归建模）。
+        window_size: (left, right)。如果 != (-1, -1)，实现滑动窗口局部注意力。
+        softcap: float。大于 0 时激活 softcapping 注意力。
+        alibi_slopes: (nheads,) 或 (batch_size, nheads)，fp32。
+            将 (-alibi_slope * |i + seqlen_k - seqlen_q - j|) 的偏置加到
+            query i 和 key j 的注意力分数上。
+        deterministic: bool。是否使用反向传播的确定性实现（稍慢且占用更多内存）。
+            前向传播始终是确定性的。
+        return_attn_probs: bool。是否返回注意力概率。此选项仅用于测试，
+            返回的概率不保证正确（缩放可能不正确）。
+
+    约束：
+        - 1 <= headdim <= 256。
+        - nheads % nheads_k == 0。
+        - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
+        - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
+        - batch_size > 0。
+        - softcap >= 0（0.0 表示关闭；Ascend 950 不支持 softcap）。
+        - 0.0 <= dropout_p < 1.0；0.0 表示关闭 dropout。
+        - 不支持 alibi_slopes。
+        - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同。
+
+    返回：
+        out: (batch_size, seqlen, nheads, headdim)。
+        softmax_lse [可选，return_attn_probs=True 时]: (batch_size, nheads, seqlen)。
+            QK^T * scaling 每行的 logsumexp（即 softmax 归一化因子的对数）。
+        S_dmask [可选，return_attn_probs=True 时]: (batch_size, nheads, seqlen, seqlen)。
+            softmax 的输出（缩放可能不同），同时编码 dropout 模式
+            （负值表示该位置被丢弃，非负值表示保留）。
+    """
+```
+
+#### flash_attn_varlen_func
+
+```python
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 表示无限上下文窗口
+    softcap=0.0,  # <=0.0 表示不启用
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    block_table=None,
+):
+    """
+    评估时应将 dropout_p 设为 0.0。
+
+    支持变长序列：Q、K、V 按 token 拼接存储，通过 cu_seqlens 索引各序列边界。
+    支持多查询注意力和分组查询注意力（MQA/GQA），通过传入比 Q 头数少的 K、V 来实现。
+    注意 Q 的头数必须能被 K、V 的头数整除。
+
+    如果 causal=True，因果掩码对齐到注意力矩阵的右下角。
+    例如，如果 seqlen_q = 2 且 seqlen_k = 5，因果掩码（1 = 保留，0 = 掩码）为：
+        1 1 1 1 0
+        1 1 1 1 1
+    如果 seqlen_q = 5 且 seqlen_k = 2，因果掩码为：
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    如果掩码的某一行全为零，输出将为零。
+
+    如果 window_size != (-1, -1)，实现滑动窗口局部注意力。
+    位置 i 的 query 只会关注 [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] 范围内的 key。
+
+    参数：
+        q: (total_q, nheads, headdim)，total_q 为批次中 query token 总数。
+        k: (total_k, nheads_k, headdim)，total_k 为批次中 key token 总数。
+        v: (total_k, nheads_k, headdim)，total_k 为批次中 value token 总数。
+        cu_seqlens_q: (batch_size + 1,)，dtype 为 torch.int32。用于索引 q 的累积序列长度。
+        cu_seqlens_k: (batch_size + 1,)，dtype 为 torch.int32。用于索引 k、v 的累积序列长度。
+        max_seqlen_q: int。批次中最大 query 序列长度。
+        max_seqlen_k: int。批次中最大 key 序列长度。
+        dropout_p: float。Dropout 概率。
+        softmax_scale: float。softmax 前对 QK^T 的缩放。默认为 1 / sqrt(headdim)。
+        causal: bool。是否应用因果注意力掩码（例如用于自回归建模）。
+        window_size: (left, right)。如果 != (-1, -1)，实现滑动窗口局部注意力。
+        softcap: float。大于 0 时激活 softcapping 注意力。
+        alibi_slopes: (nheads,) 或 (batch_size, nheads)，fp32。
+            将 (-alibi_slope * |i + seqlen_k - seqlen_q - j|) 的偏置加到
+            query i 和 key j 的注意力分数上。
+        deterministic: bool。是否使用反向传播的确定性实现（稍慢且占用更多内存）。
+            前向传播始终是确定性的。
+        return_attn_probs: bool。是否返回注意力概率。此选项仅用于测试。
+        block_table [可选]: 分页 KV 缓存的块表。
+
+    约束：
+        - 1 <= headdim <= 256。
+        - nheads % nheads_k == 0。
+        - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
+        - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
+        - batch_size > 0。
+        - total_q > 0；Q 必须至少包含一个 query token。
+        - softcap >= 0（0.0 表示关闭；Ascend 950 不支持 softcap）。
+        - 0.0 <= dropout_p < 1.0；0.0 表示关闭 dropout。
+        - 不支持 alibi_slopes。
+        - cu_seqlens_q / cu_seqlens_k / block_table 若传入须为 int32。
+        - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同。
+
+    返回：
+        out: (total_q, nheads, headdim)。
+        softmax_lse [可选，return_attn_probs=True 时]: (nheads, total_q)。
+            QK^T * scaling 每行的 logsumexp（即 softmax 归一化因子的对数）。
+        S_dmask [可选，return_attn_probs=True 时]: (batch_size, nheads, seqlen, seqlen)。
+            softmax 的输出，同时编码 dropout 模式。
+    """
+```
+
+### FlashAttention v3
+
+#### flash_attn_with_kvcache
+
+```python
+def flash_attn_with_kvcache(
+    q,
+    k_cache,
+    v_cache,
+    k=None,
+    v=None,
+    qv=None,
+    rotary_cos=None,
+    rotary_sin=None,
+    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+    cache_batch_idx: Optional[torch.Tensor] = None,
+    cache_leftpad: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    rotary_seqlens: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    attention_chunk=0,
+    softcap=0.0,
+    rotary_interleaved=True,
+    scheduler_metadata=None,
+    num_splits=0,
+    pack_gqa=None,
+    sm_margin=0,
+    return_softmax_lse=False,
+):
+    """
+    v3 版本的 KV 缓存接口，相比 v2 增加了更多功能。
+
+    如果 k 和 v 不为 None，k_cache 和 v_cache 将被 *原地更新* 为 k 和 v 的新值。
+    这对于增量解码非常有用。
+
+    支持多查询注意力和分组查询注意力（MQA/GQA）。
+
+    如果 causal=True，因果掩码对齐到注意力矩阵的右下角。
+
+    如果 window_size != (-1, -1)，实现滑动窗口局部注意力。
+
+    注意：不支持反向传播。
+
+    参数：
+        q: (batch_size, seqlen, nheads, headdim)
+        k_cache: 如果没有 page_table，形状为 (batch_size_cache, seqlen_cache, nheads_k, headdim)；
+            如果有 page_table（即分页 KV 缓存），形状为 (num_blocks, page_block_size, nheads_k, headdim)
+            page_block_size 可以是任意值（如 1, 2, 3, 64 等）。
+        v_cache: 如果没有 page_table，形状为 (batch_size_cache, seqlen_cache, nheads_k, headdim_v)；
+            如果有 page_table，形状为 (num_blocks, page_block_size, nheads_k, headdim_v)。
+        k [可选]: (batch_size, seqlen_new, nheads_k, headdim)。如果不为 None，从 cache_seqlens 指定的位置开始拼接到 k_cache。
+        v [可选]: (batch_size, seqlen_new, nheads_k, headdim_v)。与 k 类似。
+        qv [可选]: (batch_size, seqlen, nheads, headdim_v)。
+        rotary_cos [可选]: (seqlen_ro, rotary_dim / 2)。旋转位置编码的 cos 值。
+        rotary_sin [可选]: (seqlen_ro, rotary_dim / 2)。旋转位置编码的 sin 值。
+        cache_seqlens: int 或 (batch_size,)，dtype 为 torch.int32。KV 缓存的序列长度。
+        cache_batch_idx: (batch_size,)，dtype 为 torch.int32。用于索引 KV 缓存的索引。
+        cache_leftpad: (batch_size,)，dtype 为 torch.int32。KV 缓存起始索引。
+        page_table [可选]: (batch_size, max_num_blocks_per_seq)，dtype 为 torch.int32。
+        cu_seqlens_q [可选]: 变长模式下的 query 累积序列长度。
+        cu_seqlens_k_new [可选]: 变长模式下的新 key 累积序列长度。
+        max_seqlen_q [可选]: 变长模式下的最大 query 序列长度。
+        rotary_seqlens [可选]: 旋转位置编码的序列长度。
+        q_descale, k_descale, v_descale: 可选，用于 FP8 量化的反缩放因子。
+        softmax_scale: float。softmax 前对 QK^T 的缩放。默认为 1 / sqrt(headdim)。
+        causal: bool。是否应用因果注意力掩码。
+        window_size: (left, right)。如果 != (-1, -1)，实现滑动窗口局部注意力。
+        attention_chunk: int。注意力分块大小。
+        softcap: float。大于 0 时激活 softcapping 注意力。
+        rotary_interleaved: bool。旋转位置编码模式。
+        scheduler_metadata: 可选，调度器元数据。
+        num_splits: int。如果 > 1，将 key/value 在序列维度上分割成这么多块。
+            如果 num_splits == 1，不分割。如果 num_splits == 0，自动选择。
+        pack_gqa: bool。是否打包 GQA 以提高性能。
+        sm_margin: int。SM 边际，用于调优。
+        return_softmax_lse: bool。是否返回注意力分数的 logsumexp。
+
+    约束：
+        - 1 <= headdim <= 256。
+        - FP8_E4M3FN 要求 Q/K/V 的 headdim 均为 128。
+        - nheads % nheads_k == 0。
+        - dtype 支持 float16 / bfloat16 / FP8_E4M3FN（仅 Ascend 950）；Q、K、V 的 dtype 必须一致。
+        - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
+        - batch_size > 0。
+        - softcap >= 0（0.0 表示关闭）。
+        - 不支持 alibi_slopes / rotary / attention_chunk / pack_gqa。
+        - cache_seqlens / page_table / cu_seqlens_* 若传入须为 int32。
+        - 不支持反向传播。
+
+    返回：
+        out: (batch_size, seqlen, nheads, headdim)。
+        softmax_lse [可选]: (batch_size, nheads, seqlen)。QK^T * scaling 的每行 logsumexp。
+    """
+```
+
+#### flash_attn_func
+
+```python
+def flash_attn_func(
+    q,
+    k,
+    v,
+    softmax_scale=None,
+    causal=False,
+    qv=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    window_size=(-1, -1),
+    attention_chunk=0,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    deterministic=False,
+    sm_margin=0,
+    return_attn_probs=False,
+):
+    """
+    v3 版本的标准注意力接口，相比 v2 增加了 FP8 反量化、attention_chunk 等参数。
+
+    支持多查询注意力和分组查询注意力（MQA/GQA），通过传入比 Q 头数少的 K、V 来实现。
+    注意 Q 的头数必须能被 K、V 的头数整除。
+
+    如果 causal=True，因果掩码对齐到注意力矩阵的右下角。
+    例如，如果 seqlen_q = 2 且 seqlen_k = 5，因果掩码（1 = 保留，0 = 掩码）为：
+        1 1 1 1 0
+        1 1 1 1 1
+    如果 seqlen_q = 5 且 seqlen_k = 2，因果掩码为：
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    如果掩码的某一行全为零，输出将为零。
+
+    如果 window_size != (-1, -1)，实现滑动窗口局部注意力。
+    位置 i 的 query 只会关注 [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] 范围内的 key。
+
+    参数：
+        q: (batch_size, seqlen, nheads, headdim)
+        k: (batch_size, seqlen, nheads_k, headdim)
+        v: (batch_size, seqlen, nheads_k, headdim)
+        softmax_scale: float。softmax 前对 QK^T 的缩放。默认为 1 / sqrt(headdim)。
+        causal: bool。是否应用因果注意力掩码（例如用于自回归建模）。
+        qv [可选]: (batch_size, seqlen, nheads, headdim_v)。
+        q_descale, k_descale, v_descale: 可选，用于 FP8 量化的反缩放因子。
+        window_size: (left, right)。如果 != (-1, -1)，实现滑动窗口局部注意力。
+        attention_chunk: int。注意力分块大小。
+        softcap: float。大于 0 时激活 softcapping 注意力。
+        num_splits: int。如果 > 1，将 key/value 在序列维度上分割成这么多块。
+            如果 num_splits == 1，不分割。如果 num_splits == 0，自动选择。
+        pack_gqa: bool。是否打包 GQA 以提高性能。
+        deterministic: bool。是否使用反向传播的确定性实现。
+        sm_margin: int。SM 边际，用于调优。
+        return_attn_probs: bool。是否返回注意力概率。此选项仅用于测试。
+
+    约束：
+        - 1 <= headdim <= 256。
+        - FP8_E4M3FN 要求 Q/K/V 的 headdim 均为 128，仅支持前向。
+        - nheads % nheads_k == 0。
+        - dtype 支持 float16 / bfloat16 / FP8_E4M3FN（仅 Ascend 950）；Q、K、V 的 dtype 必须一致。
+        - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
+        - batch_size > 0。
+        - softcap >= 0（0.0 表示关闭）。
+        - 不支持 alibi_slopes / attention_chunk / pack_gqa。
+        - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
+
+    返回：
+        out: (batch_size, seqlen, nheads, headdim)。
+        softmax_lse [可选，return_attn_probs=True 时]: (batch_size, nheads, seqlen)。
+            QK^T * scaling 每行的 logsumexp。
+    """
+```
+
+#### flash_attn_varlen_func
+
+```python
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    seqused_q=None,
+    seqused_k=None,
+    softmax_scale=None,
+    causal=False,
+    qv=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    window_size=(-1, -1),
+    attention_chunk=0,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    deterministic=False,
+    sm_margin=0,
+    return_attn_probs=False,
+):
+    """
+    v3 版本的变长序列注意力接口。
+
+    支持变长序列：Q、K、V 按 token 拼接存储，通过 cu_seqlens 索引各序列边界。
+    支持多查询注意力和分组查询注意力（MQA/GQA）。
+
+    如果 causal=True，因果掩码对齐到注意力矩阵的右下角。
+
+    如果 window_size != (-1, -1)，实现滑动窗口局部注意力。
+
+    参数：
+        q: (total_q, nheads, headdim)，total_q 为批次中 query token 总数。
+        k: (total_k, nheads_k, headdim)，total_k 为批次中 key token 总数。
+        v: (total_k, nheads_k, headdim)，total_k 为批次中 value token 总数。
+        cu_seqlens_q: (batch_size + 1,)，dtype 为 torch.int32。用于索引 q 的累积序列长度。
+        cu_seqlens_k: (batch_size + 1,)，dtype 为 torch.int32。用于索引 k、v 的累积序列长度。
+        max_seqlen_q: int。批次中最大 query 序列长度。
+        max_seqlen_k: int。批次中最大 key 序列长度。
+        seqused_q [可选]: 实际使用的 query 序列长度。
+        seqused_k [可选]: 实际使用的 key 序列长度。
+        softmax_scale: float。softmax 前对 QK^T 的缩放。默认为 1 / sqrt(headdim)。
+        causal: bool。是否应用因果注意力掩码。
+        qv [可选]: 额外的 query value 张量。
+        q_descale, k_descale, v_descale: 可选，用于 FP8 量化的反缩放因子。
+        window_size: (left, right)。如果 != (-1, -1)，实现滑动窗口局部注意力。
+        attention_chunk: int。注意力分块大小。
+        softcap: float。大于 0 时激活 softcapping 注意力。
+        num_splits: int。key/value 序列维度分割块数。
+        pack_gqa: bool。是否打包 GQA 以提高性能。
+        deterministic: bool。是否使用反向传播的确定性实现。
+        sm_margin: int。SM 边际，用于调优。
+        return_attn_probs: bool。是否返回注意力概率。此选项仅用于测试。
+
+    约束：
+        - 1 <= headdim <= 256。
+        - FP8_E4M3FN 要求 Q/K/V 的 headdim 均为 128，仅支持前向。
+        - nheads % nheads_k == 0。
+        - dtype 支持 float16 / bfloat16 / FP8_E4M3FN（仅 Ascend 950）；Q、K、V 的 dtype 必须一致。
+        - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
+        - batch_size > 0。
+        - total_q > 0；Q 必须至少包含一个 query token。
+        - softcap >= 0（0.0 表示关闭）。
+        - 不支持 alibi_slopes / attention_chunk / pack_gqa。
+        - cu_seqlens_q / cu_seqlens_k 若传入须为 int32。
+        - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
+
+    返回：
+        out: (total_q, nheads, headdim)。
+        softmax_lse [可选，return_attn_probs=True 时]: (nheads, total_q)。
+            QK^T * scaling 每行的 logsumexp。
+    """
+```
+
+#### flash_attn_combine
+
+```python
+def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
+    """
+    合并 split-KV 注意力的分片结果：
+        lse = logsumexp_s(lse_partial)
+        out = sum_s exp(lse_s - lse) * O_s
+
+    参数:
+        out_partial: fp32 分片输出。
+            BSND: (num_splits, batch, seqlen, nheads, headdim)
+            TND:  (num_splits, total_q, nheads, headdim)
+        lse_partial: fp32 分片 logsumexp，逻辑布局为 (..., seqlen, nheads)。
+            BSND: (num_splits, batch, seqlen, nheads)
+            TND:  (num_splits, total_q, nheads)
+        out [可选]: 预分配输出，原地写回。
+            传入时以 out.dtype 为准。
+        out_dtype [可选]: fp16 / bf16 / fp32；缺省取 out_partial.dtype（fp32），
+            与 flash-attention 一致。
+
+    返回:
+        (out, softmax_lse)。softmax_lse 为 fp32，形状 (batch, seqlen, nheads)
+        或 (total_q, nheads)；其 seqlen 维连续，与 flash_attn_func 返回的
+        (batch, nheads, seqlen) 布局不同。
+
+    当前仓内 v3 forward 尚未暴露真实的 split accumulator；调用方需从外部
+    split-attention 生产者获取 out_partial/lse_partial。
+    """
+```
+
+> v3 的公开 Python 包装目前只接受上述 4 个参数，并且始终返回合并后的 LSE。
+> 底层 `fwd_combine` 还支持 `cu_seqlens`、`seqused` 和 `return_lse`，但这些
+> 参数当前未通过公开包装层透传，不应视为稳定的公开 API。底层收到的
+> `cu_seqlens` / `seqused` 也只做格式校验，不限制实际处理的行。
+
+### FlashAttention v4
+
+#### flash_attn_varlen_func
+```python
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    qv=None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    min_seqlen_k: Optional[int] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    gather_kv_indices: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    learnable_sink: Optional[torch.Tensor] = None,
+    softcap=0.0, # 0.0 means deactivated
+    num_splits=0,    # Can be tuned for speed
+    pack_gqa: Optional[bool] = None,
+    deterministic: bool = False,
+    score_mod: Optional[Callable] = None,
+    score_mod_bwd: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
+    block_sparse_tensors=None,
+    aux_tensors: Optional[list] = None,
+    aux_scalars: Optional[tuple] = None,
+    return_lse: bool = False,
+):
+    """
+    v4 版本的变长序列注意力接口。
+
+    支持变长序列：Q、K、V 按 token 拼接存储，通过 cu_seqlens 索引各序列边界。
+    支持多查询注意力和分组查询注意力（MQA/GQA）。
+
+    如果 causal=True，因果掩码对齐到注意力矩阵的右下角。
+
+    如果 window_size 非 (None, None) / (-1, -1)，实现滑动窗口局部注意力。
+
+    支持可选分页 KV Cache（仅正向）：
+    通过 page_table 指定 KV cache 页表，k/v 可采用分页格式存储。
+
+    参数：
+        q: (total_q, nheads, headdim)，total_q 为批次中 query token 总数。当不使用变长模式时，为 (batch_size, seqlen, nheads, headdim)。
+        k: (total_k, nheads_k, headdim)，total_k 为批次中 key token 总数。当使用 paged KV cache 时，为 (num_pages, page_size, nheads_k, headdim)。
+        v: (total_k, nheads_k, headdim_v)，total_k 为批次中 value token 总数。当使用 paged KV cache 时，为 (num_pages, page_size, nheads_k, headdim_v)。
+        cu_seqlens_q: (batch_size + 1,)，dtype 为 torch.int32。用于索引 q 的累积序列长度。
+        cu_seqlens_k: (batch_size + 1,)，dtype 为 torch.int32。用于索引 k、v 的累积序列长度。
+        max_seqlen_q: int。批次中最大 query 序列长度。
+        max_seqlen_k: int。批次中最大 key 序列长度。
+        min_seqlen_k [可选]: key 的最小序列长度。
+        seqused_q [可选]: (batch_size,)，dtype 为 torch.int32。每个 batch 实际使用的 query 序列长度。（反向暂不支持）
+        seqused_k [可选]: (batch_size,)，dtype 为 torch.int32。每个 batch 实际使用的 key 序列长度。（反向暂不支持）
+        gather_kv_indices [可选]: KV 索引。
+        page_table [可选]: (batch_size, max_num_pages_per_seq)，dtype 为 torch.int32。分页 KV Cache 的页表。（仅正向）
+        softmax_scale: float。softmax 前对 QK^T 的缩放因子。默认为 1 / sqrt(headdim + (headdim_v if qv is not None else 0))。
+        causal: bool。是否应用因果注意力掩码。
+        qv [可选]: (batch_size, seqlen, nheads, headdim_v)。用于 cross-attention。
+        window_size: (left, right)。如果 != (-1, -1)，实现滑动窗口局部注意力。
+        softcap: float。大于 0 时激活 softcapping 注意力。
+        num_splits: int。key/value 序列维度分割块数。如果为 0，则根据启发式方法自动确定分割数量。
+        pack_gqa: bool。是否打包 GQA 以提高性能。
+        deterministic: bool。是否使用反向传播的确定性实现。
+        score_mod [可选]: 自定义 score 修改函数。
+        score_mod_bwd [可选]: 反向传播阶段的自定义 score 修改函数。
+        mask_mod [可选]: 自定义 attention mask。
+        block_sparse_tensors [可选]: block sparse tensor。
+        aux_tensors [可选]: 用于 score_mod 的辅助 tensor。
+        aux_scalars [可选]: 用于 score_mod/mask_mod 的辅助标量。
+        return_lse: bool。是否返回 attention scores 的 logsumexp。
+
+    约束：
+        - 1 <= headdim <= 256。
+        - FP8_E4M3FN 要求 Q/K/V 的 headdim 均为 128，仅支持前向。
+        - nheads % nheads_k == 0。
+        - dtype 支持 float16 / bfloat16 / FP8_E4M3FN（仅 Ascend 950）；Q、K、V 的 dtype 必须一致。
+        - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
+        - batch_size > 0。
+        - softcap >= 0（0.0 表示关闭）。
+        - score_mod / mask_mod 在 Ascend 950 上路由到原生 Flex 后端。
+        - Flex 后端不支持 learnable_sink。
+        - 不支持 pack_gqa / min_seqlen_k / gather_kv_indices。
+        - cu_seqlens_* / seqused_* / page_table 若传入须为 int32。
+        - 在 Ascend 950 上，分页 KV Cache 的 page_size 仅支持 128、256、512 或 1024。
+        - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
+
+    返回：
+        out: (total_q, nheads, headdim_v) 或稠密 (batch_size, seqlen, nheads, headdim_v)。
+        softmax_lse [可选，return_lse=True 时]: 变长为 (nheads, total_q)；稠密为 (batch_size, nheads, seqlen)。
+            QK^T * scaling 每行的 logsumexp。
+    """
+```
+
+#### flash_attn_combine
+
+```python
+def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
+                       cu_seqlens=None, seqused=None, virtual_batch_idx=None,
+                       return_lse=True):
+    """
+    FA4 的分片合并入口（合并数学与 v3 一致）。out_partial 为 4 维时按变长
+    (TND) 解释，为 5 维时按批量 (BSND) 解释。
+
+    out_partial 支持 fp16 / bf16 / fp32；低精度 partial 会转换为 fp32 后累加。
+    传入 out 时以 out.dtype 为准。
+    cu_seqlens / seqused: 为接口兼容而接受并校验，当前不参与行数限定。
+    virtual_batch_idx: dense 布局下从虚拟 batch 槽位到真实 batch 的映射。
+    return_lse=False 时返回 (out, None)。
+    """
+```
+
+> v4 的公开 Python 包装支持上述全部参数。`cu_seqlens` / `seqused` 仍只做格式
+> 校验，当前不限制实际处理的行；`return_lse=False` 时不会分配或返回 LSE。
+
+#### flash_attn_combine 通用运行时约束
+
+现有实现中，v3 的 combine 行为在 Ascend 910 和 Ascend 950 上一致，v4 的行为
+在这两种设备上也一致。公开接口还受以下约束：
+
+- `1 <= num_splits <= 256`；`out_partial` 的最后一维必须连续。
+- `lse_partial` 必须为 fp32，维度数比 `out_partial` 少 1，除 LSE 外各维必须与
+  `out_partial` 完全一致。
+- kernel 的 tile 必须适配 150 KiB UB。给定 `num_splits` 和输出 dtype 时，
+  `head_dim` 存在与 `num_splits` 耦合的上限，超出后报
+  `combine tile exceeds 150 KiB UB budget for head_dim=...`。代表性边界如下：
+
+  | num_splits | fp16 / bf16 输出时 head_dim 上限 | fp32 输出时 head_dim 上限 |
+  | ---------: | -------------------------------: | ------------------------: |
+  |          1 |                              864 |                       792 |
+  |          8 |                              864 |                       792 |
+  |         16 |                              848 |                       784 |
+  |         32 |                              848 |                       776 |
+  |         64 |                              816 |                       752 |
+  |        128 |                              768 |                       712 |
+  |        192 |                              720 |                       672 |
+  |        256 |                              672 |                       624 |
+
+  精确校验使用 `ceil(num_splits / 8) * 8` 计算 split 对齐宽度：
+
+  ```text
+  per_row = ns_align * 16 + (16 + out_bytes + 4) * HEAD_DIM_ALIGN
+  ```
+
+  其中 fp32 输出时 `out_bytes=4`、`HEAD_DIM_ALIGN` 按 8 对齐，fp16 / bf16
+  输出时 `out_bytes=2`、`HEAD_DIM_ALIGN` 按 16 对齐；从 32、24、16、8 行中
+  选择首个满足 `tile_rows * per_row <= 150 * 1024` 的 tile，最小 8 行仍超限时
+  报错。
+- 当 `seqlen`、`num_heads` 或 `head_dim` 任一为 0 时，接口在完成前面的形状和
+  参数校验后，直接返回形状正确的 `out`（请求 LSE 时还包括 LSE），不启动
+  combine kernel。
+
+## 特性
+
+#### flash_attn_with_kvcache
+
+| 特性                | v2 | v3 |
+| ------------------- | -- | -- |
+| FP16 (float16)      | ✅ | ✅ |
+| BF16 (bfloat16)     | ✅ | ✅ |
+| 因果注意力 (Causal) | ✅ | ✅ |
+| 滑动窗口注意力      | ✅ | ✅ |
+| MQA/GQA             | ✅ | ✅ |
+| 分页 KV 缓存        | ✅ | ✅ |
+| 旋转位置编码 (RoPE) | -  | -  |
+| ALiBi               | ✅  | -  |
+| Softcapping         | ✅ | ✅ |
+| FP8 量化            | -  | ✅ |
+| 变长序列            | ✅ | ✅ |
+
+#### flash_attn_func
+
+| 特性                | v2 | v3 |
+| ------------------- | -- | -- |
+| FP16 (float16)      | ✅ | ✅ |
+| BF16 (bfloat16)     | ✅ | ✅ |
+| 因果注意力 (Causal) | ✅ | ✅ |
+| 滑动窗口注意力      | ✅ | ✅ |
+| MQA/GQA             | ✅ | ✅ |
+| 反向传播            | ✅ | ✅ |
+| ALiBi               | ✅  | -  |
+| Softcapping         | ✅ | ✅ |
+| FP8 量化            | -  | ✅ |
+| Dropout             | ✅ | -  |
+
+#### flash_attn_varlen_func
+
+| 特性                | v2 | v3 | v4 |
+| ------------------- | -- | -- | -- |
+| FP16 (float16)      | ✅ | ✅ | ✅ |
+| BF16 (bfloat16)     | ✅ | ✅ | ✅ |
+| 因果注意力 (Causal) | ✅ | ✅ | ✅ |
+| 滑动窗口注意力      | ✅ | ✅ | ✅ |
+| MQA/GQA             | ✅ | ✅ | ✅ |
+| 反向传播            | ✅ | ✅ | ✅ |
+| 变长序列            | ✅ | ✅ | ✅ |
+| 分页 KV 缓存        | ✅ | ✅  | ✅ |
+| ALiBi               | ✅  | -  | -  |
+| Softcapping         | ✅ | ✅ | ✅ |
+| FP8 量化            | -  | ✅ | ✅ |
+| Dropout             | ✅ | -  | -  |
+
+#### flash_attn_combine
+
+| 特性                        | v3 | v4 |
+| --------------------------- | -- | -- |
+| FP16 / BF16 / FP32 partial 输入 | -  | ✅ |
+| FP32 LSE 输入               | ✅ | ✅ |
+| FP16 / BF16 / FP32 输出     | ✅ | ✅ |
+| 批量 (BSND) 分片            | ✅ | ✅ |
+| 变长 (TND) 分片             | ✅ | ✅ |
+| cu_seqlens / seqused        | ⚠ 底层可校验，Python API 未暴露 | ✅ 接受但当前忽略 |
+| virtual_batch_idx           | -  | ✅ dense |
+| 合并后的 LSE 输出           | ✅（始终返回） | ✅ (`return_lse`) |
+| `return_lse` 开关           | -  | ✅ |
+
+⚠ 表示底层 `fwd_combine` 已实现相关校验，但 v3 当前公开 Python 包装未透传这些
+参数。
+
+## 许可证
+
+本项目采用 BSD 3-Clause License 开源协议。详情请参阅 [LICENSE](./LICENSE) 文件。

@@ -1,0 +1,77 @@
+/*
+ * CATLASS documentation palette
+ *
+ * Ascend brand red: #C7000B (Pantone 185C)
+ * Supporting neutrals: black, #9FA0A0, #DCDDDD, white
+ */
+:root > * {
+  --ascend-red: #c7000b;
+  --ascend-red-light: #d2333c;
+  --ascend-gray: #9fa0a0;
+  --ascend-gray-light: #dcdddd;
+
+  --md-primary-fg-color: #1b1b1b;
+  --md-primary-fg-color--light: #353535;
+  --md-primary-fg-color--dark: #000;
+  --md-primary-bg-color: #fff;
+  --md-primary-bg-color--light: rgba(255, 255, 255, 0.78);
+
+  --md-accent-fg-color: var(--ascend-red);
+  --md-accent-fg-color--transparent: rgba(199, 0, 11, 0.1);
+  --md-accent-bg-color: #fff;
+  --md-accent-bg-color--light: rgba(255, 255, 255, 0.78);
+}
+
+[data-md-color-scheme="default"] {
+  --md-typeset-a-color: #b0000a;
+  --md-default-fg-color--lightest: var(--ascend-gray-light);
+}
+
+[data-md-color-scheme="slate"] {
+  --md-hue: 0;
+  --md-primary-fg-color: #090909;
+  --md-primary-fg-color--light: #242424;
+  --md-primary-fg-color--dark: #000;
+  --md-accent-fg-color: #f05a62;
+  --md-accent-fg-color--transparent: rgba(240, 90, 98, 0.12);
+  --md-typeset-a-color: #ff6b73;
+}
+
+.md-logo {
+  display: none !important;
+}
+
+.md-header,
+.md-tabs {
+  background-color: var(--md-primary-fg-color);
+}
+
+.md-tabs__item--active {
+  box-shadow: inset 0 -0.15rem 0 var(--ascend-red);
+}
+
+.md-tabs__link--active,
+.md-tabs__link:is(:focus, :hover) {
+  color: #fff;
+  opacity: 1;
+}
+
+.md-nav__link--active {
+  font-weight: 600;
+}
+
+.md-typeset .md-button--primary {
+  background-color: var(--ascend-red);
+  border-color: var(--ascend-red);
+  color: #fff;
+}
+
+.md-typeset .md-button--primary:is(:focus, :hover) {
+  background-color: var(--ascend-red-light);
+  border-color: var(--ascend-red-light);
+  color: #fff;
+}
+
+*:focus-visible {
+  outline-color: var(--ascend-red);
+}

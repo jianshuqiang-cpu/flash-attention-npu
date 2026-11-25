@@ -1,0 +1,86 @@
+# Copyright (c) 2026, Minghua Shen.
+
+from torch_compile_utils import (
+    run_fixed_compile_test,
+    load_api,
+    require_soc,
+    run_metadata_compile_test,
+    run_varlen_compile_test,
+)
+
+
+def test_fa4_910_scheduler_metadata_torch_compile_correctness():
+    require_soc("910")
+
+    api = load_api("flash_attn_npu_4.flash_attn_npu_interface")
+
+    run_metadata_compile_test(
+        api,
+        expected_sizes={
+            "NO_MASK": 2336,
+            "CAUSAL": 2336,
+            "LOCAL_LEFT": 2336,
+            "LOCAL_RIGHT": 2336,
+            "FULL_WINDOW_COLLAPSE": 2336,
+        },
+        tiling_only_metadata=True,
+    )
+
+
+def test_fa4_910_varlen_torch_compile_correctness():
+    require_soc("910")
+
+    api = load_api("flash_attn_npu_4.flash_attn_npu_interface")
+
+    run_varlen_compile_test(
+        api,
+        backward=True,
+    )
+
+
+def test_fa4_950_scheduler_metadata_torch_compile_correctness():
+    require_soc("950")
+
+    api = load_api("flash_attn_npu_4.flash_attn_npu_interface_950")
+
+    run_metadata_compile_test(api, expected_sizes=None, tiling_only_metadata=True)
+
+
+def test_fa4_950_varlen_torch_compile_correctness():
+    require_soc("950")
+
+    api = load_api("flash_attn_npu_4.flash_attn_npu_interface_950")
+
+    run_varlen_compile_test(
+        api,
+        backward=False,
+    )
+
+
+def test_fa4_950_varlen_asymmetric_causal_torch_compile_correctness():
+    require_soc("950")
+
+    api = load_api("flash_attn_npu_4.flash_attn_npu_interface_950")
+
+    run_varlen_compile_test(
+        api,
+        backward=False,
+        cu_q_values=(0, 2, 6),
+        cu_k_values=(0, 1, 6),
+        causal=True,
+    )
+
+
+def test_fa4_910_fixed_torch_compile_correctness():
+    """
+    Verify FA4 fixed-length API correctness.
+    """
+
+    require_soc("910")
+
+    api = load_api("flash_attn_npu_4.flash_attn_npu_interface")
+
+    run_fixed_compile_test(
+        api,
+        backward=True,
+    )

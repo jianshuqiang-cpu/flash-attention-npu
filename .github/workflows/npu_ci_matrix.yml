@@ -1,0 +1,202 @@
+name: NPU CI 编译矩阵
+
+# 多 CANN × torch/torch_npu 兼容编译矩阵。手动触发 (workflow_dispatch), 不跑每次 PR。
+# 在预构建的 fa-npu-ci:<name> 镜像里并发编译, 汇总 per-combo pass/fail。
+#
+# 双架构并行: 950 (x86_64) 和 910B (aarch64) 各跑一个 job, 同时执行。
+# 每个 job 用 ARCH_FILTER 和 NPU_FILTER 选择本机对应的 combo。
+#
+# 前置 (每台 runner 上一次性操作):
+#   1. 确保 clone 镜像存在 (两架构均由 build_matrix_images.sh 构建):
+#      - 950 机器:  fa-npu-ci:950-cann9.1-torch2.9
+#      - 910B 机器: fa-npu-ci:910b-cann9.1-torch2.9
+#   2. bash ci/build_matrix_images.sh   # 构建本机架构的 combo 镜像 (910B 和 950 均需)
+#
+# runner 标签:
+#   950 机器:  self-hosted, linux, x64, npu, flash-attention-npu
+#   910B 机器: self-hosted, linux, arm64, npu, flash-attention-npu
+# 状态检查名: NPU CI 编译矩阵 / <arch> 编译
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_jobs:
+        description: "并发容器数上限 (0=不限; 内存吃紧时调小, 如 3)"
+        required: false
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  matrix_build:
+    name: ${{ matrix.arch_label }} 编译
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - arch_filter: x86_64
+            npu_filter: "950"
+            arch_label: x86_64-950
+            runs_on: '["self-hosted", "linux", "x64", "npu", "flash-attention-npu"]'
+            clone_image: fa-npu-ci:950-cann9.1-torch2.9
+          - arch_filter: aarch64
+            npu_filter: "910"
+            arch_label: aarch64-910B
+            runs_on: '["self-hosted", "linux", "arm64", "npu", "flash-attention-npu"]'
+            clone_image: fa-npu-ci:910b-cann9.1-torch2.9
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    timeout-minutes: 360
+    env:
+      CI_DOCKER_IMAGE: ${{ matrix.clone_image }}
+      CI_DOCKER_CPUS: ${{ matrix.npu_filter == '950' && '16' || '' }}
+      CI_MATRIX_MAX_JOBS: ${{ inputs.max_jobs }}
+      ARCH_FILTER: ${{ matrix.arch_filter }}
+      NPU_FILTER: ${{ matrix.npu_filter }}
+      MATRIX_FILE: ci/ci_build_matrix.tsv
+      CI_CONTAINER_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}
+    steps:
+      - name: Clone repo (docker first 3x as root, then host 3x)
+        env:
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$PWD"
+          REPO_URL="https://github.com/${GITHUB_REPOSITORY}.git"
+          unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy || true
+          git_proxy=""
+          git_proxy_hosts="github.com,gist.github.com,api.github.com,raw.githubusercontent.com,codeload.github.com,objects.githubusercontent.com"
+          case " $(hostname -I 2>/dev/null || true) " in
+            *" 192.168.13.241 "*) git_proxy=http://127.0.0.1:18790 ;;
+            *" 192.168.9.226 "*) git_proxy=http://127.0.0.1:17890 ;;
+          esac
+          proxy_file="${PROXY_CONFIG_FILE:-${GOLDEN_CACHE_HOST_DIR:-/home/FA_NPU_CI_DATA}/proxy.conf}"
+          if [ -f "$proxy_file" ]; then
+            while IFS='=' read -r proxy_key proxy_value || [ -n "$proxy_key" ]; do
+              proxy_key="${proxy_key#"${proxy_key%%[![:space:]]*}"}"
+              proxy_key="${proxy_key%"${proxy_key##*[![:space:]]}"}"
+              [[ -z "$proxy_key" || "$proxy_key" == \#* ]] && continue
+              proxy_value="${proxy_value#"${proxy_value%%[![:space:]]*}"}"
+              proxy_value="${proxy_value%"${proxy_value##*[![:space:]]}"}"
+              case "$proxy_key" in
+                GIT_PROXY|HTTPS_PROXY|HTTP_PROXY|https_proxy|http_proxy) git_proxy="$proxy_value" ;;
+                GIT_PROXY_WHITELIST|PROXY_WHITELIST) git_proxy_hosts="$proxy_value" ;;
+              esac
+            done < "$proxy_file"
+          fi
+          [ "${CI_GIT_PROXY+x}" = x ] && git_proxy="$CI_GIT_PROXY"
+          [ "${CI_GIT_PROXY_WHITELIST+x}" = x ] && git_proxy_hosts="$CI_GIT_PROXY_WHITELIST"
+          git_proxy_conf="$(mktemp /tmp/ci-git-proxy.XXXXXX.conf)"
+          : > "$git_proxy_conf"
+          if [ -n "$git_proxy" ]; then
+            git_proxy_hosts="${git_proxy_hosts//,/ }"
+            for git_proxy_host in $git_proxy_hosts; do
+              git_proxy_host="${git_proxy_host#"${git_proxy_host%%[![:space:]]*}"}"
+              git_proxy_host="${git_proxy_host%"${git_proxy_host##*[![:space:]]}"}"
+              [ -n "$git_proxy_host" ] || continue
+              if [[ "$git_proxy_host" == *"://"* ]]; then
+                printf '[http "%s"]\n\tproxy = %s\n' "$git_proxy_host" "$git_proxy" >> "$git_proxy_conf"
+              else
+                printf '[http "https://%s"]\n\tproxy = %s\n' "$git_proxy_host" "$git_proxy" >> "$git_proxy_conf"
+                printf '[http "https://%s/"]\n\tproxy = %s\n' "$git_proxy_host" "$git_proxy" >> "$git_proxy_conf"
+                printf '[http "http://%s"]\n\tproxy = %s\n' "$git_proxy_host" "$git_proxy" >> "$git_proxy_conf"
+                printf '[http "http://%s/"]\n\tproxy = %s\n' "$git_proxy_host" "$git_proxy" >> "$git_proxy_conf"
+              fi
+            done
+          fi
+          chmod 644 "$git_proxy_conf" 2>/dev/null || true
+          proxy_args=()
+          if [ -s "$git_proxy_conf" ]; then
+            proxy_args+=(
+              -v "$git_proxy_conf:/tmp/ci-git-proxy.conf:ro"
+              -e GIT_CONFIG_COUNT=1
+              -e GIT_CONFIG_KEY_0=include.path
+              -e GIT_CONFIG_VALUE_0=/tmp/ci-git-proxy.conf
+            )
+          fi
+
+          # ---------- 阶段1: docker 容器 clone (root, 重试 3 次) ----------
+          # 用 docker 容器 (root) clone, 避免 runner 用户与残留 root 文件的权限冲突。
+          # 容器内用 git init + fetch (不要求空目录), checkout 前用 git clean 删 untracked。
+          docker_ok=false
+          docker_cpu_args=()
+          if [ -n "$CI_DOCKER_CPUS" ]; then
+            docker_cpu_args+=(--cpus="$CI_DOCKER_CPUS")
+          fi
+          if docker run --rm \
+            "${docker_cpu_args[@]}" \
+            --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
+            "${proxy_args[@]}" \
+            --network host \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            "$CI_DOCKER_IMAGE" \
+            bash -c '
+              set -e
+              git config --global --add safe.directory /workspace
+              git config --global http.postBuffer 524288000
+              REPO_URL="https://github.com/'"${GITHUB_REPOSITORY}"'.git"
+              TARGET_SHA="'"$TARGET_SHA"'"
+              for i in 1 2 3; do
+                echo "[clone][docker] attempt $i/3"
+                rm -rf /workspace/.git 2>/dev/null || true
+                git init -q
+                git remote remove origin 2>/dev/null || true
+                git remote add origin "$REPO_URL"
+                if git fetch --depth=1 origin "$TARGET_SHA"; then
+                  git clean -fdx -e .git
+                  git checkout -q FETCH_HEAD
+                  echo "[clone][docker] success"
+                  exit 0
+                fi
+                echo "[clone][docker] attempt $i/3 failed, retry in 15s..."
+                sleep 15
+              done
+              echo "[clone][docker] all 3 attempts failed"
+              exit 1
+            '; then
+            docker_ok=true
+          fi
+
+          # ---------- 阶段2: docker 失败, 改用宿主机 clone (重试 3 次) ----------
+          if [ "$docker_ok" != "true" ]; then
+            echo "[clone][docker] failed, fallback to host"
+            if [ -s "$git_proxy_conf" ]; then
+              export GIT_CONFIG_COUNT=1
+              export GIT_CONFIG_KEY_0=include.path
+              export GIT_CONFIG_VALUE_0="$git_proxy_conf"
+            fi
+            for i in 1 2 3; do
+              echo "[clone][host] attempt $i/3"
+              rm -rf .git 2>/dev/null || true
+              git init -q
+              git remote remove origin 2>/dev/null || true
+              git remote add origin "$REPO_URL"
+              if git fetch --depth=1 origin "$TARGET_SHA"; then
+                git clean -fdx -e .git
+                git checkout -q FETCH_HEAD
+                break
+              fi
+              echo "[clone][host] attempt $i/3 failed, retry in 15s..."
+              sleep 15
+            done
+          fi
+
+          ls -la ci/run_ci_matrix.sh
+          git log --oneline -1
+
+      - name: Run matrix build (${{ matrix.arch_filter }})
+        run: |
+          set -euo pipefail
+          bash ci/run_ci_matrix.sh
+
+      - name: Clean up this job's CI containers
+        if: always()
+        run: |
+          if [ -f ci/cleanup_ci_containers.sh ]; then
+            bash ci/cleanup_ci_containers.sh
+          else
+            echo "cleanup script not found; skipping cleanup"
+          fi

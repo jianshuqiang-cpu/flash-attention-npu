@@ -1,0 +1,48 @@
+# Conda environment for Ascend Catlass DSL.
+# LLVM/MLIR are provided by the AscendNPU-IR build, not by conda.
+name: ascend-catlass-dsl
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python>=3.10,<3.14
+  - cmake>=3.28,<4.0
+  - ninja>=1.12
+  - clang=19.1.7
+  - clangxx=19.1.7
+  - clang-tools=19.1.7
+  - lld=19.1.7
+  - lit=19.1.7
+  - pip:
+      # build
+      - setuptools>=68
+      - wheel
+      - setuptools-scm>=8
+      - pybind11==2.13.6
+      # runtime
+      - numpy>=1.24,<3
+      - attrs
+      - cython
+      - decorator
+      - sympy
+      - cffi
+      - pyyaml
+      - pathlib2
+      - psutil
+      - protobuf==3.20.0
+      - scipy
+      - requests
+      - absl-py
+      # dev/test
+      - pytest
+      - ruff
+      - black
+      - mypy
+      # docs
+      - mkdocs>=1.6.1
+      # NPU 端到端示例需要（与 CANN 9.1.0 匹配；torch-npu 提供 Python 3.10–3.13 的 wheel，
+      # 与当前环境 Python 版本一致即可；仅运行 examples/end_to_end 与上板回归时需要，不影响 MLIR 层单元测试）
+      # 注意：在 x86_64 Linux 上，pip 默认会拉取带 CUDA 的 torch wheel（体积大且依赖 CUDA 运行库）；
+      # 若仅用于 NPU 上板、不打算使用 CUDA，可改为安装 CPU 版 torch（如 torch==2.9.0+cpu，需指定 PyTorch CPU 源）。
+      - torch==2.9.0
+      - torch-npu==2.9.0.post6

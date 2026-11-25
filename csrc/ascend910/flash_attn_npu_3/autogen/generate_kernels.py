@@ -1,0 +1,141 @@
+# Copyright (c) 2026, Minghua Shen.
+
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional
+
+# Generates the v3 NPU dispatch translation units (one explicit instantiation
+# per .cpp so the kernel templates compile in parallel). head_dim is NOT a
+# template axis:
+# the forward (FAInfer) does not bin by head_dim at all (it is a runtime tiling
+# value), and the backward (FAGGeneral) selects head_dim at runtime via a
+# switch() inside the impl (bwd_dispatch_common.hpp). So head_dim is deliberately
+# dropped here.
+#
+# The real compile-time axes are dtype and input layout. The forward supports
+# the three input layouts (TND / BSND / BNSD), as does the backward.
+# Each generated .cpp holds exactly ONE
+# explicit instantiation of the per-family dispatch template, so the heavy
+# kernel templates land in separate, parallel-compiled translation units. The
+# impl bodies live in the shared fwd_dispatch_impl.hpp / bwd_dispatch_common.hpp
+# headers (one directory up); this script only emits the instantiation stubs.
+
+# dtype key -> C++ type token
+DTYPE_MAP = {
+    "fp16": "half",
+    "bf16": "bfloat16_t",
+}
+
+# Forward layout key -> (display name, FaiKenel::inputLayout token).
+FWD_LAYOUTS = [
+    ("bsnd", "BSND", "FaiKenel::inputLayout::BSND"),
+    ("tnd", "TND", "FaiKenel::inputLayout::TND"),
+    ("bnsd", "BNSD", "FaiKenel::inputLayout::BNSD"),
+]
+
+# Backward layout key -> (display name, FAG layout constant token). The backward
+# uses the FAG-side BSND/TND constants (see fag_kernel_common.hpp), not the
+# kernel inputLayout enum.
+BWD_LAYOUTS = [
+    ("bsnd", "BSND", "BSND"),
+    ("tnd", "TND", "TND"),
+    ("bnsd", "BNSD", "BNSD"),
+]
+
+PRELUDE = (
+    "// Copyright (c) 2026, Minghua Shen.\n"
+)
+
+
+def _header(family_desc: str, layout_display: str) -> str:
+    return (
+        PRELUDE + f"// v3 {family_desc}, {layout_display} variant. One explicit instantiation per\n"
+        "// translation unit so the kernel templates compile in parallel across\n"
+        "// cores; head_dim is a runtime axis (switch/tiling inside the impl), not a\n"
+        "// template parameter, so it is not a generation axis.\n\n"
+    )
+
+
+def fwd_kernel(dtype_key: str, layout: tuple) -> "Kernel":
+    ctype = DTYPE_MAP[dtype_key]
+    layout_key, display, layout_token = layout
+    body = (
+        _header("forward FAInfer dispatch", display)
+        + '#include "../fwd_dispatch_impl.hpp"\n\n'
+        + f"template void launch_fwd_dtype<{ctype}, {layout_token}>(const FwdLaunchArgs &);"
+        f"  // {display}\n"
+    )
+    return Kernel(
+        family="fwd",
+        dtype=dtype_key,
+        layout=layout_key,
+        filename=f"fwd_dispatch_{dtype_key}_{layout_key}.cpp",
+        content=body,
+    )
+
+
+def bwd_kernel(dtype_key: str, layout: tuple) -> "Kernel":
+    ctype = DTYPE_MAP[dtype_key]
+    layout_key, display, enum = layout
+    body = (
+        _header("backward FAGGeneral dispatch", display)
+        + '#include "../bwd_dispatch_common.hpp"\n\n'
+        + f"template void bwd_dispatch_run<{ctype}, {enum}>(const BwdLaunchArgs &);"
+        f"  // {display}\n"
+    )
+    return Kernel(
+        family="bwd",
+        dtype=dtype_key,
+        layout=layout_key,
+        filename=f"bwd_dispatch_{dtype_key}_{layout_key}.cpp",
+        content=body,
+    )
+
+
+@dataclass
+class Kernel:
+    family: str
+    dtype: str
+    layout: str
+    filename: str
+    content: str
+
+
+def get_all_kernels() -> List[Kernel]:
+    kernels: List[Kernel] = []
+    for dtype in DTYPE_MAP:
+        for layout in FWD_LAYOUTS:
+            kernels.append(fwd_kernel(dtype, layout))
+        for layout in BWD_LAYOUTS:
+            kernels.append(bwd_kernel(dtype, layout))
+    return kernels
+
+
+def write_kernel(kernel: Kernel, output_dir: Path) -> None:
+    (output_dir / kernel.filename).write_text(kernel.content)
+
+
+def main(output_dir: Optional[str]) -> None:
+    output_dir = Path(output_dir) if output_dir is not None else Path(__file__).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for kernel in get_all_kernels():
+        write_kernel(kernel, output_dir)
+    print(f"Generated {len(get_all_kernels())} dispatch TUs in {output_dir}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        prog="generate_kernels",
+        description="Generate the v3 flash_attn_npu dispatch template instantiations "
+        "(per dtype x layout; head_dim is a runtime axis and is not generated).",
+    )
+    parser.add_argument(
+        "-o",
+        "--output_dir",
+        required=False,
+        help="Where to generate the dispatch .cpp stubs; "
+        "defaults to this script's directory (csrc/flash_attn_npu_3/autogen).",
+    )
+    args = parser.parse_args()
+    main(args.output_dir)

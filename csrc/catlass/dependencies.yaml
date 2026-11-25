@@ -1,0 +1,29 @@
+---
+package:
+  name: "catlass"
+  version: "1.5.0"
+
+ascend_stack:
+  - name: "hdk"
+    version: ">=1.80.0"
+
+  - name: "cann"
+    version: ">=8.5.0"
+
+common:
+  - name: "gcc"
+    version: ">=7.5.0"
+
+  - name: "gxx"
+    version: ">=7.5.0"
+
+  - name: "cmake"
+    version: ">=3.16.0"
+
+  - name: "python"
+    version: ">=3.8,<3.12"
+
+supported_npu:
+  - "atlasa2"
+  - "atlasa3"
+  - "ascend950"
