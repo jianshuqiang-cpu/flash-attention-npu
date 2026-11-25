@@ -28,6 +28,8 @@
 
 namespace Catlass::Epilogue::Block {
 
+enum class ScoreBoundary { None, Lower, Upper };
+
 template <class OutputType_, class LayoutS_, class MaskType_, class TileCopy_, bool HAS_SOFTCAP_>
 class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::GemmType<float, LayoutS_>, MaskType_,
                     TileCopy_> {
@@ -160,7 +162,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         }
     }
 
-    template <bool Positional = false, bool Folded = false, class TensorP>
+    template <bool Positional = false, bool Folded = false, ScoreBoundary Boundary = ScoreBoundary::None, class TensorP>
     __aicore__ inline void operator()(TensorP& l1PTensorTla, GemmCoord actualBlockShape, uint32_t isFirstKvSTile,
                                       uint32_t ubSBufId, uint32_t l1PBufId, Arch::CrossCoreFlag qkReadyFlag,
                                       Arch::CrossCoreFlag softmaxReadyFlag, uint32_t qSBlockSize, uint32_t qNBlockSize,
@@ -206,10 +208,11 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>((ubSBufId & pBankMask_) + 2);
         if (isFirstKvSTile) {
             if (n > 64) {
-                ComputeScaleAndMax<ElementInput, ElementOutput, false, Positional, Folded>(
+                ComputeScaleAndMax<ElementInput, ElementOutput, false, Positional, Folded, Boundary>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN,
                     nPadding, scaleValue, softcapValue, 128, blockStride, nRound,
-                    leftOfRowZero, windowWidth, firstRowInHead, qSBlockSize);
+                    Boundary == ScoreBoundary::None ? leftOfRowZero : leftOfRowZero + static_cast<int32_t>(rowStart),
+                    windowWidth, firstRowInHead, qSBlockSize);
             } else {
                 ComputeScaleAndMax64<ElementInput, ElementOutput, false, Positional, Folded>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN,
@@ -218,10 +221,11 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
             }
         } else {
             if (n > 64) {
-                ComputeScaleAndMax<ElementInput, ElementOutput, true, Positional, Folded>(
+                ComputeScaleAndMax<ElementInput, ElementOutput, true, Positional, Folded, Boundary>(
                     sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding,
                     scaleValue, softcapValue, 128, blockStride, nRound,
-                    leftOfRowZero, windowWidth, firstRowInHead, qSBlockSize);
+                    Boundary == ScoreBoundary::None ? leftOfRowZero : leftOfRowZero + static_cast<int32_t>(rowStart),
+                    windowWidth, firstRowInHead, qSBlockSize);
             } else {
                 ComputeScaleAndMax64<ElementInput, ElementOutput, true, Positional, Folded>(
                     sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding,
@@ -404,7 +408,8 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         Adds(srcVreg, srcVreg, -softcapValue, maskVreg);
     }
 
-    template <typename ElementS, typename ElementP, bool isUpdate, bool Positional = false, bool Folded = false>
+    template <typename ElementS, typename ElementP, bool isUpdate, bool Positional = false, bool Folded = false,
+              ScoreBoundary Boundary = ScoreBoundary::None>
     __simd_vf__ static inline void
     ComputeScaleAndMax(__ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
                        __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
@@ -472,7 +477,21 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                 ApplySoftcap(srcVreg, softcapVreg, pregFull, dSoftcap);
                 ApplySoftcap(srcVreg_unroll, softcapVreg, pregTailN, dSoftcap);
             }
-            if constexpr (Positional) {
+            if constexpr (Boundary != ScoreBoundary::None) {
+                // In a single Q head the inclusive window shifts one column per row.
+                const int32_t edge = leftOfRowZero + static_cast<int32_t>(i);
+                uint32_t first = edge > 0 ? static_cast<uint32_t>(edge) : 0U;
+                uint32_t second = first > FLOAT_REP_SIZE ? first - FLOAT_REP_SIZE : 0U;
+                auto prefix0 = UpdateMask<float>(first);
+                auto prefix1 = UpdateMask<float>(second);
+                if constexpr (Boundary == ScoreBoundary::Lower) {
+                    Select(srcVreg, minVreg, srcVreg, prefix0);
+                    Select(srcVreg_unroll, minVreg, srcVreg_unroll, prefix1);
+                } else {
+                    Select(srcVreg, srcVreg, minVreg, prefix0);
+                    Select(srcVreg_unroll, srcVreg_unroll, minVreg, prefix1);
+                }
+            } else if constexpr (Positional) {
                 Compares<uint32_t, AscendC::CMPMODE::LE>(pregCompare, (RegTensor<uint32_t>&)columns, width, pregFull);
                 Select(srcVreg, srcVreg, minVreg, pregCompare);
                 int32_t step = -1;

@@ -444,7 +444,7 @@ at::Tensor flash_attn_prepare_fd_metadata(const at::Tensor& scheduler_metadata, 
 
     SeqlenScratch scratch;
     optiling::FAInferContext ctx;
-    fill_inference_context(ctx, scratch, q, k, v, is_varlen_q ? &cu_seqlen_q_cpu : nullptr,
+    fill_inference_context(ctx, scratch, is_varlen_q ? &cu_seqlen_q_cpu : nullptr,
                            seqused_q_cpu.defined() ? &seqused_q_cpu : nullptr, &seqlens_k_cpu, paged_KV,
                            page_block_size, num_blocks, max_num_blocks_per_seq, maskDer.is_causal, maskDer.is_local,
                            maskDer.is_local ? maskDer.window_left : 0, maskDer.is_local ? maskDer.window_right : 0,
@@ -478,10 +478,94 @@ at::Tensor flash_attn_prepare_fd_metadata(const at::Tensor& scheduler_metadata, 
     return hints;
 }
 
+// Prepare on the capture thread. The paged kernel reads live KV lengths;
+// its kernel selection, core ranges and split workspace come from the same
+// host tiler as eager. Physical page geometry is supplied by each forward.
+static std::pair<at::Tensor, std::array<int64_t, 4>> PrepareMixedTiling(
+    const at::Tensor& lengths, const std::optional<at::Tensor>& cuQ, int batch, int maxQ,
+    int64_t maxKv, int heads, int kvHeads, bool causal, int64_t left, int64_t right,
+    bool softcap, int64_t splits, const std::optional<at::Tensor>& usedQ)
+{
+    const c10::OptionalDeviceGuard guard(device_of(lengths));
+    TORCH_CHECK(lengths.device().type() == at::kPrivateUse1 && lengths.scalar_type() == at::kInt &&
+                    lengths.dim() == 1 && lengths.numel() == batch && batch > 0, "invalid mixed KV cache_seqlens");
+    TORCH_CHECK(maxQ >= 0 && maxKv >= 0 && heads > 0 && kvHeads > 0 && heads % kvHeads == 0,
+                "invalid mixed KV sequence bounds or head counts");
+    const uint32_t cores = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
+    TORCH_CHECK(splits >= 0 && splits <= cores, "num_splits exceeds the device core count");
+    at::Tensor cu;
+    if (cuQ) {
+        TORCH_CHECK(cuQ->device() == lengths.device() && cuQ->scalar_type() == at::kInt &&
+                        cuQ->dim() == 1 && cuQ->numel() == batch + 1, "invalid mixed KV cu_seqlens_q");
+        cu = cuQ->cpu().contiguous();
+        TORCH_CHECK(cu.data_ptr<int32_t>()[0] == 0, "cu_seqlens_q must start at zero");
+    }
+    const auto kv = lengths.cpu().contiguous();
+    at::Tensor used;
+    if (usedQ) {
+        TORCH_CHECK(cuQ && usedQ->device() == lengths.device() && usedQ->scalar_type() == at::kInt &&
+                        usedQ->dim() == 1 && usedQ->numel() == batch, "invalid mixed KV seqused_q");
+        used = usedQ->cpu().contiguous();
+        const auto* prefix = cu.data_ptr<int32_t>();
+        const auto* rows = used.data_ptr<int32_t>();
+        for (int b = 0; b < batch; ++b) {
+            TORCH_CHECK(rows[b] >= 0 && rows[b] <= int64_t(prefix[b + 1]) - prefix[b],
+                        "seqused_q exceeds the packed query region");
+        }
+    }
+    const auto mask = DeriveFwdMask(causal, left, right, maxQ, maxKv);
+    auto layout = cuQ ? FwdLayout::TND : FwdLayout::BSND;
+    SeqlenScratch scratch;
+    optiling::FAInferContext ctx;
+    fill_inference_context(ctx, scratch, cuQ ? &cu : nullptr, usedQ ? &used : nullptr, &kv, true, 128, 0, 0,
+                           mask.is_causal, mask.is_local, mask.window_left, mask.window_right,
+                           cuQ.has_value(), true, 2, batch, maxQ, heads, kvHeads, 192, 192,
+                           1.0f, softcap ? 1.0f : 0.0f, true, layout);
+    TORCH_CHECK(ctx.maxQSeqlen <= maxQ && ctx.maxKvSeqlen <= maxKv, "lengths exceed the declared bounds");
+    ctx.mixedKvStorage = true;
+    ctx.flashDecodeFlag = UseFlashDecode(batch, maxQ, cuQ ? cu.data_ptr<int32_t>() : nullptr,
+                                         usedQ ? used.data_ptr<int32_t>() : nullptr,
+                                         kv.data_ptr<int32_t>(), true, mask.is_local, true, layout, splits);
+    ctx.numSplits = static_cast<uint32_t>(splits);
+    FAInferTilingData tiling{};
+    optiling::FAInferTiling tiler(ctx);
+    tiler.SetCoreNum(cores);
+    tiler.DoTiling(tiling);
+    const auto launch = LaunchForTiling(tiling, cores, true, mask.is_local,
+                                       mask.is_local && !softcap && maxQ == 1 &&
+                                       mask.window_left >= 127 && mask.window_right == 0);
+    const bool addPaired = cuQ && !mask.is_local && !softcap && splits == 0 &&
+        optiling::CanPairDecode(tiling, kv.data_ptr<int32_t>()[0]);
+    const int64_t bytesNeeded = sizeof(tiling) + (addPaired ? optiling::kPairedPlanOffset : 0U);
+    auto bytes = at::empty({bytesNeeded}, at::device(at::kCPU).dtype(at::kByte));
+    std::memcpy(bytes.data_ptr(), &tiling, sizeof(tiling));
+    if (addPaired) {
+        optiling::SetPairedDecodeRanges(tiling);
+        std::memset(bytes.data_ptr<uint8_t>() + sizeof(tiling), 0, optiling::kPairedPlanOffset - sizeof(tiling));
+        std::memcpy(bytes.data_ptr<uint8_t>() + optiling::kPairedPlanOffset, &tiling, sizeof(tiling));
+    }
+    return {bytes, launch};
+}
+
 PYBIND11_MODULE(flash_attn_npu_3_950, m)
 {
     m.doc() = "FlashAttention v3 — Ascend 950 backend";
-    m.def("fwd", &mha_fwd, "Forward pass, with KV-cache (Ascend 950)");
+    m.def("fwd", &mha_fwd, "Forward pass, with KV-cache (Ascend 950)",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("k_new"),
+          py::arg("v_new"), py::arg("q_v"), py::arg("out"), py::arg("cu_seqlens_q"),
+          py::arg("cu_seqlens_k"), py::arg("cu_seqlens_k_new"), py::arg("seqused_q"), py::arg("seqused_k"),
+          py::arg("max_seqlen_q"), py::arg("max_seqlen_k"), py::arg("page_table"), py::arg("kv_batch_idx"),
+          py::arg("leftpad_k"), py::arg("rotary_cos"), py::arg("rotary_sin"), py::arg("seqlens_rotary"),
+          py::arg("q_descale"), py::arg("k_descale"), py::arg("v_descale"), py::arg("softmax_scale"),
+          py::arg("is_causal"), py::arg("window_size_left"), py::arg("window_size_right"), py::arg("attention_chunk"),
+          py::arg("softcap"), py::arg("is_rotary_interleaved"), py::arg("scheduler_metadata"), py::arg("num_splits"),
+          py::arg("pack_gqa"), py::arg("sm_margin"), py::arg("return_softmax_lse"), py::arg("layout"),
+          py::arg("paired_prefill") = py::none(), py::arg("fd_active_cores") = py::none(),
+          py::arg("fd_workspace_bytes") = py::none(), py::arg("mixed_launch") = py::none());
+    m.def("prepare_mixed_tiling", &PrepareMixedTiling, "Prepare mixed KV tiling outside graph capture",
+          py::arg("lengths"), py::arg("cu_q"), py::arg("batch"), py::arg("max_q"), py::arg("max_kv"),
+          py::arg("heads"), py::arg("kv_heads"), py::arg("causal"), py::arg("left"), py::arg("right"),
+          py::arg("softcap"), py::arg("splits"), py::arg("used_q") = py::none());
     m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata (tiling) on AICPU",
           py::arg("batch_size"), py::arg("max_seqlen_q"), py::arg("num_heads_q"), py::arg("num_heads_kv"),
           py::arg("headdim"), py::arg("headdim_v"), py::arg("cache_seqlens"), py::arg("seqlens_q"),
