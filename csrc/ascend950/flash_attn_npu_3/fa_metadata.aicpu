@@ -105,9 +105,9 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     const bool countWindowTasks = metaArgs->quantMode == 2U && metaArgs->pagedKV != 0U &&
         metaArgs->maskType == 4U && metaArgs->windowSizeLeft == 511 && metaArgs->windowSizeRight == 0 &&
         metaArgs->softcapActive == 0U && metaArgs->embeddingSize == 192U && metaArgs->embeddingSizeV == 192U &&
-        metaArgs->numHeads == 16U * metaArgs->numHeadsK &&
-        uint64_t(metaArgs->batch) * metaArgs->numHeads <= 2ULL * metaArgs->blockDim;
-    bool fullQueryTileInEachBatch = true;
+        metaArgs->numHeads == 16U * metaArgs->numHeadsK;
+    // Empty packed requests own no Q tasks. Only a short, nonempty request forbids pairing.
+    bool allNonemptyQueriesHaveFullTile = true;
     if (seqlensQ != nullptr)
         actualMaxQ = 0;
     for (uint32_t b = 0; b < metaArgs->batch; ++b) {
@@ -126,8 +126,8 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
         }
         const uint32_t len = seqlensQ ? readLength(seqlensQ, b, metaArgs->qCumulative) : metaArgs->maxQSeqlen;
         actualMaxQ = len > actualMaxQ ? len : actualMaxQ;
-        fullQueryTileInEachBatch = fullQueryTileInEachBatch && len >= Q_TILE_CEIL;
-        if (countWindowTasks) {
+        allNonemptyQueriesHaveFullTile &= (len == 0U || len >= Q_TILE_CEIL);
+        if (countWindowTasks && windowTasks <= 2ULL * metaArgs->blockDim) {
             windowTasks += ((uint64_t(len) + Q_TILE_CEIL - 1U) / Q_TILE_CEIL) * metaArgs->numHeads;
         }
         const uint32_t activeQ = fa950_plan::ActiveQueryRows(len, readLength(cacheSeqlens, b, metaArgs->kvCumulative), metaArgs->maskType != 0U,
@@ -145,9 +145,9 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     // Mixed BF16/FP8 KV: mirror the host tiling's paired-prefill and small-MTP
     // tile policy, otherwise the metadata path loses the paired pipeline.
     const uint32_t groupSizeTiles = metaArgs->numHeads / metaArgs->numHeadsK;
-    const bool oneWindowWave = fullQueryTileInEachBatch && windowTasks >= metaArgs->blockDim &&
+    const bool oneWindowWave = allNonemptyQueriesHaveFullTile && windowTasks >= metaArgs->blockDim &&
                                windowTasks <= 2ULL * metaArgs->blockDim && windowTasks != 0U;
-    const bool hasPairedWave = metaArgs->quantMode == 2U && fullQueryTileInEachBatch &&
+    const bool hasPairedWave = metaArgs->quantMode == 2U && allNonemptyQueriesHaveFullTile &&
         (groupSizeTiles % 2U == 0U) &&
         (fullQ128Tasks >= 2ULL * metaArgs->blockDim || (oneWindowWave && windowTasks > metaArgs->blockDim));
     const bool pairedWindow =

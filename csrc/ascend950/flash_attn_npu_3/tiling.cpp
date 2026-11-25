@@ -1016,8 +1016,9 @@ void FAInferTiling::DoTiling(FAInferTilingData& tilingdata)
         !faInfo_.flashDecodeFlag && faInfo_.maskType == MaskType::MASK_BAND &&
         faInfo_.windowSizeLeft == 511 && faInfo_.windowSizeRight == 0 && faInfo_.softcapValue == 0.0f &&
         faInfo_.embeddingSize == 192 && faInfo_.embeddingSizeV == 192 && faInfo_.numHeads == 16 * faInfo_.kvHeads &&
-        faInfo_.maxQSeqlen >= Q_TILE_CEIL && uint64_t(faInfo_.batch) * faInfo_.numHeads <= 2ULL * blockNum_;
-    bool fullQueryTileInEachBatch = true;
+        faInfo_.maxQSeqlen >= Q_TILE_CEIL;
+    // Empty packed requests own no Q tasks. Only a short, nonempty request forbids pairing.
+    bool allNonemptyQueriesHaveFullTile = true;
     for (uint32_t b = 0; b < static_cast<uint32_t>(faInfo_.batch); ++b) {
         const uint32_t qLen =
             faInfo_.qSeqlenList == nullptr
@@ -1031,10 +1032,10 @@ void FAInferTiling::DoTiling(FAInferTilingData& tilingdata)
                                           : faInfo_.kvSeqlenList[b]);
         const uint32_t activeQ =
             fa950_plan::ActiveQueryRows(qLen, kvLen, faInfo_.maskType != MaskType::NO_MASK, faInfo_.windowSizeRight);
-        if (countWindowTasks) {
+        if (countWindowTasks && windowTasks <= 2ULL * blockNum_) {
             windowTasks += ((uint64_t(qLen) + Q_TILE_CEIL - 1U) / Q_TILE_CEIL) * faInfo_.numHeads;
         }
-        fullQueryTileInEachBatch &= qLen >= Q_TILE_CEIL;
+        allNonemptyQueriesHaveFullTile &= (qLen == 0U || qLen >= Q_TILE_CEIL);
         fullQ128Tasks += uint64_t(activeQ / Q_TILE_CEIL) * faInfo_.numHeads;
     }
     qBaseTile_ = fa950_plan::SelectQueryTile(faInfo_.embeddingSize, faInfo_.embeddingSizeV, faInfo_.maxQSeqlen,
@@ -1042,9 +1043,9 @@ void FAInferTiling::DoTiling(FAInferTilingData& tilingdata)
                                              faInfo_.windowSizeLeft, faInfo_.windowSizeRight);
     // A ragged last Q tile still occupies a processing slot. At exactly one
     // wave use individual heads; above it a pair can avoid an entire second wave.
-    const bool oneWindowWave = fullQueryTileInEachBatch && windowTasks >= blockNum_ &&
+    const bool oneWindowWave = allNonemptyQueriesHaveFullTile && windowTasks >= blockNum_ &&
                                windowTasks <= 2ULL * blockNum_ && windowTasks != 0U;
-    const bool hasPairedWave = faInfo_.mixedKvStorage && fullQueryTileInEachBatch &&
+    const bool hasPairedWave = faInfo_.mixedKvStorage && allNonemptyQueriesHaveFullTile &&
                                (faInfo_.numHeads / faInfo_.kvHeads) % 2U == 0U &&
                                (fullQ128Tasks >= 2ULL * blockNum_ || (oneWindowWave && windowTasks > blockNum_));
     const bool pairedWindow = faInfo_.maskType == MaskType::MASK_BAND &&
