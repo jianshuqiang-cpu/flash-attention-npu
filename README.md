@@ -520,6 +520,32 @@ def flash_attn_with_kvcache(
     """
 ```
 
+#### Compact FP8 KV prefill on Ascend 950
+
+For causal TND prefill with BF16 Q, E4M3FN K/V, head dimension 192 and
+128-token pages, prepare a staging plan for a fixed page table and set of
+sequence lengths. The plan converts each visible physical page once per
+forward and runs BF16 attention on the remapped logical page table. Physical
+pages may appear in any order and may be shared across requests.
+
+```python
+from flash_attn_npu_3 import prepare_fp8_kv_staging
+
+plan = prepare_fp8_kv_staging(
+    q, k_cache, page_table=page_table, cache_seqlens=cache_seqlens,
+    cu_seqlens_q=cu_seqlens_q, max_seqlen_q=max_seqlen_q, window_size=(511, 0),
+)
+out = plan.forward(q, k_cache, v_cache, k_descale=k_descale, v_descale=v_descale)
+```
+
+Use contiguous FP32 descales of shape `[physical_pages, 128, kv_heads]`.
+K/V and descales can change on each forward. Rebuild the plan if the page
+mapping, lengths or shapes change. Plan construction reads the metadata back
+to the host, so prepare it outside graph capture. Each forward allocates BF16
+scratch for the compact cache by default. To reuse the scratch on one stream,
+allocate it with `plan.allocate_workspace()` and pass it as `workspace=` to
+`plan.forward`. `plan.workspace_bytes` reports its size.
+
 #### flash_attn_func
 
 ```python

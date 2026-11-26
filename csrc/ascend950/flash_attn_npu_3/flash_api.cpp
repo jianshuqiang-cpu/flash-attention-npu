@@ -11,6 +11,7 @@
 #include "mha_bwd.cpp"
 #include "fa_metadata_args.h"
 #include "combine_dispatch.hpp"
+#include "kv_cache_staging.hpp"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 
 extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args);
@@ -589,6 +590,9 @@ PYBIND11_MODULE(flash_attn_npu_3_950, m)
           py::arg("paired_prefill") = py::none(), py::arg("fd_active_cores") = py::none(),
           py::arg("fd_workspace_bytes") = py::none(), py::arg("mixed_launch") = py::none(),
           py::arg("profile_kvcache") = false);
+    m.def("_stage_fp8_kv", &stage_fp8_kv, "Convert selected paged FP8 K/V to compact BF16 K/V",
+          py::arg("key"), py::arg("value"), py::arg("key_scale"), py::arg("value_scale"),
+          py::arg("source_pages"), py::arg("key_out"), py::arg("value_out"));
     m.def("prepare_mixed_tiling", &PrepareMixedTiling, "Prepare mixed KV tiling outside graph capture",
           py::arg("lengths"), py::arg("cu_q"), py::arg("batch"), py::arg("max_q"), py::arg("max_kv"),
           py::arg("heads"), py::arg("kv_heads"), py::arg("causal"), py::arg("left"), py::arg("right"),
