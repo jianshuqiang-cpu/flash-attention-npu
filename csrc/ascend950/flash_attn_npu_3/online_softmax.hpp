@@ -164,7 +164,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     }
 
     template <bool Positional = false, bool Folded = false, ScoreBoundary Boundary = ScoreBoundary::None,
-              bool SkipUniformStripe = false, class TensorP>
+              bool SkipUniformStripe = false, bool AlignedSwaEdge = false, class TensorP>
     __aicore__ inline void operator()(TensorP& l1PTensorTla, GemmCoord actualBlockShape, uint32_t isFirstKvSTile,
                                       uint32_t ubSBufId, uint32_t l1PBufId, Arch::CrossCoreFlag qkReadyFlag,
                                       Arch::CrossCoreFlag softmaxReadyFlag, uint32_t qSBlockSize, uint32_t qNBlockSize,
@@ -210,7 +210,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>((ubSBufId & pBankMask_) + 2);
         if (isFirstKvSTile) {
             if (n > 64) {
-                ComputeWideScores<false, Positional, Folded, Boundary, SkipUniformStripe>(
+                ComputeWideScores<false, Positional, Folded, Boundary, SkipUniformStripe, AlignedSwaEdge>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN,
                     nPadding, scaleValue, softcapValue, 128, blockStride, nRound,
                     Boundary == ScoreBoundary::None ? leftOfRowZero : leftOfRowZero + static_cast<int32_t>(rowStart),
@@ -223,7 +223,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
             }
         } else {
             if (n > 64) {
-                ComputeWideScores<true, Positional, Folded, Boundary, SkipUniformStripe>(
+                ComputeWideScores<true, Positional, Folded, Boundary, SkipUniformStripe, AlignedSwaEdge>(
                     sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding,
                     scaleValue, softcapValue, 128, blockStride, nRound,
                     Boundary == ScoreBoundary::None ? leftOfRowZero : leftOfRowZero + static_cast<int32_t>(rowStart),
@@ -410,7 +410,8 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         Adds(srcVreg, srcVreg, -softcapValue, maskVreg);
     }
 
-    template <bool IsUpdate, bool Positional, bool Folded, ScoreBoundary Boundary, bool SkipUniformStripe>
+    template <bool IsUpdate, bool Positional, bool Folded, ScoreBoundary Boundary, bool SkipUniformStripe,
+              bool AlignedSwaEdge>
     __aicore__ inline static void ComputeWideScores(
         __ubuf__ ElementInput* scores, __ubuf__ ElementInput* maxOut, __ubuf__ ElementInput* maxStart,
         __ubuf__ ElementInput* previousMax, __ubuf__ ElementOutput* probability, __ubuf__ ElementInput* sum,
@@ -421,6 +422,26 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         // The paired SWA boundary has one Q head and 64 rows per AIV.
         if constexpr (SkipUniformStripe && !HAS_SOFTCAP_ && Boundary != ScoreBoundary::None) {
             if (rows == 64U && rowsPerHead == 128U && nLoops == 1U && tailN == 64U) {
+                if constexpr (AlignedSwaEdge) {
+                    // For aligned full pages, the partial stripe starts
+                    // at column 1 in either half of the 128-column tile.
+                    constexpr auto lower = Boundary == ScoreBoundary::Lower ?
+                        ScoreStripe::HighLive : ScoreStripe::HighMasked;
+                    constexpr auto upper = Boundary == ScoreBoundary::Lower ?
+                        ScoreStripe::LowMasked : ScoreStripe::LowLive;
+                    if (edge == 1) {
+                        ComputeScaleAndMax<ElementInput, ElementOutput, IsUpdate, false, false, Boundary, lower, true>(
+                            scores, maxOut, maxStart, previousMax, probability, sum, rows, nLoops, tailN, nPadding,
+                            scale, softcap, stride, probabilityStride, repeatStride, edge, width, firstRow, rowsPerHead);
+                        return;
+                    }
+                    if (edge == 65) {
+                        ComputeScaleAndMax<ElementInput, ElementOutput, IsUpdate, false, false, Boundary, upper, true>(
+                            scores, maxOut, maxStart, previousMax, probability, sum, rows, nLoops, tailN, nPadding,
+                            scale, softcap, stride, probabilityStride, repeatStride, edge, width, firstRow, rowsPerHead);
+                        return;
+                    }
+                }
                 const int32_t lastEdge = edge + static_cast<int32_t>(rows - 1U);
                 constexpr auto skip = Boundary == ScoreBoundary::Lower ? ScoreStripe::LowMasked : ScoreStripe::HighMasked;
                 constexpr auto live = Boundary == ScoreBoundary::Lower ? ScoreStripe::HighLive : ScoreStripe::LowLive;
@@ -446,7 +467,8 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
     }
 
     template <typename ElementS, typename ElementP, bool isUpdate, bool Positional = false, bool Folded = false,
-              ScoreBoundary Boundary = ScoreBoundary::None, ScoreStripe Stripe = ScoreStripe::Both>
+              ScoreBoundary Boundary = ScoreBoundary::None, ScoreStripe Stripe = ScoreStripe::Both,
+              bool LinearMask = false>
     __simd_vf__ static inline void
     ComputeScaleAndMax(__ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
                        __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
@@ -539,8 +561,11 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                 }
             } else if constexpr (Boundary != ScoreBoundary::None) {
                 // In a single Q head the inclusive window shifts one column per row.
-                const int32_t edge = leftOfRowZero + static_cast<int32_t>(i);
-                const uint32_t positiveEdge = edge > 0 ? static_cast<uint32_t>(edge) : 0U;
+                uint32_t positiveEdge = i + 1U;
+                if constexpr (!LinearMask) {
+                    const int32_t edge = leftOfRowZero + static_cast<int32_t>(i);
+                    positiveEdge = edge > 0 ? static_cast<uint32_t>(edge) : 0U;
+                }
                 if constexpr (!lowMasked && Stripe != ScoreStripe::LowLive) {
                     uint32_t first = positiveEdge;
                     auto prefix0 = UpdateMask<float>(first);
@@ -551,7 +576,10 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                     }
                 }
                 if constexpr (!highMasked && Stripe != ScoreStripe::HighLive) {
-                    uint32_t second = positiveEdge > FLOAT_REP_SIZE ? positiveEdge - FLOAT_REP_SIZE : 0U;
+                    uint32_t second = positiveEdge;
+                    if constexpr (!LinearMask) {
+                        second = positiveEdge > FLOAT_REP_SIZE ? positiveEdge - FLOAT_REP_SIZE : 0U;
+                    }
                     auto prefix1 = UpdateMask<float>(second);
                     if constexpr (Boundary == ScoreBoundary::Lower) {
                         Select(srcVreg_unroll, minVreg, srcVreg_unroll, prefix1);

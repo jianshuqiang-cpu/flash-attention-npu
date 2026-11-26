@@ -1371,11 +1371,13 @@ class FAIKernel950 {
                             const int32_t edge = static_cast<int32_t>(AscendC::Std::min(int64_t{128},
                                 AscendC::Std::max(int64_t{-128}, boundary)));
                             if (maskLeft) {
-                                epilogueOnlineSoftmax.template operator()<false, false, Epilogue::Block::ScoreBoundary::Lower, MixedKv>(
+                                epilogueOnlineSoftmax.template operator()<false, false, Epilogue::Block::ScoreBoundary::Lower,
+                                                                          MixedKv, ResidentPages>(
                                     l1PTensorTla, actualBlockShapeQK, kvSTileRelIdx < headCount, ubSBufId, dmSlot,
                                     qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize, edge);
                             } else {
-                                epilogueOnlineSoftmax.template operator()<false, false, Epilogue::Block::ScoreBoundary::Upper, MixedKv>(
+                                epilogueOnlineSoftmax.template operator()<false, false, Epilogue::Block::ScoreBoundary::Upper,
+                                                                          MixedKv, ResidentPages>(
                                     l1PTensorTla, actualBlockShapeQK, kvSTileRelIdx < headCount, ubSBufId, dmSlot,
                                     qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize, edge);
                             }
