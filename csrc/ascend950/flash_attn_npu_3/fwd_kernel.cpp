@@ -84,7 +84,7 @@ class FAIKernel950 {
     bool hasSeqUsedQ = false;
     bool hasSeqUsedKv = false;
 
-    __aicore__ inline FAIKernel950() {}
+    __aicore__ inline FAIKernel950(AscendC::TPipe& pipe) : resource(pipe) {}
 
     // *Used* lengths from seqused when provided; cu stays the region layout.
     __aicore__ inline int64_t GetQSeqLen(uint32_t bIdx, uint32_t maxQSeqlen, AscendC::GlobalTensor<int32_t>& gQSeq,
@@ -231,6 +231,9 @@ class FAIKernel950 {
         gBlockTable.SetGlobalBuffer((__gm__ int32_t*)(params.blockTables));
         AscendC::GlobalTensor<ElementO> gO;
         gO.SetGlobalBuffer((__gm__ ElementO*)params.o);
+        if constexpr (ResidentPages || (PairedHeads && !MixedKv && std::is_same_v<ElementQ, bfloat16_t>)) {
+            gO.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+        }
         AscendC::GlobalTensor<float> gLse;
         gLse.SetGlobalBuffer((__gm__ float*)params.lse);
         AscendC::GlobalTensor<float> gPartialLse;
@@ -1954,7 +1957,8 @@ __aicore__ inline void RunFAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask,
                            storage};
     params.kDescale = kDescale;
     params.vDescale = vDescale;
-    Kernel faInfer;
+    AscendC::TPipe pipe;
+    Kernel faInfer(pipe);
     faInfer(params);
 }
 
@@ -2121,6 +2125,7 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
                            maxNumBlocksPerBatch,
                            kvSeqlenAllocated,
                            storage};
-    Kernel faInfer;
+    AscendC::TPipe pipe;
+    Kernel faInfer(pipe);
     faInfer(params);
 }

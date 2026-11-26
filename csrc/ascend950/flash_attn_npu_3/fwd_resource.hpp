@@ -27,7 +27,6 @@ struct ForwardCubeBuffer950 : LocalTensorBufferBase {
 };
 
 struct ForwardResource950 {
-    AscendC::TPipe pipe;
     LocalTensorBuffer<Ascend950, AscendC::TPosition::A1> l1Buf;
     LocalTensorBuffer<Ascend950, AscendC::TPosition::A2> l0ABuf;
     LocalTensorBuffer<Ascend950, AscendC::TPosition::B2> l0BBuf;
@@ -36,7 +35,7 @@ struct ForwardResource950 {
     LocalTensorBuffer<Ascend950, AscendC::TPosition::VECCALC> ubBuf;
     ForwardCubeBuffer950<AscendC::TPosition::C2PIPE2GM> fpBuf;
 
-    __aicore__ inline ForwardResource950()
+    __aicore__ inline ForwardResource950(AscendC::TPipe& pipe)
     {
         pipe.Destroy();
     }
