@@ -275,7 +275,7 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(event);
     }
 
-    template <bool SplitTerminalLanes = false, class TensorB, class TensorC>
+    template <bool SplitTerminalLanes = false, bool ResidentPages = false, class TensorB, class TensorC>
     __aicore__ inline void operator()(TensorB& gBTensor, TensorC& ubCTensor, AscendC::GlobalTensor<int32_t> gBlockTable,
                                       GemmCoord actualOriShape, uint32_t blockSize, uint32_t kvSTileIdx,
                                       uint32_t pipelineTileSeq, uint32_t kvSeqlenTriDown, uint32_t kvHeads,
@@ -283,7 +283,8 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                                       uint32_t globalWindowSize, uint32_t localWindowSize,
                                       Arch::CrossCoreFlag softmaxReadyFlag, Arch::CrossCoreFlag pvReadyFlag,
                                       uint64_t prefixSumL0AStages, uint64_t prefixSumL0BStages,
-                                      bool splitTerminalLanes = false)
+                                      bool splitTerminalLanes = false, uint32_t residentBank = 0U,
+                                      bool pageMiss = false)
     {
         using CopyL0CToDst = typename TileCopy_::template CopyL0CToDst<TensorC>;
         CopyL0CToDst copyL0CToDst;
@@ -298,7 +299,7 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
 
         const uint32_t bankIndex = banksByLogicalPage ? kvSTileIdx :
             (pairedHeads ? pipelineTileSeq / 2U + pairedKvBankOffset : pipelineTileSeq);
-        uint32_t l1BBufId = bankIndex % l1BBufNum;
+        uint32_t l1BBufId = ResidentPages ? residentBank : bankIndex % l1BBufNum;
         uint32_t l1BEventId = prefetchedV && l1BBufId == 2U ? THIRD_V_BANK_EVENT : l1BBufId + 3U;
         uint32_t l1ABufId = pipelineTileSeq % l1ABufNum;
 
@@ -312,11 +313,15 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         auto l1ALayoutTla = tla::MakeLayout<ElementA, LayoutTagL1A>(rowNum, pKvStride);
         auto l1ATensorTla = tla::MakeTensor(l1ATensor[l1ABufId], l1ALayoutTla, Arch::PositionL1{});
         // load V full base tile to L1 before crossCoreSync
-        if (!prefetchedV) {
+        if (!ResidentPages && !prefetchedV) {
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventId);
         }
         auto l1BTensorTlaTile = GetTile(l1BTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(curBaseTileSize, embed));
-        if (prefetchedV) {
+        if constexpr (ResidentPages) {
+            if ((pipelineTileSeq & 1U) == 0U && pageMiss) {
+                AscendC::CrossCoreWaitFlag<4, PIPE_MTE1>(9U + l1BBufId + V0_V1_FLAG_ID_OFFSET);
+            }
+        } else if (prefetchedV) {
             if (!reuseResidentPage && (pipelineTileSeq & 1U) == 0U) {
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
             }
@@ -473,7 +478,7 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
             }
 
         }
-        if (!prefetchedV) {
+        if (!ResidentPages && !prefetchedV) {
             AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
         }
@@ -531,7 +536,8 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                     copyL1ToL0B(l0BTensorTla, l1BTensorTlaTile);
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0BEventId);
 
-                    if ((mL0Itr == mL0LoopNum - 1) && (nL0Itr == nL0LoopNum - 1) && (kL0Itr == kL0LoopNum - 1)) {
+                    if (!ResidentPages && (mL0Itr == mL0LoopNum - 1) &&
+                        (nL0Itr == nL0LoopNum - 1) && (kL0Itr == kL0LoopNum - 1)) {
                         if (!prefetchedV || (!holdPrefetchedV && (pipelineTileSeq & 1U) != 0U)) {
                             AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventId);
                         }

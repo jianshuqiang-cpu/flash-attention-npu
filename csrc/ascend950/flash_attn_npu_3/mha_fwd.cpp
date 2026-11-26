@@ -734,6 +734,12 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         page_block_size == 128 && seqlen_q >= 128 && q.size(0) >= 1024 &&
         (mask_category == MaskCategory::MASK_CAUSAL ||
          (is_local && window_size_left == 511 && window_size_right == 0));
+    const bool residentPrefill = mixedKv && fmt == Format::TND && paged_KV && launch[2] &&
+        !flashDecodeEnabled && !is_softcap && !seqused_q_ && num_splits <= 1 &&
+        seqlen_q >= 1024 && q.size(0) >= 1024 && is_local &&
+        window_size_left == 511 && window_size_right == 0 &&
+        (num_heads / num_heads_k) % 2U == 0U &&
+        launchBlockDim % (num_heads / 2U) == 0U;
     using fa3_profile::TensorPtr;
     const char* kv_length_name = profile_kvcache ? "cache_seqlens" : "seqused_k";
     fa3_profile::TensorInfo profile(
@@ -760,7 +766,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
                 fields << ",\"max_seqlen_k\":" << *max_seqlen_k_;
             }
         });
-    auto launch_fa_infer = [pairedDecode, singleQueryWindow, nativePairShape, originalPairShape, fwdArgs,
+    auto launch_fa_infer = [pairedDecode, singleQueryWindow, residentPrefill, nativePairShape, originalPairShape, fwdArgs,
                             seqused_q_, seqused_k_, q_descale_, k_descale_, v_descale_,
                             profile = std::move(profile)]() -> int {
         profile([&] {
@@ -768,6 +774,8 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
                 launch_paired_decode(fwdArgs);
             } else if (singleQueryWindow) {
                 launch_single_query_window(fwdArgs);
+            } else if (residentPrefill) {
+                launch_resident_prefill(fwdArgs);
             } else if (nativePairShape && originalPairShape) {
                 if (fwdArgs.is_bf16) {
                     launch_paired_prefill_layout<Format::TND, bfloat16_t, false>(fwdArgs);
