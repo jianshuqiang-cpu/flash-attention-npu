@@ -44,6 +44,5 @@ elif is_ascend950():
         flash_attn_with_kvcache_lean as flash_attn_with_kvcache_lean,
         prepare_fd_metadata as prepare_fd_metadata,
     )
-    from .fp8_kv_staging import prepare_fp8_kv_staging as prepare_fp8_kv_staging
 else:
     raise RuntimeError(f"Unsupported Ascend device: {torch_npu.npu.get_device_name()}")
