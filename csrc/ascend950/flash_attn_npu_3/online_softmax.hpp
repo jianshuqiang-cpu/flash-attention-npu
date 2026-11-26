@@ -29,6 +29,7 @@
 namespace Catlass::Epilogue::Block {
 
 enum class ScoreBoundary { None, Lower, Upper };
+enum class ScoreStripe { Both, LowMasked, HighMasked, LowLive, HighLive };
 
 template <class OutputType_, class LayoutS_, class MaskType_, class TileCopy_, bool HAS_SOFTCAP_>
 class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::GemmType<float, LayoutS_>, MaskType_,
@@ -162,7 +163,8 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         }
     }
 
-    template <bool Positional = false, bool Folded = false, ScoreBoundary Boundary = ScoreBoundary::None, class TensorP>
+    template <bool Positional = false, bool Folded = false, ScoreBoundary Boundary = ScoreBoundary::None,
+              bool SkipUniformStripe = false, class TensorP>
     __aicore__ inline void operator()(TensorP& l1PTensorTla, GemmCoord actualBlockShape, uint32_t isFirstKvSTile,
                                       uint32_t ubSBufId, uint32_t l1PBufId, Arch::CrossCoreFlag qkReadyFlag,
                                       Arch::CrossCoreFlag softmaxReadyFlag, uint32_t qSBlockSize, uint32_t qNBlockSize,
@@ -208,7 +210,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>((ubSBufId & pBankMask_) + 2);
         if (isFirstKvSTile) {
             if (n > 64) {
-                ComputeScaleAndMax<ElementInput, ElementOutput, false, Positional, Folded, Boundary>(
+                ComputeWideScores<false, Positional, Folded, Boundary, SkipUniformStripe>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN,
                     nPadding, scaleValue, softcapValue, 128, blockStride, nRound,
                     Boundary == ScoreBoundary::None ? leftOfRowZero : leftOfRowZero + static_cast<int32_t>(rowStart),
@@ -221,7 +223,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
             }
         } else {
             if (n > 64) {
-                ComputeScaleAndMax<ElementInput, ElementOutput, true, Positional, Folded, Boundary>(
+                ComputeWideScores<true, Positional, Folded, Boundary, SkipUniformStripe>(
                     sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding,
                     scaleValue, softcapValue, 128, blockStride, nRound,
                     Boundary == ScoreBoundary::None ? leftOfRowZero : leftOfRowZero + static_cast<int32_t>(rowStart),
@@ -408,8 +410,43 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         Adds(srcVreg, srcVreg, -softcapValue, maskVreg);
     }
 
+    template <bool IsUpdate, bool Positional, bool Folded, ScoreBoundary Boundary, bool SkipUniformStripe>
+    __aicore__ inline static void ComputeWideScores(
+        __ubuf__ ElementInput* scores, __ubuf__ ElementInput* maxOut, __ubuf__ ElementInput* maxStart,
+        __ubuf__ ElementInput* previousMax, __ubuf__ ElementOutput* probability, __ubuf__ ElementInput* sum,
+        uint16_t rows, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput scale,
+        ElementInput softcap, uint16_t stride, uint32_t probabilityStride, uint32_t repeatStride,
+        int32_t edge, uint32_t width, uint32_t firstRow, uint32_t rowsPerHead)
+    {
+        // The paired SWA boundary has one Q head and 64 rows per AIV.
+        if constexpr (SkipUniformStripe && !HAS_SOFTCAP_ && Boundary != ScoreBoundary::None) {
+            if (rows == 64U && rowsPerHead == 128U && nLoops == 1U && tailN == 64U) {
+                const int32_t lastEdge = edge + static_cast<int32_t>(rows - 1U);
+                constexpr auto skip = Boundary == ScoreBoundary::Lower ? ScoreStripe::LowMasked : ScoreStripe::HighMasked;
+                constexpr auto live = Boundary == ScoreBoundary::Lower ? ScoreStripe::HighLive : ScoreStripe::LowLive;
+                const bool entireStripeMasked = Boundary == ScoreBoundary::Lower ? edge >= 64 : lastEdge <= 64;
+                const bool entireStripeLive = Boundary == ScoreBoundary::Lower ? lastEdge <= 64 : edge >= 64;
+                if (entireStripeMasked) {
+                    ComputeScaleAndMax<ElementInput, ElementOutput, IsUpdate, Positional, Folded, Boundary, skip>(
+                        scores, maxOut, maxStart, previousMax, probability, sum, rows, nLoops, tailN, nPadding,
+                        scale, softcap, stride, probabilityStride, repeatStride, edge, width, firstRow, rowsPerHead);
+                    return;
+                }
+                if (entireStripeLive) {
+                    ComputeScaleAndMax<ElementInput, ElementOutput, IsUpdate, Positional, Folded, Boundary, live>(
+                        scores, maxOut, maxStart, previousMax, probability, sum, rows, nLoops, tailN, nPadding,
+                        scale, softcap, stride, probabilityStride, repeatStride, edge, width, firstRow, rowsPerHead);
+                    return;
+                }
+            }
+        }
+        ComputeScaleAndMax<ElementInput, ElementOutput, IsUpdate, Positional, Folded, Boundary>(
+            scores, maxOut, maxStart, previousMax, probability, sum, rows, nLoops, tailN, nPadding,
+            scale, softcap, stride, probabilityStride, repeatStride, edge, width, firstRow, rowsPerHead);
+    }
+
     template <typename ElementS, typename ElementP, bool isUpdate, bool Positional = false, bool Folded = false,
-              ScoreBoundary Boundary = ScoreBoundary::None>
+              ScoreBoundary Boundary = ScoreBoundary::None, ScoreStripe Stripe = ScoreStripe::Both>
     __simd_vf__ static inline void
     ComputeScaleAndMax(__ubuf__ ElementS* srcUb, __ubuf__ ElementS* newMaxUb, __ubuf__ ElementS* newMaxUbStart,
                        __ubuf__ ElementS* LastMaxUbStart, __ubuf__ ElementP* expUb, __ubuf__ ElementS* expSumUb,
@@ -468,17 +505,26 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
             Adds(upperColumns, columns, static_cast<int32_t>(FLOAT_REP_SIZE), pregFull);
         }
         Duplicate(minVreg, MIN_VALUE);
+        constexpr bool lowMasked = Stripe == ScoreStripe::LowMasked;
+        constexpr bool highMasked = Stripe == ScoreStripe::HighMasked;
         for (uint16_t i = 0; i < m; ++i) {
-            LoadAlign(srcVreg, srcUb + i * S2BaseSize);
-            LoadAlign(srcVreg_unroll, srcUb + i * S2BaseSize + FLOAT_REP_SIZE);
-            Muls(srcVreg, srcVreg, dScale, pregFull);
-            Muls(srcVreg_unroll, srcVreg_unroll, dScale, pregTailN);
+            if constexpr (!lowMasked) {
+                LoadAlign(srcVreg, srcUb + i * S2BaseSize);
+            }
+            if constexpr (!highMasked) {
+                LoadAlign(srcVreg_unroll, srcUb + i * S2BaseSize + FLOAT_REP_SIZE);
+            }
+            if constexpr (!lowMasked) {
+                Muls(srcVreg, srcVreg, dScale, pregFull);
+            }
+            if constexpr (!highMasked) {
+                Muls(srcVreg_unroll, srcVreg_unroll, dScale, pregTailN);
+            }
             if constexpr (HAS_SOFTCAP_) {
                 ApplySoftcap(srcVreg, softcapVreg, pregFull, dSoftcap);
                 ApplySoftcap(srcVreg_unroll, softcapVreg, pregTailN, dSoftcap);
             }
-            if constexpr (Boundary != ScoreBoundary::None) {
-                // In a single Q head the inclusive window shifts one column per row.
+            if constexpr (Boundary != ScoreBoundary::None && Stripe == ScoreStripe::Both) {
                 const int32_t edge = leftOfRowZero + static_cast<int32_t>(i);
                 uint32_t first = edge > 0 ? static_cast<uint32_t>(edge) : 0U;
                 uint32_t second = first > FLOAT_REP_SIZE ? first - FLOAT_REP_SIZE : 0U;
@@ -490,6 +536,28 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                 } else {
                     Select(srcVreg, srcVreg, minVreg, prefix0);
                     Select(srcVreg_unroll, srcVreg_unroll, minVreg, prefix1);
+                }
+            } else if constexpr (Boundary != ScoreBoundary::None) {
+                // In a single Q head the inclusive window shifts one column per row.
+                const int32_t edge = leftOfRowZero + static_cast<int32_t>(i);
+                const uint32_t positiveEdge = edge > 0 ? static_cast<uint32_t>(edge) : 0U;
+                if constexpr (!lowMasked && Stripe != ScoreStripe::LowLive) {
+                    uint32_t first = positiveEdge;
+                    auto prefix0 = UpdateMask<float>(first);
+                    if constexpr (Boundary == ScoreBoundary::Lower) {
+                        Select(srcVreg, minVreg, srcVreg, prefix0);
+                    } else {
+                        Select(srcVreg, srcVreg, minVreg, prefix0);
+                    }
+                }
+                if constexpr (!highMasked && Stripe != ScoreStripe::HighLive) {
+                    uint32_t second = positiveEdge > FLOAT_REP_SIZE ? positiveEdge - FLOAT_REP_SIZE : 0U;
+                    auto prefix1 = UpdateMask<float>(second);
+                    if constexpr (Boundary == ScoreBoundary::Lower) {
+                        Select(srcVreg_unroll, minVreg, srcVreg_unroll, prefix1);
+                    } else {
+                        Select(srcVreg_unroll, srcVreg_unroll, minVreg, prefix1);
+                    }
                 }
             } else if constexpr (Positional) {
                 Compares<uint32_t, AscendC::CMPMODE::LE>(pregCompare, (RegTensor<uint32_t>&)columns, width, pregFull);
@@ -506,11 +574,23 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                 Select(srcVreg_unroll, srcVreg_unroll, minVreg, pregCompare);
                 Adds(upperColumns, upperColumns, step, pregFull);
             }
-            Select(srcVreg_unroll_new, srcVreg_unroll, minVreg, pregTailN);
-            StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2BaseSize, srcVreg, pregFull);
-            StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2BaseSize + FLOAT_REP_SIZE, srcVreg_unroll_new,
-                                                        pregFull);
-            Max(maxTmpVreg, srcVreg, srcVreg_unroll_new, pregFull);
+            if constexpr (!highMasked) {
+                Select(srcVreg_unroll_new, srcVreg_unroll, minVreg, pregTailN);
+            }
+            if constexpr (!lowMasked) {
+                StoreAlign<float, StoreDist::DIST_NORM_B32>(srcUb + i * S2BaseSize, srcVreg, pregFull);
+            }
+            if constexpr (!highMasked) {
+                StoreAlign<float, StoreDist::DIST_NORM_B32>(
+                    srcUb + i * S2BaseSize + FLOAT_REP_SIZE, srcVreg_unroll_new, pregFull);
+            }
+            if constexpr (lowMasked) {
+                Max(maxTmpVreg, minVreg, srcVreg_unroll_new, pregFull);
+            } else if constexpr (highMasked) {
+                Max(maxTmpVreg, srcVreg, minVreg, pregFull);
+            } else {
+                Max(maxTmpVreg, srcVreg, srcVreg_unroll_new, pregFull);
+            }
             // [0, 1, 2, 4, 5, .., 63] -> reduce -> [63, 0, 0, .., 0]
             Reduce<AscendC::MicroAPI::ReduceType::MAX, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
                 maxSrcVreg, maxTmpVreg, pregFull);
@@ -528,10 +608,24 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
 
         for (uint16_t i = 0; i < m; ++i) {
             LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_BRC_B32>(maxBrcVreg, newMaxUbStart + i);
-            LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_DINTLV_B32>(srcVreg, srcVreg_unroll,
-                                                                           srcUb + i * S2BaseSize);
-            ExpSub(expEvenVreg, srcVreg, maxBrcVreg, pregFull);
-            ExpSub(expOddVreg, srcVreg_unroll, maxBrcVreg, pregFull);
+            if constexpr (lowMasked || highMasked) {
+                constexpr uint32_t activeOffset = lowMasked ? FLOAT_REP_SIZE : 0U;
+                LoadAlign(srcVreg, srcUb + i * S2BaseSize + activeOffset);
+                ExpSub(srcVreg_unroll, srcVreg, maxBrcVreg, pregFull);
+                // MIN rather than zero is the original score for masked
+                // columns. In particular, ExpSub(MIN, MIN) is one.
+                ExpSub(srcVreg_unroll_new, minVreg, maxBrcVreg, pregFull);
+                if constexpr (lowMasked) {
+                    DeInterleave(expEvenVreg, expOddVreg, srcVreg_unroll_new, srcVreg_unroll);
+                } else {
+                    DeInterleave(expEvenVreg, expOddVreg, srcVreg_unroll, srcVreg_unroll_new);
+                }
+            } else {
+                LoadAlign<float, AscendC::MicroAPI::LoadDist::DIST_DINTLV_B32>(
+                    srcVreg, srcVreg_unroll, srcUb + i * S2BaseSize);
+                ExpSub(expEvenVreg, srcVreg, maxBrcVreg, pregFull);
+                ExpSub(expOddVreg, srcVreg_unroll, maxBrcVreg, pregFull);
+            }
             Add(expSumVreg, expEvenVreg, expOddVreg, pregFull);
             Reduce<AscendC::MicroAPI::ReduceType::SUM, float, float, AscendC::MicroAPI::MaskMergeMode::ZEROING>(
                 expSumVreg, expSumVreg, pregFull);

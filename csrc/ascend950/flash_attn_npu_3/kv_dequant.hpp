@@ -232,6 +232,7 @@ private:
 constexpr uint32_t BUFFERED_SCALE_BYTES = CHUNK_ROWS * 32U;
 constexpr uint32_t HALF_INPUT_BYTES = CHUNK_ELEMS + BUFFERED_SCALE_BYTES;
 constexpr uint32_t OUTPUT_ROWS = CHUNK_ROWS / 2U;
+enum class StripePart { Whole, First, Last };
 constexpr uint32_t OUTPUT_NZ_ROWS = OUTPUT_ROWS + 1U;
 constexpr uint32_t OUTPUT_BANK_BYTES = OUTPUT_NZ_ROWS * HEAD_DIM * sizeof(bfloat16_t);
 static_assert(fa950_plan::MakeUbPlan(HEAD_DIM, 1, 64, 64, 1).total +
@@ -303,18 +304,23 @@ public:
     template<class Resource>
     __aicore__ inline void Produce(Resource& resource, uint32_t rows,
         uint32_t l1Offset, uint32_t flag, uint32_t kvSlot,
-        uint32_t firstHalf = 0U, uint32_t endHalf = 2U)
+        uint32_t firstHalf = 0U, uint32_t endHalf = 2U, uint32_t firstReadyFlag = 0U,
+        StripePart part = StripePart::Whole)
     {
         if (AscendC::GetSubBlockIdx() != 1U - kvSlot) { return; }
-        if (firstHalf == 0U) {
+        if (firstHalf == 0U && part != StripePart::Last) {
             AscendC::CrossCoreWaitFlag<4, PIPE_MTE3>(flag);
         }
         auto dst = resource.l1Buf.template GetBufferByByte<bfloat16_t>(l1Offset);
         const uint32_t paddedRows = (rows + 15U) / 16U * 16U;
         for (uint32_t slot = firstHalf; slot < endHalf; ++slot) {
             if (count_[slot] == 0U) { continue; }
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID6 + slot);
-            for (uint32_t start = 0; start < count_[slot]; start += OUTPUT_ROWS) {
+            if (part != StripePart::Last) {
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID6 + slot);
+            }
+            const uint32_t firstRow = part == StripePart::Last ? OUTPUT_ROWS : 0U;
+            const uint32_t endRow = part == StripePart::First ? OUTPUT_ROWS : count_[slot];
+            for (uint32_t start = firstRow; start < endRow; start += OUTPUT_ROWS) {
                 const uint32_t bank = start / OUTPUT_ROWS;
                 const uint32_t n = AscendC::Std::min(count_[slot] - start, OUTPUT_ROWS);
                 const uint32_t event = EVENT_ID6 + bank;
@@ -331,10 +337,17 @@ public:
                 AscendC::DataCopy(dst[(slot * CHUNK_ROWS + start) * 16U], output_[bank], scatter);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(event);
             }
+            if (part == StripePart::First) {
+                // Input and both cross-core signals belong to the complete half page.
+                continue;
+            }
+            if (slot == 0U && firstReadyFlag != 0U) {
+                AscendC::CrossCoreSetFlag<4, PIPE_MTE3>(firstReadyFlag);
+            }
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID6 + slot);
             inputInFlight_[slot] = true;
         }
-        if (endHalf == 2U) {
+        if (endHalf == 2U && part != StripePart::First) {
             AscendC::CrossCoreSetFlag<4, PIPE_MTE3>(flag);
         }
     }

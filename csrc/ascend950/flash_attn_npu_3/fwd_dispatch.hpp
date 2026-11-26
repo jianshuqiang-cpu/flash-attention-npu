@@ -59,12 +59,20 @@ extern template void launch_fwd_impl<half, Format::TND>(const FwdLaunchArgs& a);
 extern template void launch_fwd_impl<half, Format::BSND>(const FwdLaunchArgs& a);
 extern template void launch_fwd_impl<half, Format::BNSD>(const FwdLaunchArgs& a);
 
-template <Format kLayout>
+template <Format kLayout, typename DType, bool MixedKv>
 void launch_paired_prefill_layout(const FwdLaunchArgs& a);
 
-extern template void launch_paired_prefill_layout<Format::TND>(const FwdLaunchArgs&);
-extern template void launch_paired_prefill_layout<Format::BSND>(const FwdLaunchArgs&);
-extern template void launch_paired_prefill_layout<Format::BNSD>(const FwdLaunchArgs&);
+extern template void launch_paired_prefill_layout<Format::TND, half, false>(const FwdLaunchArgs&);
+extern template void launch_paired_prefill_layout<Format::TND, bfloat16_t, false>(const FwdLaunchArgs&);
+extern template void launch_paired_prefill_layout<Format::TND, bfloat16_t, true>(const FwdLaunchArgs&);
+extern template void launch_paired_prefill_layout<Format::BSND, bfloat16_t, true>(const FwdLaunchArgs&);
+extern template void launch_paired_prefill_layout<Format::BNSD, bfloat16_t, true>(const FwdLaunchArgs&);
+
+template <typename DType>
+void launch_grouped_prefill(const FwdLaunchArgs& a);
+
+extern template void launch_grouped_prefill<half>(const FwdLaunchArgs&);
+extern template void launch_grouped_prefill<bfloat16_t>(const FwdLaunchArgs&);
 
 template <Format kLayout>
 void launch_mixed_swa_layout(const FwdLaunchArgs& a);
@@ -84,11 +92,11 @@ inline void launch_fwd(const FwdLaunchArgs& a)
     if (a.quant_mode == 2U && a.paired_query_heads && a.paged_kv && !a.has_softcap &&
         !(a.enable_dn && a.mask_category == MaskCategory::NO_MASK)) {
         if (a.layout == Format::TND) {
-            launch_paired_prefill_layout<Format::TND>(a);
+            launch_paired_prefill_layout<Format::TND, bfloat16_t, true>(a);
         } else if (a.layout == Format::BNSD) {
-            launch_paired_prefill_layout<Format::BNSD>(a);
+            launch_paired_prefill_layout<Format::BNSD, bfloat16_t, true>(a);
         } else {
-            launch_paired_prefill_layout<Format::BSND>(a);
+            launch_paired_prefill_layout<Format::BSND, bfloat16_t, true>(a);
         }
         return;
     }

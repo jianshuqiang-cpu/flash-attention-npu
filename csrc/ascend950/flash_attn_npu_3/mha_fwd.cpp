@@ -25,6 +25,7 @@
 #include <torch/extension.h>
 
 #include "acl/acl.h"
+#include "fa_profile.hpp"
 #include "fwd_dispatch.hpp"
 #include "tiling.cpp"
 #include "tilingdata.h"
@@ -40,14 +41,16 @@
 using flash_attn_npu_950_v3::fill_inference_context;
 using flash_attn_npu_950_v3::SeqlenScratch;
 
+template <typename WriteParameters>
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& kvLengths,
-                                           const std::optional<at::Tensor>& qLengths);
+                                           const std::optional<at::Tensor>& qLengths, const char* scope,
+                                           const char* kvLengthsName, WriteParameters writeParameters);
 
 static PrefillLaunchInfo BuildSwaPrefillMetadata(at::Tensor& schedMd, const at::Tensor& cuQ,
                                                 const at::Tensor& usedK, uint64_t totalQ, uint32_t maxQ,
                                                 uint32_t heads, uint32_t kvHeads, uint32_t dim,
                                                 uint32_t pageSize, uint64_t capacity, uint32_t cores,
-                                                const FwdMaskDerivation& mask, bool softcap)
+                                                const FwdMaskDerivation& mask, bool causal, float softcap)
 {
     FAMetadataArgs args{};
     args.seqlensQAddr = reinterpret_cast<uint64_t>(cuQ.data_ptr());
@@ -66,10 +69,15 @@ static PrefillLaunchInfo BuildSwaPrefillMetadata(at::Tensor& schedMd, const at::
     args.qCumulative = 1;
     args.pagedKV = 1;
     args.quantMode = 2;
-    args.softcapActive = softcap;
+    args.softcapActive = softcap > 0.0f;
     args.packedQueryRows = totalQ;
     args.pageCapacity = capacity;
-    auto storage = GetSchedulerMetadataImpl(args, usedK, cuQ);
+    auto storage = GetSchedulerMetadataImpl(
+        args, usedK, cuQ, "forward_aicpu", "cache_seqlens", [&](std::ostream& fields) {
+            fields << "\"max_seqlen_q\":" << maxQ << ",\"causal\":" << causal
+                   << ",\"window_size\":[" << mask.window_left << ',' << mask.window_right << "],\"softcap\":";
+            fa3_profile::WriteFloat(fields, softcap);
+        });
     const auto bytes = static_cast<int64_t>(fa_metadata::MetadataBytesWithKv(true, args.batch));
     // One ordered read supplies validation, kernel specialization, and blockDim.
     const auto host = storage.narrow(0, bytes, sizeof(PrefillLaunchInfo)).cpu();
@@ -152,7 +160,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         std::optional<bool> pack_gqa_, int64_t sm_margin, bool return_softmax_lse, int64_t layout,
         std::optional<bool> paired_prefill_, std::optional<int64_t> fd_active_cores_,
         std::optional<int64_t> fd_workspace_bytes_,
-        std::optional<std::array<int64_t, 4>> mixed_launch_)
+        std::optional<std::array<int64_t, 4>> mixed_launch_, bool profile_kvcache)
 {
     // ============================================================
     // 0. Device guard + stream + AIC core count
@@ -429,6 +437,9 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
         auto empty_lse_accum = at::empty({0}, q.options().dtype(at::kFloat));
         return {out, lse, empty_accum, empty_lse_accum};
     }
+    const bool requested_causal = is_causal;
+    const std::array<int64_t, 2> requested_window{window_size_left, window_size_right};
+    const bool has_input_metadata = scheduler_metadata_.has_value();
 
     // ============================================================
     // 6/7. Tiling source: precomputed AICPU metadata or host tiling
@@ -462,7 +473,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
             TORCH_CHECK(cu_seqlens_q.device() == q.device() && seqlens_k.device() == q.device(),
                         "automatic prefill lengths must be on the query NPU");
             const auto info = BuildSwaPrefillMetadata(tiling_dev, cu_seqlens_q, seqlens_k, q.size(0),
-                seqlen_q, num_heads, num_heads_k, head_size_q, page_block_size, capacity, blockDim, mask, is_softcap);
+                seqlen_q, num_heads, num_heads_k, head_size_q, page_block_size, capacity, blockDim, mask, is_causal, softcap);
             scheduler_metadata_ = tiling_dev;
             launch[2] = info.qBanks == 2U;
             if (info.tasks > 0U) {
@@ -713,14 +724,66 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
          paged_KV ? static_cast<uint64_t>(k.stride(2)) : 0U, paged_KV ? static_cast<uint64_t>(v.stride(2)) : 0U,
          is_varlen_q ? static_cast<uint64_t>(q.size(0)) : 0U},
         launch[2] != 0};
-    auto launch_fa_infer = [pairedDecode, singleQueryWindow, fwdArgs, seqused_q_, seqused_k_, q_descale_, k_descale_, v_descale_]() -> int {
-        if (pairedDecode) {
-            launch_paired_decode(fwdArgs);
-        } else if (singleQueryWindow) {
-            launch_single_query_window(fwdArgs);
-        } else {
-            launch_fwd(fwdArgs);
-        }
+    // Native FP16/BF16 reuse an L1 K/V tile across adjacent heads of a paged GQA group.
+    // Actual query/KV lengths remain on device, including during graph replay.
+    const bool originalPairShape = num_heads == 16 && num_heads_k == 1;
+    const bool nativePairShape = quantMode == 0U && fmt == Format::TND && paged_KV && is_varlen_q &&
+        !seqused_q_ && seqused_k_.has_value() && !is_varlen_kv && !flashDecodeEnabled && !is_softcap && num_splits <= 1 &&
+        num_heads > num_heads_k && num_heads <= 65535 / 192 &&
+        head_size_q == 192 && head_size_v == 192 &&
+        page_block_size == 128 && seqlen_q >= 128 && q.size(0) >= 1024 &&
+        (mask_category == MaskCategory::MASK_CAUSAL ||
+         (is_local && window_size_left == 511 && window_size_right == 0));
+    using fa3_profile::TensorPtr;
+    const char* kv_length_name = profile_kvcache ? "cache_seqlens" : "seqused_k";
+    fa3_profile::TensorInfo profile(
+        "forward",
+        {{"q", &q}, {profile_kvcache ? "k_cache" : "k", &k}, {profile_kvcache ? "v_cache" : "v", &v},
+         {"cu_seqlens_q", &cu_seqlens_q}, {"cu_seqlens_k", &cu_seqlens_k},
+         {"seqused_q", TensorPtr(seqused_q_)}, {kv_length_name, (profile_kvcache || is_varlen_kv) ? &seqlens_k : nullptr},
+         {"page_table", &page_table},
+         {"q_descale", TensorPtr(q_descale_)}, {"k_descale", TensorPtr(k_descale_)}, {"v_descale", TensorPtr(v_descale_)},
+         {"scheduler_metadata", profile_kvcache && has_input_metadata ? TensorPtr(scheduler_metadata_) : nullptr}},
+        {&out, return_softmax_lse ? &softmaxlse : nullptr}, [&](std::ostream& fields) {
+            fields << "\"softmax_scale\":";
+            fa3_profile::WriteFloat(fields, softmax_scale);
+            fields << ",\"causal\":" << requested_causal
+                   << ",\"window_size\":[" << requested_window[0] << ',' << requested_window[1] << "],\"softcap\":";
+            fa3_profile::WriteFloat(fields, softcap);
+            if (profile_kvcache) {
+                fields << ",\"num_splits\":" << num_splits << ",\"return_softmax_lse\":" << return_softmax_lse;
+            }
+            if (is_varlen_q) {
+                fields << ",\"max_seqlen_q\":" << *max_seqlen_q_;
+            }
+            if (max_seqlen_k_ && (is_varlen_kv || !has_input_metadata)) {
+                fields << ",\"max_seqlen_k\":" << *max_seqlen_k_;
+            }
+        });
+    auto launch_fa_infer = [pairedDecode, singleQueryWindow, nativePairShape, originalPairShape, fwdArgs,
+                            seqused_q_, seqused_k_, q_descale_, k_descale_, v_descale_,
+                            profile = std::move(profile)]() -> int {
+        profile([&] {
+            if (pairedDecode) {
+                launch_paired_decode(fwdArgs);
+            } else if (singleQueryWindow) {
+                launch_single_query_window(fwdArgs);
+            } else if (nativePairShape && originalPairShape) {
+                if (fwdArgs.is_bf16) {
+                    launch_paired_prefill_layout<Format::TND, bfloat16_t, false>(fwdArgs);
+                } else {
+                    launch_paired_prefill_layout<Format::TND, half, false>(fwdArgs);
+                }
+            } else if (nativePairShape) {
+                if (fwdArgs.is_bf16) {
+                    launch_grouped_prefill<bfloat16_t>(fwdArgs);
+                } else {
+                    launch_grouped_prefill<half>(fwdArgs);
+                }
+            } else {
+                launch_fwd(fwdArgs);
+            }
+        });
         return 0;
     };
     // RunOpApiV2 keeps the kernel launch inside a torch_npu op context so it can

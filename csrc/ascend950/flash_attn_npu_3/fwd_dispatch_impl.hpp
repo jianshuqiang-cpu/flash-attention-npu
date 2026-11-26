@@ -50,8 +50,8 @@
                                              a.tiling_device, a.scale_value, a.softcap_value, a.num_blocks,            \
                                              a.max_num_blocks_per_batch, a.kv_seqlen_allocated, a.storage, a.k_descale_device, a.v_descale_device)
 
-#define FWD_MIXED_KERNEL_LAUNCH(KERNEL, MASK_CAT, CACHE_MODE_V, PAGE_SHAPE_V, LSE_MODE, HAS_SOFTCAP, PAIRED)                         \
-    KERNEL<DType, float, kLayout, kLayout, CACHE_MODE_V, PAGE_SHAPE_V, MASK_CAT, kCacheLayout, LSE_MODE, HAS_SOFTCAP, true, PAIRED>  \
+#define FWD_KV_KERNEL_LAUNCH(KERNEL, MASK_CAT, CACHE_MODE_V, PAGE_SHAPE_V, LSE_MODE, HAS_SOFTCAP, ...)                     \
+    KERNEL<DType, float, kLayout, kLayout, CACHE_MODE_V, PAGE_SHAPE_V, MASK_CAT, kCacheLayout, LSE_MODE, HAS_SOFTCAP, __VA_ARGS__> \
         <<<a.block_dim, nullptr, a.stream>>>(a.q_device, a.k_device, a.v_device, a.mask_device, a.block_table_device,  \
                                              a.o_device, a.lse_device, a.q_seq_device, a.kv_seq_device,                \
                                              a.seq_used_q_device, a.seq_used_kv_device, a.workspace_device,            \
@@ -105,11 +105,11 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
                                         if constexpr (MaskCat == MaskCategory::MASK_SWA) {
                                             launch_mixed_swa_layout<kLayout>(a);
                                         } else if (a.paired_query_heads) {
-                                            FWD_MIXED_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV,
-                                                                    LseMode, HasSoftcap, true);
+                                            FWD_KV_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV,
+                                                                    LseMode, HasSoftcap, true, true);
                                         } else {
-                                            FWD_MIXED_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV,
-                                                                    LseMode, HasSoftcap, false);
+                                            FWD_KV_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV,
+                                                                    LseMode, HasSoftcap, true, false);
                                         }
                                     } else {
                                         FWD_KERNEL_LAUNCH(FAInfer, MaskCat, CacheModeV, PageShapeV, LseMode, HasSoftcap);
@@ -127,16 +127,31 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
 }
 
 // Paired Q heads use a dedicated device image to pipeline PV columns.
-template <Format kLayout>
+template <Format kLayout, typename DType, bool MixedKv>
 void launch_paired_prefill_layout(const FwdLaunchArgs& a)
 {
-    using DType = bfloat16_t;
     constexpr auto kCacheLayout = CacheLayout::nd;
     FWD_BOOL_SWITCH(a.lse_mode, LseMode, {
         FWD_MASK_SWITCH(a.mask_category, MaskCat, {
-            FWD_MIXED_KERNEL_LAUNCH(FAInferPairedPrefill, MaskCat, CacheMode::pagedCache,
-                                    PageShape::BnBsND, LseMode, false, true);
+            FWD_KV_KERNEL_LAUNCH(FAInferPairedPrefill, MaskCat, CacheMode::pagedCache,
+                                    PageShape::BnBsND, LseMode, false, MixedKv, true);
         });
+    });
+}
+
+template <typename DType>
+void launch_grouped_prefill(const FwdLaunchArgs& a)
+{
+    constexpr auto kLayout = Format::TND;
+    constexpr auto kCacheLayout = CacheLayout::nd;
+    FWD_BOOL_SWITCH(a.lse_mode, LseMode, {
+        if (a.mask_category == MaskCategory::MASK_CAUSAL) {
+            FWD_KV_KERNEL_LAUNCH(FAInferPairedPrefill, MaskCategory::MASK_CAUSAL, CacheMode::pagedCache,
+                                 PageShape::BnBsND, LseMode, false, false, true, true);
+        } else {
+            FWD_KV_KERNEL_LAUNCH(FAInferPairedPrefill, MaskCategory::MASK_SWA, CacheMode::pagedCache,
+                                 PageShape::BnBsND, LseMode, false, false, true, true);
+        }
     });
 }
 
@@ -149,8 +164,8 @@ void launch_mixed_swa_layout(const FwdLaunchArgs& a)
     FWD_BOOL_SWITCH(a.lse_mode, LseMode, {
         FWD_BOOL_SWITCH(a.has_softcap, HasSoftcap, {
             FWD_BOOL_SWITCH(a.paired_query_heads, Paired, {
-                FWD_MIXED_KERNEL_LAUNCH(FAInfer, MaskCategory::MASK_SWA, CacheMode::pagedCache, PageShape::BnBsND,
-                                        LseMode, HasSoftcap, Paired);
+                FWD_KV_KERNEL_LAUNCH(FAInfer, MaskCategory::MASK_SWA, CacheMode::pagedCache, PageShape::BnBsND,
+                                        LseMode, HasSoftcap, true, Paired);
             });
         });
     });
@@ -162,12 +177,12 @@ void launch_single_query_window_layout(const FwdLaunchArgs& a)
     using DType = bfloat16_t;
     constexpr CacheLayout kCacheLayout = CacheLayout::nd;
     FWD_BOOL_SWITCH(a.lse_mode, LseMode, {
-        FWD_MIXED_KERNEL_LAUNCH(FAInferSingleQueryWindow, MaskCategory::MASK_SWA, CacheMode::pagedCache,
-                                PageShape::BnBsND, LseMode, false, false);
+        FWD_KV_KERNEL_LAUNCH(FAInferSingleQueryWindow, MaskCategory::MASK_SWA, CacheMode::pagedCache,
+                                PageShape::BnBsND, LseMode, false, true, false);
     });
 }
 
-#undef FWD_MIXED_KERNEL_LAUNCH
+#undef FWD_KV_KERNEL_LAUNCH
 #undef FWD_KERNEL_LAUNCH
 #undef FWD_MASK_SWITCH
 #undef FWD_BOOL_SWITCH

@@ -4,6 +4,7 @@
 // for FlashAttention v3.
 
 
+#include <utility>
 #include <torch/extension.h>
 
 #include "mha_fwd.cpp"
@@ -14,8 +15,10 @@
 
 extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void* args);
 
+template <typename WriteParameters>
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& kvLengths,
-                                           const std::optional<at::Tensor>& qLengths)
+                                           const std::optional<at::Tensor>& qLengths, const char* scope,
+                                           const char* kvLengthsName, WriteParameters writeParameters)
 {
     const int64_t bytes = static_cast<int64_t>(fa_metadata::MetadataBytesWithKv(args.maskType != 0, args.batch));
     const auto trailerBytes = args.packedQueryRows != 0 ? static_cast<int64_t>(sizeof(PrefillLaunchInfo)) : 0;
@@ -24,9 +27,13 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
 
     const auto stream = c10_npu::getCurrentNPUStream();
     const auto handle = stream.stream(false);
+    fa3_profile::TensorInfo profile(
+        scope, {{args.qCumulative ? "cu_seqlens_q" : "seqused_q", fa3_profile::TensorPtr(qLengths)},
+                {kvLengthsName, &kvLengths}},
+        {&meta}, writeParameters);
     // The caller's stream orders both the length producers and the attention launch.
-    auto metadata_task = [handle, args]() mutable -> int {
-        ComputeFAMetadata<<<1, nullptr, handle>>>(&args, sizeof(args));
+    auto metadata_task = [handle, args, profile = std::move(profile)]() mutable -> int {
+        profile([&] { ComputeFAMetadata<<<1, nullptr, handle>>>(&args, sizeof(args)); });
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", metadata_task);
@@ -44,7 +51,8 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
                                   std::optional<at::Tensor> seqlens_q, std::optional<at::Tensor> cu_seqlens_k,
                                   std::optional<int64_t> page_size, bool causal, bool hasSoftcap, int64_t num_splits,
                                   int64_t max_seqlen_k, int64_t window_size_left, int64_t window_size_right,
-                                  int64_t quant_mode, std::optional<at::Tensor> cu_seqlens_q)
+                                  int64_t quant_mode, std::optional<at::Tensor> cu_seqlens_q,
+                                  std::optional<at::ScalarType> qkv_dtype, bool profile_varlen)
 {
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(num_heads_q % num_heads_kv == 0, "Number of heads in key/value must divide number of heads in query");
@@ -111,7 +119,24 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     // the flag: a buffer built for softcap==0 must not select the paired wave for a
     // softcap>0 call.
     args.softcapActive = hasSoftcap ? 1U : 0U;
-    return GetSchedulerMetadataImpl(args, kv_lengths, q_lengths);
+    const char* kv_lengths_name = kv_cumulative ? "cu_seqlens_k" : (profile_varlen ? "seqused_k" : "cache_seqlens");
+    return GetSchedulerMetadataImpl(
+        args, kv_lengths, q_lengths, "ComputeFAMetadata", kv_lengths_name, [&](std::ostream& fields) {
+            fields << "\"batch_size\":" << batch_size << ",\"max_seqlen_q\":" << max_seqlen_q
+                   << ",\"max_seqlen_k\":" << max_seqlen_k << ",\"num_heads_q\":" << num_heads_q
+                   << ",\"num_heads_kv\":" << num_heads_kv << ",\"headdim\":" << headdim
+                   << ",\"headdim_v\":" << headdim_v << ",\"causal\":" << causal
+                   << ",\"window_size\":[" << window_size_left << ',' << window_size_right
+                   << "],\"has_softcap\":" << hasSoftcap;
+            if (page_size) {
+                fields << ",\"page_size\":" << *page_size;
+            }
+            if (qkv_dtype) {
+                const auto kv_dtype = quant_mode == 2 ? at::ScalarType::Float8_e4m3fn : *qkv_dtype;
+                fields << ",\"qkv_dtype\":\"" << c10::getDtypeNames(*qkv_dtype).first
+                       << "\",\"kv_dtype\":\"" << c10::getDtypeNames(kv_dtype).first << '"';
+            }
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +574,7 @@ static std::pair<at::Tensor, std::array<int64_t, 4>> PrepareMixedTiling(
 
 PYBIND11_MODULE(flash_attn_npu_3_950, m)
 {
+    fa3_profile::RegisterProfilingCallback();
     m.doc() = "FlashAttention v3 — Ascend 950 backend";
     m.def("fwd", &mha_fwd, "Forward pass, with KV-cache (Ascend 950)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("k_new"),
@@ -561,7 +587,8 @@ PYBIND11_MODULE(flash_attn_npu_3_950, m)
           py::arg("softcap"), py::arg("is_rotary_interleaved"), py::arg("scheduler_metadata"), py::arg("num_splits"),
           py::arg("pack_gqa"), py::arg("sm_margin"), py::arg("return_softmax_lse"), py::arg("layout"),
           py::arg("paired_prefill") = py::none(), py::arg("fd_active_cores") = py::none(),
-          py::arg("fd_workspace_bytes") = py::none(), py::arg("mixed_launch") = py::none());
+          py::arg("fd_workspace_bytes") = py::none(), py::arg("mixed_launch") = py::none(),
+          py::arg("profile_kvcache") = false);
     m.def("prepare_mixed_tiling", &PrepareMixedTiling, "Prepare mixed KV tiling outside graph capture",
           py::arg("lengths"), py::arg("cu_q"), py::arg("batch"), py::arg("max_q"), py::arg("max_kv"),
           py::arg("heads"), py::arg("kv_heads"), py::arg("causal"), py::arg("left"), py::arg("right"),
@@ -571,7 +598,8 @@ PYBIND11_MODULE(flash_attn_npu_3_950, m)
           py::arg("headdim"), py::arg("headdim_v"), py::arg("cache_seqlens"), py::arg("seqlens_q"),
           py::arg("cu_seqlens_k"), py::arg("page_size"), py::arg("causal"), py::arg("has_softcap"),
           py::arg("num_splits"), py::arg("max_seqlen_k"), py::arg("window_size_left"), py::arg("window_size_right"),
-          py::arg("quant_mode"), py::arg("cu_seqlens_q") = py::none());
+          py::arg("quant_mode"), py::arg("cu_seqlens_q") = py::none(), py::arg("qkv_dtype") = py::none(),
+          py::arg("profile_varlen") = false);
     m.def("flash_attn_metadata_flags", &flash_attn_metadata_flags,
           "Host readback of launch-shape flags from scheduler metadata (not capture-safe)");
     m.def("flash_attn_prepare_fd_metadata", &flash_attn_prepare_fd_metadata,

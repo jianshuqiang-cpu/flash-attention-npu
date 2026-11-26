@@ -195,6 +195,7 @@ def _flash_attn_forward_impl(
     return_softmax_lse: bool,
     layout: int,
     mixed_launch: Optional[List[int]] = None,
+    profile_kvcache: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if cu_seqlens_q is not None:
         _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
@@ -285,6 +286,7 @@ def _flash_attn_forward_impl(
         fd_active_cores,
         fd_workspace_bytes,
         mixed_launch,
+        profile_kvcache,
     )
 
     if out_accum is None:
@@ -365,6 +367,7 @@ def _flash_attn_forward_fake(
     return_softmax_lse,
     layout,
     mixed_launch=None,
+    profile_kvcache=False,
 ):
     is_varlen_q = cu_seqlens_q is not None
     if is_varlen_q:
@@ -546,6 +549,8 @@ def _get_scheduler_metadata_op(
     window_right: int,
     quant_mode: int = 0,
     cu_seqlens_q: Optional[torch.Tensor] = None,
+    qkv_dtype: Optional[torch.dtype] = None,
+    profile_varlen: bool = False,
 ) -> torch.Tensor:
     return flash_attn_npu_3_950.get_scheduler_metadata(
         batch_size,
@@ -566,6 +571,8 @@ def _get_scheduler_metadata_op(
         window_right,
         quant_mode,
         cu_seqlens_q,
+        qkv_dtype,
+        profile_varlen,
     )
 
 
@@ -589,6 +596,8 @@ def _get_scheduler_metadata_fake(
     window_right: int,
     quant_mode: int = 0,
     cu_seqlens_q: Optional[torch.Tensor] = None,
+    qkv_dtype: Optional[torch.dtype] = None,
+    profile_varlen: bool = False,
 ) -> torch.Tensor:
     ctx = torch.library.get_ctx()
     metadata_size = ctx.new_dynamic_size()
@@ -751,6 +760,7 @@ def get_scheduler_metadata(
         window_size[1],
         quant_mode,
         cu_seqlens_q,
+        qkv_dtype,
     )
     return scheduler_metadata
 
@@ -833,6 +843,7 @@ def flash_attn_with_kvcache_lean(
         getattr(scheduler_metadata, "fd_active_cores", None),
         getattr(scheduler_metadata, "fd_workspace_bytes", None),
         getattr(scheduler_metadata, "_mixed_launch", None),
+        profile_kvcache=True,
     )
     if return_softmax_lse:
         return out, lse
@@ -1187,6 +1198,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 window_size[1],
                 quant_mode,
                 cu_seqlens_q if seqused_q is None else None,
+                q.dtype,
+                profile_varlen=True,
             )
 
         out, softmax_lse, _, _ = _training_forward(
@@ -1666,6 +1679,7 @@ def flash_attn_with_kvcache(
         return_softmax_lse=return_softmax_lse,
         layout=layout,
         mixed_launch=mixed_launch,
+        profile_kvcache=True,
     )
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 

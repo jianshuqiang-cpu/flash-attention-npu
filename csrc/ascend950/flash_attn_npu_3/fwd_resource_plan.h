@@ -26,6 +26,8 @@ constexpr uint32_t L1_CAPACITY = 512U * 1024U;
 constexpr uint32_t SCORE_STAGES = 2;
 constexpr uint32_t P_STAGES = 3;
 constexpr uint32_t PV_FLAG_BASE = SCORE_STAGES + P_STAGES;
+// Two K banks use distinct one-way prefix-ready flags in paired FP8 Prefill.
+constexpr uint32_t EARLY_K_READY_BASE = 11U;
 
 struct UbPlan {
     uint32_t s, p, lo, go, lm, gm, dm, ll, gl, total;

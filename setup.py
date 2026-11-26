@@ -381,6 +381,8 @@ class BishengBuildExt(build_ext):
             "-ltiling_api",
             "-lplatform",
         ]
+        if ext_name == "flash_attn_npu_3_950":
+            link_flags.append("-lprofapi")
 
         # NOTE: ccache is intentionally NOT supported. bisheng requires `-x asc`
         # to enter ASC/device-compile mode (without it, kernel_operator.h and the

@@ -16,6 +16,7 @@
 #include <torch/extension.h>
 
 #include "acl/acl.h"
+#include "fa_profile.hpp"
 #include "fag_tiling.cpp"
 #include "fag_kernel.cpp"
 #include "tiling/platform/platform_ascendc.h"
@@ -460,6 +461,12 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
         }                                                                                                              \
     } while (0)
 
+    const fa3_profile::TensorInfo profile(
+        {&dout, &q, &k, &v, &out, &softmax_lse, &mask_npu_tensor,
+         fa3_profile::TensorPtr(cu_seqlens_q_), fa3_profile::TensorPtr(cu_seqlens_k_),
+         fa3_profile::TensorPtr(seqused_q_), fa3_profile::TensorPtr(seqused_k_)},
+        {&dq, &dk, &dv});
+    const uint64_t profile_start = profile.Begin();
     if (q.dtype() == at::kBFloat16) {
         if (is_varlen) {
             DISPATCH_BWD950_FLAGS(bfloat16_t, TND);
@@ -480,6 +487,8 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
 
 #undef DISPATCH_BWD950_FLAGS
 #undef LAUNCH_BWD950
+
+    profile.Report(profile_start);
 
     at::Tensor softmax_d = is_varlen ? at::empty({num_heads, q.size(0)}, q.options().dtype(at::kFloat))
                                      : at::empty({batch_size, num_heads, q_seqlen}, q.options().dtype(at::kFloat));
