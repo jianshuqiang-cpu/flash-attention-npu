@@ -231,7 +231,7 @@ class FAIKernel950 {
         gBlockTable.SetGlobalBuffer((__gm__ int32_t*)(params.blockTables));
         AscendC::GlobalTensor<ElementO> gO;
         gO.SetGlobalBuffer((__gm__ ElementO*)params.o);
-        if constexpr (ResidentPages || (PairedHeads && !MixedKv && std::is_same_v<ElementQ, bfloat16_t>)) {
+        if constexpr (ResidentPages || (PairedHeads && !MixedKv)) {
             gO.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
         }
         AscendC::GlobalTensor<float> gLse;
@@ -288,7 +288,7 @@ class FAIKernel950 {
         fdRowCapacity_ = faiTilingData->fdRowCapacity;
         fdLseSubStride_ = faiTilingData->fdLseSubStride;
 
-        const bool prefetchNextQ = nativePair && !GroupedHeads && !LseMode && qFormat == Format::TND &&
+        bool prefetchNextQ = nativePair && !GroupedHeads && !LseMode && qFormat == Format::TND &&
             kvcacheType == CacheMode::pagedCache && cacheLayout == CacheLayout::nd &&
             maskCategory == MaskCategory::MASK_SWA && batch_ == 1U && qHeads_ == 16U && kvHeads_ == 1U &&
             embed_ == 192U && embedV_ == 192U && qBaseTile_ == 128U && kvBaseTile_ == 128U &&
@@ -296,8 +296,13 @@ class FAIKernel950 {
             qkL1TileM_ == 128U && qkL1TileKLeft_ == 192U && qkL1TileKRight_ == 192U &&
             pvL1TileM_ == 128U && pvL1TileN_ == 192U && pvL1TileKLeft_ == 128U && pvL1TileKRight_ == 128U &&
             kL1BufNum_ == 2U && vL1BufNum_ == 2U && pL1BufNum_ == 3U &&
-            GetQSeqLen(0U, faiTilingData->maxQSeqlen, gActualQseqlen, gSeqUsedQ) == 16384 &&
-            GetKvSeqLen(0U, gActualKvseqlen, gSeqUsedKv) == 32768;
+            GetQSeqLen(0U, faiTilingData->maxQSeqlen, gActualQseqlen, gSeqUsedQ) == 16384;
+        if (prefetchNextQ) {
+            const int64_t kvLen = GetKvSeqLen(0U, gActualKvseqlen, gSeqUsedKv);
+            // A full, page-aligned prefix gives every Q tile the same SWA page span.
+            prefetchNextQ = kvLen == 32768 || (std::is_same_v<ElementQ, half> &&
+                kvLen >= 16384 + 512 && kvLen % 128 == 0);
+        }
         const bool compactPipeline = ResidentPages || prefetchNextQ;
         const bool leadKeyPages = prefetchNextQ && kvcacheShape == PageShape::BnBsND;
         if (leadKeyPages) {
@@ -452,7 +457,8 @@ class FAIKernel950 {
         EpilogueOnlineSoftmax secondSm(resource, secondPlan, scaleValue_, softcapValue_);
         const bool packFinalOutput = (MixedKv && PairedHeads && !PairedKv &&
             maskCategory == MaskCategory::MASK_SWA && qBaseTile_ == 128U && embedV_ == 192U) ||
-            prefetchNextQ;
+            prefetchNextQ || (nativePair && std::is_same_v<ElementQ, half> &&
+                maskCategory == MaskCategory::MASK_SWA && qBaseTile_ == 128U && embedV_ == 192U);
         EpilogueRescaleO firstO(resource, ubPlan, mixedKv && !PairedHeads, packFinalOutput);
         EpilogueRescaleO secondO(resource, secondPlan, mixedKv && !PairedHeads, packFinalOutput);
         fa950_mixed::KvDequant kvDequant(resource, mixedKv ? ubPlan.total : 0U);
@@ -1368,8 +1374,7 @@ class FAIKernel950 {
                         const bool maskRight = !notNextMask && windowSizeRightStartLen < key0 + maxDiag;
                         if (maskCategory == MaskCategory::MASK_SWA && PairedHeads && qNBlockSize == 1U &&
                             kvSTileSizeAct > 64U && maskLeft != maskRight) {
-                            constexpr bool alignedSwaEdge = ResidentPages ||
-                                (nativePair && std::is_same_v<ElementQ, bfloat16_t>);
+                            constexpr bool alignedSwaEdge = ResidentPages || nativePair;
                             // Lower bound is inclusive; the upper boundary counts valid columns.
                             const int64_t boundary = (maskLeft ? windowSizeLeftStartLen :
                                 windowSizeRightStartLen + 1) - key0;
