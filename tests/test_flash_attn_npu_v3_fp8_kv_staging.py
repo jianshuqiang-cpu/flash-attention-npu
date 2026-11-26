@@ -109,3 +109,59 @@ def test_fp8_kv_staging_empty_kv_and_invalid_visible_page():
     assert plan.num_staged_pages == 0
     out = plan.forward(q, k, v, k_descale=ks, v_descale=vs)
     assert torch.count_nonzero(out.cpu()).item() == 0
+
+
+@pytest.mark.parametrize("q_len,max_q,window", [
+    (1, 1, (511, 0)),
+    (4, 128, (511, 0)),
+    (16, 16, (-1, 0)),
+])
+def test_fp8_decode_uses_original_path(q_len, max_q, window, monkeypatch):
+    q, k, v, ks, vs, _ = make_inputs(16, 1, "BBND", window)
+    q = q[:q_len]
+    table = torch.tensor([[8, 3, 7, 1, 5, 4, 2, 0, 6], [0] * 9],
+                         dtype=torch.int32, device="npu")
+    lengths = torch.tensor([1151, 0], dtype=torch.int32, device="npu")
+    prefixes = torch.tensor([0, q_len, q_len], dtype=torch.int32, device="npu")
+    options = dict(page_table=table, cache_seqlens=lengths, cu_seqlens_q=prefixes,
+                   max_seqlen_q=max_q, window_size=window)
+
+    from flash_attn_npu_3 import fp8_kv_staging
+
+    def unexpected_staging(*args, **kwargs):
+        pytest.fail("Decode entered BF16 staging")
+
+    monkeypatch.setattr(fp8_kv_staging, "_compact_page_table", unexpected_staging)
+    monkeypatch.setattr(fp8_kv_staging.flash_attn_npu_3_950, "_stage_fp8_kv", unexpected_staging)
+    plan = prepare_fp8_kv_staging(q, k, **options)
+    assert plan.num_staged_pages == plan.workspace_bytes == 0
+    assert plan.allocate_workspace() is None
+    assert_equal(plan._page_table, table)
+    expected = flash_attn_with_kvcache(
+        q, k, v, k_descale=ks, v_descale=vs, causal=True, return_softmax_lse=True, **options,
+    )
+    actual = plan.forward(q, k, v, k_descale=ks, v_descale=vs, return_softmax_lse=True)
+    for result, reference in zip(actual[:2], expected[:2]):
+        assert_equal(result, reference)
+
+
+def test_fp8_staging_above_decode_query_limit():
+    q, k, v, ks, vs, _ = make_inputs(5, 1, "BBND", (511, 0))
+    q = q[:17]
+    args = dict(
+        page_table=torch.tensor([[8, 3]], dtype=torch.int32, device="npu"),
+        cache_seqlens=torch.tensor([245], dtype=torch.int32, device="npu"),
+        cu_seqlens_q=torch.tensor([0, 17], dtype=torch.int32, device="npu"),
+        max_seqlen_q=17,
+    )
+    plan = prepare_fp8_kv_staging(q, k, **args)
+    assert plan.num_staged_pages == 2
+    workspace = plan.allocate_workspace()
+    assert workspace is not None
+    reference = flash_attn_with_kvcache(
+        q, k, v, k_descale=ks, v_descale=vs, causal=True, window_size=(511, 0), **args,
+    )
+    torch.testing.assert_close(
+        plan.forward(q, k, v, k_descale=ks, v_descale=vs, workspace=workspace).cpu(),
+        reference.cpu(), rtol=5e-3, atol=5e-3,
+    )

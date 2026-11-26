@@ -546,6 +546,10 @@ scratch for the compact cache by default. To reuse the scratch on one stream,
 allocate it with `plan.allocate_workspace()` and pass it as `workspace=` to
 `plan.forward`. `plan.workspace_bytes` reports its size.
 
+Batches with at most 16 actual query rows per request use the existing mixed
+FP8 Decode path with the original page indices. For these batches,
+`plan.workspace_bytes` is zero and `plan.allocate_workspace()` returns `None`.
+
 #### flash_attn_func
 
 ```python
