@@ -420,7 +420,7 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
         int32_t edge, uint32_t width, uint32_t firstRow, uint32_t rowsPerHead)
     {
         // The paired SWA boundary has one Q head and 64 rows per AIV.
-        if constexpr (SkipUniformStripe && !HAS_SOFTCAP_ && Boundary != ScoreBoundary::None) {
+        if constexpr ((AlignedSwaEdge || SkipUniformStripe) && !HAS_SOFTCAP_ && Boundary != ScoreBoundary::None) {
             if (rows == 64U && rowsPerHead == 128U && nLoops == 1U && tailN == 64U) {
                 if constexpr (AlignedSwaEdge) {
                     // For aligned full pages, the partial stripe starts
@@ -442,22 +442,24 @@ class BlockEpilogue<EpilogueFAOnlineSoftmaxT<HAS_SOFTCAP_>, OutputType_, Gemm::G
                         return;
                     }
                 }
-                const int32_t lastEdge = edge + static_cast<int32_t>(rows - 1U);
-                constexpr auto skip = Boundary == ScoreBoundary::Lower ? ScoreStripe::LowMasked : ScoreStripe::HighMasked;
-                constexpr auto live = Boundary == ScoreBoundary::Lower ? ScoreStripe::HighLive : ScoreStripe::LowLive;
-                const bool entireStripeMasked = Boundary == ScoreBoundary::Lower ? edge >= 64 : lastEdge <= 64;
-                const bool entireStripeLive = Boundary == ScoreBoundary::Lower ? lastEdge <= 64 : edge >= 64;
-                if (entireStripeMasked) {
-                    ComputeScaleAndMax<ElementInput, ElementOutput, IsUpdate, Positional, Folded, Boundary, skip>(
-                        scores, maxOut, maxStart, previousMax, probability, sum, rows, nLoops, tailN, nPadding,
-                        scale, softcap, stride, probabilityStride, repeatStride, edge, width, firstRow, rowsPerHead);
-                    return;
-                }
-                if (entireStripeLive) {
-                    ComputeScaleAndMax<ElementInput, ElementOutput, IsUpdate, Positional, Folded, Boundary, live>(
-                        scores, maxOut, maxStart, previousMax, probability, sum, rows, nLoops, tailN, nPadding,
-                        scale, softcap, stride, probabilityStride, repeatStride, edge, width, firstRow, rowsPerHead);
-                    return;
+                if constexpr (SkipUniformStripe) {
+                    const int32_t lastEdge = edge + static_cast<int32_t>(rows - 1U);
+                    constexpr auto skip = Boundary == ScoreBoundary::Lower ? ScoreStripe::LowMasked : ScoreStripe::HighMasked;
+                    constexpr auto live = Boundary == ScoreBoundary::Lower ? ScoreStripe::HighLive : ScoreStripe::LowLive;
+                    const bool entireStripeMasked = Boundary == ScoreBoundary::Lower ? edge >= 64 : lastEdge <= 64;
+                    const bool entireStripeLive = Boundary == ScoreBoundary::Lower ? lastEdge <= 64 : edge >= 64;
+                    if (entireStripeMasked) {
+                        ComputeScaleAndMax<ElementInput, ElementOutput, IsUpdate, Positional, Folded, Boundary, skip>(
+                            scores, maxOut, maxStart, previousMax, probability, sum, rows, nLoops, tailN, nPadding,
+                            scale, softcap, stride, probabilityStride, repeatStride, edge, width, firstRow, rowsPerHead);
+                        return;
+                    }
+                    if (entireStripeLive) {
+                        ComputeScaleAndMax<ElementInput, ElementOutput, IsUpdate, Positional, Folded, Boundary, live>(
+                            scores, maxOut, maxStart, previousMax, probability, sum, rows, nLoops, tailN, nPadding,
+                            scale, softcap, stride, probabilityStride, repeatStride, edge, width, firstRow, rowsPerHead);
+                        return;
+                    }
                 }
             }
         }

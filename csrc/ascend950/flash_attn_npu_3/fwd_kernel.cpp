@@ -1365,6 +1365,8 @@ class FAIKernel950 {
                         const bool maskRight = !notNextMask && windowSizeRightStartLen < key0 + maxDiag;
                         if (maskCategory == MaskCategory::MASK_SWA && PairedHeads && qNBlockSize == 1U &&
                             kvSTileSizeAct > 64U && maskLeft != maskRight) {
+                            constexpr bool alignedSwaEdge = ResidentPages ||
+                                (nativePair && std::is_same_v<ElementQ, bfloat16_t>);
                             // Lower bound is inclusive; the upper boundary counts valid columns.
                             const int64_t boundary = (maskLeft ? windowSizeLeftStartLen :
                                 windowSizeRightStartLen + 1) - key0;
@@ -1372,12 +1374,12 @@ class FAIKernel950 {
                                 AscendC::Std::max(int64_t{-128}, boundary)));
                             if (maskLeft) {
                                 epilogueOnlineSoftmax.template operator()<false, false, Epilogue::Block::ScoreBoundary::Lower,
-                                                                          MixedKv, ResidentPages>(
+                                                                          MixedKv, alignedSwaEdge>(
                                     l1PTensorTla, actualBlockShapeQK, kvSTileRelIdx < headCount, ubSBufId, dmSlot,
                                     qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize, edge);
                             } else {
                                 epilogueOnlineSoftmax.template operator()<false, false, Epilogue::Block::ScoreBoundary::Upper,
-                                                                          MixedKv, ResidentPages>(
+                                                                          MixedKv, alignedSwaEdge>(
                                     l1PTensorTla, actualBlockShapeQK, kvSTileRelIdx < headCount, ubSBufId, dmSlot,
                                     qkReadyFlag, softmaxReadyFlag, qSBlockSize, qNBlockSize, edge);
                             }
