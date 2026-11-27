@@ -727,18 +727,21 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     // Native FP16/BF16 reuse an L1 K/V tile across adjacent heads of a paged GQA group.
     // Actual query/KV lengths remain on device, including during graph replay.
     const bool originalPairShape = num_heads == 16 && num_heads_k == 1;
+    const bool originalPairTiles = head_size_q == 192 && head_size_v == 192 && page_block_size == 128;
+    const bool nativeSwaTiles = head_size_q <= 192 && head_size_v <= 192 &&
+        head_size_q % 16 == 0 && head_size_v % 16 == 0;
+    const bool evenGroupSize = (num_heads / num_heads_k) % 2 == 0;
     const bool nativePairShape = quantMode == 0U && fmt == Format::TND && paged_KV && is_varlen_q &&
         !seqused_q_ && seqused_k_.has_value() && !is_varlen_kv && !flashDecodeEnabled && !is_softcap && num_splits <= 1 &&
-        num_heads > num_heads_k && num_heads <= 65535 / 192 &&
-        head_size_q == 192 && head_size_v == 192 &&
-        page_block_size == 128 && seqlen_q >= 128 && q.size(0) >= 1024 &&
-        (mask_category == MaskCategory::MASK_CAUSAL ||
-         (is_local && window_size_left == 511 && window_size_right == 0));
+        num_heads > num_heads_k && num_heads <= 65535 / head_size_q &&
+        seqlen_q >= 128 && q.size(0) >= 1024 &&
+        ((mask_category == MaskCategory::MASK_CAUSAL && originalPairTiles) ||
+         (is_local && nativeSwaTiles &&
+          (evenGroupSize || (originalPairTiles && window_size_left == 511 && window_size_right == 0))));
     const bool residentPrefill = mixedKv && fmt == Format::TND && paged_KV && launch[2] &&
         !flashDecodeEnabled && !is_softcap && !seqused_q_ && num_splits <= 1 &&
         seqlen_q >= 1024 && q.size(0) >= 1024 && is_local &&
-        window_size_left == 511 && window_size_right == 0 &&
-        (num_heads / num_heads_k) % 2U == 0U &&
+        window_size_left == 511 && window_size_right == 0 && evenGroupSize &&
         launchBlockDim % (num_heads / 2U) == 0U;
     using fa3_profile::TensorPtr;
     const char* kv_length_name = profile_kvcache ? "cache_seqlens" : "seqused_k";
