@@ -218,15 +218,11 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
 
     bool externalKv = false;
     bool prefetchedV = false;
-    bool holdPrefetchedV = false;
-    static constexpr uint32_t THIRD_V_BANK_EVENT = 7U; // Q uses events 5 and 6.
+    static constexpr uint32_t THIRD_V_BANK_EVENT = 7U;
 
     bool singleKvProducer = false;
     bool pairedHeads = false;
-    bool banksByLogicalPage = false;
-    bool reuseResidentPage = false;
     bool useUnitFix = false;
-    uint32_t pairedKvBankOffset = 0U;
     uint64_t pageStride = 0;
 
     __aicore__ inline void SetPageStride(uint64_t stride)
@@ -255,27 +251,32 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
 
     template<class TensorB>
     __aicore__ inline void PrefetchNativeV(TensorB& gmV, AscendC::GlobalTensor<int32_t> pages,
-                                           uint32_t logicalPage, uint32_t embed)
+                                           uint32_t logicalPage, uint32_t embed, uint32_t endKV, uint32_t blockSize,
+                                           bool resident = false)
     {
-        constexpr uint32_t pageRows = 128U;
         const uint32_t bank = logicalPage % l1BBufNum;
         const uint32_t event = bank < 2U ? bank + 3U : THIRD_V_BANK_EVENT;
-        using CopyGmToL1B = typename TileCopy_::template CopyGmToL1B<TensorB>;
-        CopyGmToL1B copyGmToL1B;
-        const auto layout = tla::MakeLayout<ElementB, LayoutTagL1B>(pageRows, embed);
-        auto l1V = tla::MakeTensor(l1BTensor[bank], layout, Arch::PositionL1{});
-        const auto physicalPage = static_cast<uint64_t>(pages.GetValue(logicalPage));
-        auto page = tla::MakeTensor(gmV.data()[physicalPage * pageStride], gmV.layout(), Arch::PositionGM{});
-        const auto shape = tla::MakeShape(pageRows, embed);
-        const auto zero = tla::MakeCoord(0, 0);
-        auto l1Tile = GetTile(l1V, zero, shape);
-        auto gmTile = GetTile(page, zero, shape);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(event);
-        copyGmToL1B(l1Tile, gmTile);
+        if (!resident) {
+            // The NZ row pitch must match the consuming PV tile, including tails.
+            const uint32_t firstRow = logicalPage * 128U;
+            const uint32_t pageRows = min(128U, endKV - firstRow);
+            using CopyGmToL1B = typename TileCopy_::template CopyGmToL1B<TensorB>;
+            CopyGmToL1B copyGmToL1B;
+            const auto layout = tla::MakeLayout<ElementB, LayoutTagL1B>(pageRows, embed);
+            auto l1V = tla::MakeTensor(l1BTensor[bank], layout, Arch::PositionL1{});
+            const auto physicalPage = static_cast<uint64_t>(pages.GetValue(firstRow / blockSize));
+            auto page = tla::MakeTensor(gmV.data()[physicalPage * pageStride], gmV.layout(), Arch::PositionGM{});
+            const auto shape = tla::MakeShape(pageRows, embed);
+            const auto zero = tla::MakeCoord(0, 0);
+            auto l1Tile = GetTile(l1V, zero, shape);
+            auto gmTile = GetTile(page, tla::MakeCoord(firstRow % blockSize, 0U), shape);
+            copyGmToL1B(l1Tile, gmTile);
+        }
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(event);
     }
 
-    template <bool SplitTerminalLanes = false, bool ResidentPages = false, class TensorB, class TensorC>
+    template <bool ResidentPages = false, class TensorB, class TensorC>
     __aicore__ inline void operator()(TensorB& gBTensor, TensorC& ubCTensor, AscendC::GlobalTensor<int32_t> gBlockTable,
                                       GemmCoord actualOriShape, uint32_t blockSize, uint32_t kvSTileIdx,
                                       uint32_t pipelineTileSeq, uint32_t kvSeqlenTriDown, uint32_t kvHeads,
@@ -283,8 +284,7 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                                       uint32_t globalWindowSize, uint32_t localWindowSize,
                                       Arch::CrossCoreFlag softmaxReadyFlag, Arch::CrossCoreFlag pvReadyFlag,
                                       uint64_t prefixSumL0AStages, uint64_t prefixSumL0BStages,
-                                      bool splitTerminalLanes = false, uint32_t residentBank = 0U,
-                                      bool pageMiss = false)
+                                      uint32_t residentBank = 0U, bool pageMiss = false)
     {
         using CopyL0CToDst = typename TileCopy_::template CopyL0CToDst<TensorC>;
         CopyL0CToDst copyL0CToDst;
@@ -297,10 +297,10 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
         uint32_t curBaseTileSize = actualOriShape[2];
         uint32_t kvTileStart = kvSTileIdx * kvSBaseTile;
 
-        const uint32_t bankIndex = banksByLogicalPage ? kvSTileIdx :
-            (pairedHeads ? pipelineTileSeq / 2U + pairedKvBankOffset : pipelineTileSeq);
-        uint32_t l1BBufId = ResidentPages ? residentBank : bankIndex % l1BBufNum;
-        uint32_t l1BEventId = prefetchedV && l1BBufId == 2U ? THIRD_V_BANK_EVENT : l1BBufId + 3U;
+        const uint32_t bankIndex = prefetchedV ? kvSTileIdx :
+            (pairedHeads ? pipelineTileSeq / 2U : pipelineTileSeq);
+        const uint32_t l1BBufId = ResidentPages ? residentBank : bankIndex % l1BBufNum;
+        const uint32_t l1BEventId = l1BBufNum == 3U && l1BBufId == 2U ? THIRD_V_BANK_EVENT : l1BBufId + 3U;
         uint32_t l1ABufId = pipelineTileSeq % l1ABufNum;
 
         auto l1BLayoutTla = tla::MakeLayout<ElementB, LayoutTagL1B>(curBaseTileSize, embedPhysical);
@@ -322,7 +322,7 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                 AscendC::CrossCoreWaitFlag<4, PIPE_MTE1>(9U + l1BBufId + V0_V1_FLAG_ID_OFFSET);
             }
         } else if (prefetchedV) {
-            if (!reuseResidentPage && (pipelineTileSeq & 1U) == 0U) {
+            if ((pipelineTileSeq & 1U) == 0U) {
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventId);
             }
         } else if (externalKv) {
@@ -334,7 +334,7 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
             } else {
                 WaitCrossCoreSync<4, PIPE_MTE1>(ready);
             }
-        } else if (!reuseResidentPage && (!pairedHeads || (pipelineTileSeq & 1U) == 0U)) {
+        } else if (!pairedHeads || (pipelineTileSeq & 1U) == 0U) {
             // The second Q head consumes the tile already in this L1 bank.
             if constexpr (FULL_QUANT_FP8 && PAGED_CACHE_FLAG_) {
                 // A 256-KV tile can span two independently mapped 128-token pages.
@@ -536,9 +536,8 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
                     copyL1ToL0B(l0BTensorTla, l1BTensorTlaTile);
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(l0BEventId);
 
-                    if (!ResidentPages && (mL0Itr == mL0LoopNum - 1) &&
-                        (nL0Itr == nL0LoopNum - 1) && (kL0Itr == kL0LoopNum - 1)) {
-                        if (!prefetchedV || (!holdPrefetchedV && (pipelineTileSeq & 1U) != 0U)) {
+                    if (!ResidentPages && mL0Itr == mL0LoopNum - 1 && nL0Itr == nL0LoopNum - 1 && kL0Itr == kL0LoopNum - 1) {
+                        if (!prefetchedV || (pipelineTileSeq & 1U) != 0U) {
                             AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventId);
                         }
                         if (externalKv && (!pairedHeads || pipelineTileSeq % 2U != 0U)) {
@@ -608,26 +607,6 @@ struct BlockMmadTla<MmadFlashAttentionPV<ArchTag_, PAGED_CACHE_FLAG_, NZ_LAYOUT_
             if (!useUnitFix) {
                 AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
                 AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
-            }
-            if constexpr (SplitTerminalLanes && !ENABLE_DN_) {
-                if (splitTerminalLanes && nL0Itr + 1U == nL0LoopNum) {
-                    // The first fragment is already in both UBs. Publish the
-                    // completed lane 0 output while FIX fills lane 1's tail.
-                    constexpr uint32_t laneRows = 64U;
-                    const auto shape = tla::MakeShape(laneRows, l0TileNPhysical);
-                    auto laneDst = GetTile(ubCTensor, tla::MakeCoord(0U, nL0Itr * L0_TILE_N), shape);
-                    auto lane0 = GetTile(l0CTensorTla, tla::MakeCoord(0U, 0U), shape);
-                    auto lane1 = GetTile(l0CTensorTla, tla::MakeCoord(laneRows, 0U), shape);
-                    Tile::CopyL0CToUBTla<ArchTag, decltype(l0CTensorTla), TensorC, Tile::CopyL0CToUBMode::NO_SPLIT,
-                                         Tile::ScaleGranularity::NO_QUANT, false> copyToLane;
-                    copyToLane(laneDst, lane0, false, 0U);
-                    Arch::CrossCoreSetFlag<4, PIPE_FIX>(pvReadyFlag);
-                    copyToLane(laneDst, lane1, true, 0U);
-                    AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventId);
-                    Arch::CrossCoreFlag lane1Ready(pvReadyFlag.id + V0_V1_FLAG_ID_OFFSET);
-                    Arch::CrossCoreSetFlag<4, PIPE_FIX>(lane1Ready);
-                    return;
-                }
             }
             // 需要kernel传输ubCTensor的时候确保其shape的m，n是满足32B（8个32位元素）对齐的
             // rounded up by 8 and splited in half to each AIV

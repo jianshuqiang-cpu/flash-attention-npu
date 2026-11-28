@@ -31,8 +31,9 @@ public:
     }
 
     __aicore__ inline void Plan(Window& result, uint32_t begin, uint32_t end, uint32_t batch,
-                                uint32_t head, uint32_t protectedBank)
+                                uint32_t head)
     {
+        uint32_t protectedBank = INVALID;
         if (batch_ != batch || head_ != head) {
             batch_ = batch;
             head_ = head;
@@ -55,8 +56,8 @@ public:
                 result.lateTail = tail && bank == protectedBank;
             }
             result.banks[page - begin] = bank;
-            // A tail replacement can wait for its predecessor's final PV.
-            // All other replacements must let that predecessor remain live.
+            // Keep the preceding page live until both heads have read its V.
+            // When the tail uses that slot, its write waits for this task's PV.
             protectedBank = bank;
         }
     }

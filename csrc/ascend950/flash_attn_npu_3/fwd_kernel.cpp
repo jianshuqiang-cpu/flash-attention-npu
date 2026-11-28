@@ -132,22 +132,21 @@ class FAIKernel950 {
             keyLane ? params.storage.keyHeadStride : params.storage.valueHeadStride, page, 128U, keyLane ? 1U : 0U);
     }
 
+    template<bool FirstStripePrepared = false>
     __aicore__ inline void ProduceResidentKv(fa950_mixed::KvDequantBuffered& dequant, uint32_t bank,
-        uint32_t pvL1AddrStart, bool keyLane, uint32_t firstHalf = 0U, uint32_t endHalf = 2U, uint32_t prefixReady = 0U)
+        uint32_t pvL1AddrStart, bool keyLane)
     {
         constexpr uint32_t pageBytes = 128U * 192U * sizeof(bfloat16_t);
         const uint32_t base = keyLane ? qL1BufNum_ * pageBytes :
             pvL1AddrStart + pL1BufNum_ * 128U * 128U * sizeof(ElementP);
-        dequant.Produce(resource, 128U, base + bank * pageBytes, (keyLane ? 7U : 9U) + bank,
-                        keyLane ? 1U : 0U, firstHalf, endHalf, prefixReady);
+        dequant.Produce<FirstStripePrepared>(resource, 128U, base + bank * pageBytes,
+                                           (keyLane ? 7U : 9U) + bank, keyLane ? 1U : 0U);
     }
 
     __aicore__ inline void ProducePairedKv(fa950_mixed::KvDequantBuffered& halfDequant, const FAIKernelParams& params,
                                            AscendC::GlobalTensor<int32_t> pages, uint32_t kvHeadIdx,
                                            uint32_t kvSplitStart, uint32_t kvSplitEnd, uint32_t kvSLoopNum,
-                                           uint32_t noSkipKvS, uint32_t pvL1AddrStart, uint32_t step,
-                                           bool reuseFirstPage, bool earlyKey,
-                                           fa950_mixed::StripePart part = fa950_mixed::StripePart::Whole)
+                                           uint32_t noSkipKvS, uint32_t pvL1AddrStart, uint32_t step)
     {
         const bool keyLane = AscendC::GetSubBlockIdx() == 0U;
         const uint32_t kvSlot = keyLane ? 1U : 0U;
@@ -158,21 +157,8 @@ class FAIKernel950 {
         const auto headStride = keyLane ? params.storage.keyHeadStride : params.storage.valueHeadStride;
         if (step == 0U) {
             const uint32_t rows = kvSplitStart + 1U == kvSLoopNum ? noSkipKvS - kvSplitStart * 128U : 128U;
-            uint32_t prefetchPage = kvSplitStart;
-            if (reuseFirstPage) {
-                const uint32_t flag = keyLane ? 7U : 9U;
-                // The preceding task has released its bank-zero
-                // operand. Publish the same data for the new task.
-                AscendC::CrossCoreWaitFlag<4, PIPE_MTE3>(flag);
-                AscendC::CrossCoreSetFlag<4, PIPE_MTE3>(flag);
-                ++prefetchPage;
-            }
-            if (prefetchPage < kvSplitEnd) {
-                const uint32_t prefetchRows = prefetchPage == kvSplitStart ? rows :
-                    (prefetchPage + 1U == kvSLoopNum ? noSkipKvS - prefetchPage * 128U : 128U);
-                halfDequant.Prefetch(cache, scales, pages, kvHeadIdx, kvHeads_,
-                    pageStride, tokenStride, headStride, prefetchPage, prefetchRows, kvSlot);
-            }
+            halfDequant.Prefetch(cache, scales, pages, kvHeadIdx, kvHeads_,
+                pageStride, tokenStride, headStride, kvSplitStart, rows, kvSlot);
         }
         // Keep the first two keys on the original schedule for startup.
         // In steady state, prepare 64 rows during each query-head step.
@@ -180,12 +166,8 @@ class FAIKernel950 {
         const uint32_t firstHalf = wholeKey ? 0U : step % 2U;
         const uint32_t endHalf = wholeKey ? 2U : firstHalf + 1U;
         const uint32_t page = kvSplitStart + step / 2U + (keyLane && step != 0U ? 1U : 0U);
-        if (page < kvSplitEnd && (!reuseFirstPage || page != kvSplitStart)) {
+        if (page < kvSplitEnd) {
             const uint32_t rows = page + 1U == kvSLoopNum ? noSkipKvS - page * 128U : 128U;
-            using Part = fa950_mixed::StripePart;
-            const bool splitStripe = step >= 2U && rows == 128U;
-            if (part == Part::Last && !splitStripe) { return; }
-            const Part activePart = splitStripe ? part : Part::Whole;
             // Cube consumes the first visible page in bank zero.
             // SWA can start at an odd physical tile index.
             const uint32_t bank = maskCategory == MaskCategory::MASK_SWA ?
@@ -194,11 +176,9 @@ class FAIKernel950 {
                 + bank * qkL1TileKRight_ * qkL1TileN_ * 2U;
             const uint32_t vOffset = pvL1AddrStart + pvL1TileM_ * pvL1TileKLeft_ * 2U * pL1BufNum_
                 + bank * pvL1TileKRight_ * pvL1TileN_ * 2U;
-            const uint32_t firstReady = earlyKey && keyLane && rows == 128U && page > kvSplitStart ?
-                fa950_plan::EARLY_K_READY_BASE + bank : 0U;
             halfDequant.Produce(resource, rows, keyLane ? kOffset : vOffset,
-                (keyLane ? 7U : 9U) + bank, kvSlot, firstHalf, endHalf, firstReady, activePart);
-            if (activePart != Part::First && endHalf == 2U && page + 1U < kvSplitEnd) {
+                (keyLane ? 7U : 9U) + bank, kvSlot, firstHalf, endHalf);
+            if (endHalf == 2U && page + 1U < kvSplitEnd) {
                 const uint32_t next = page + 1U;
                 const uint32_t nextRows = next + 1U == kvSLoopNum ? noSkipKvS - next * 128U : 128U;
                 halfDequant.Prefetch(cache, scales, pages, kvHeadIdx, kvHeads_,
@@ -274,7 +254,6 @@ class FAIKernel950 {
         const uint32_t groupSize = qHeads_ / kvHeads_;
         const uint32_t groupedTasksPerKvHead = (groupSize + 1U) / 2U;
         const uint32_t groupedTasksPerQTile = groupedTasksPerKvHead * kvHeads_;
-        const bool hasUnpairedTail = GroupedHeads && groupSize % 2U != 0U;
         // Native metadata is shared with ordinary FP16/BF16 callers. Only the paired
         // specialization reserves the second Q bank in the per-core L1 layout.
         qL1BufNum_ = nativePair ? 2U : faiTilingData->qL1BufNum;
@@ -288,34 +267,22 @@ class FAIKernel950 {
         fdRowCapacity_ = faiTilingData->fdRowCapacity;
         fdLseSubStride_ = faiTilingData->fdLseSubStride;
 
-        bool prefetchNextQ = nativePair && !GroupedHeads && !LseMode && qFormat == Format::TND &&
-            kvcacheType == CacheMode::pagedCache && cacheLayout == CacheLayout::nd &&
-            maskCategory == MaskCategory::MASK_SWA && batch_ == 1U && qHeads_ == 16U && kvHeads_ == 1U &&
-            embed_ == 192U && embedV_ == 192U && qBaseTile_ == 128U && kvBaseTile_ == 128U &&
-            blockSize_ == 128U && windowSizeLeft_ == 511 && windowSizeRight_ == 0 && flashDecodeFlag_ == 0U &&
-            qkL1TileM_ == 128U && qkL1TileKLeft_ == 192U && qkL1TileKRight_ == 192U &&
-            pvL1TileM_ == 128U && pvL1TileN_ == 192U && pvL1TileKLeft_ == 128U && pvL1TileKRight_ == 128U &&
-            kL1BufNum_ == 2U && vL1BufNum_ == 2U && pL1BufNum_ == 3U &&
-            GetQSeqLen(0U, faiTilingData->maxQSeqlen, gActualQseqlen, gSeqUsedQ) == 16384;
-        if (prefetchNextQ) {
-            const int64_t kvLen = GetKvSeqLen(0U, gActualKvseqlen, gSeqUsedKv);
-            // A full, page-aligned prefix gives every Q tile the same SWA page span.
-            prefetchNextQ = kvLen == 32768 || (std::is_same_v<ElementQ, half> &&
-                kvLen >= 16384 + 512 && kvLen % 128 == 0);
-        }
-        const bool compactPipeline = ResidentPages || prefetchNextQ;
-        const bool leadKeyPages = prefetchNextQ && kvcacheShape == PageShape::BnBsND;
+        // Prefetch K and V pages within the current paired SWA task.
+        constexpr bool prefetchNativeKv = nativePair && maskCategory == MaskCategory::MASK_SWA;
+        constexpr bool compactPipeline = ResidentPages || prefetchNativeKv;
+        constexpr bool leadKeyPages = prefetchNativeKv && kvcacheShape == PageShape::BnBsND;
         if (leadKeyPages) {
             kL1BufNum_ = 3U;
         }
-        if (prefetchNextQ) {
-            // A K bank holds one full logical page; the reduced pitch leaves
-            // space for the third Q bank alongside the original P and V banks.
+        if (prefetchNativeKv) {
+            // Use single-tile K slots so three V slots fit in L1.
             qkL1TileN_ = 128U;
-            qL1BufNum_ = 3U;
             vL1BufNum_ = 3U;
             pL1BufNum_ = 2U;
         }
+        static_assert(8U * 128U * 192U * sizeof(half) + 2U * 128U * 128U * sizeof(half) <=
+                      fa950_plan::L1_CAPACITY, "Two Q and three K/V slots fit beside two P slots");
+
         if constexpr (ResidentPages) {
             qkL1TileN_ = 128U;
             kL1BufNum_ = RESIDENT_KEY_BANKS;
@@ -325,8 +292,6 @@ class FAIKernel950 {
         static_assert((2U + RESIDENT_KEY_BANKS + fa950_resident::BANKS) * 128U * 192U * sizeof(bfloat16_t) +
                       2U * 128U * 128U * sizeof(bfloat16_t) <= fa950_plan::L1_CAPACITY,
                       "Resident prefill needs four K, three V, two Q and two P banks");
-        static_assert(9U * 128U * 192U * sizeof(half) + 2U * 128U * 128U * sizeof(half) <=
-                      fa950_plan::L1_CAPACITY, "Three Q, K and V slots fit beside two P slots");
 
         AscendC::LocalTensor<ElementP> l1PTensor[MAX_CROSS_CORE_BUF_STAGES];
         AscendC::LocalTensor<ElementS> ubSTensor[UB_S_BUF_STAGES];
@@ -363,20 +328,6 @@ class FAIKernel950 {
                       "Native pair must fit a second output and its softmax statistics");
         static_assert(fa950_plan::L1Bytes(192, 192) + 128U * 192U * sizeof(half) <= fa950_plan::L1_CAPACITY,
                       "Native pair must fit two Q banks alongside K, V and P");
-        constexpr bool mixedPairBridge = PairedHeads && MixedKv && kvcacheType == CacheMode::pagedCache &&
-            maskCategory == MaskCategory::MASK_SWA;
-        constexpr bool nativeBf16 = std::is_same_v<ElementQ, bfloat16_t> && !MixedKv && !PairedHeads;
-        const bool relaxedBf16 = nativeBf16 && !mixedKv && pL1BufNum_ == 3U && vL1BufNum_ == 2U;
-        // The two V banks can bridge one outstanding PV at a task boundary.
-        const bool crossTask = qFormat == Format::TND && !IsDN && (!PairedHeads || nativePair || mixedPairBridge) && !LseMode &&
-            maskCategory == MaskCategory::MASK_SWA && embed_ == 192U && embedV_ == 192U &&
-            kvBaseTile_ == 128U && (qBaseTile_ == 128U || (relaxedBf16 && qBaseTile_ == 64U)) &&
-            (ResidentPages || (GroupedHeads ? !hasUnpairedTail : (relaxedBf16 || kvHeads_ == 1U))) &&
-            flashDecodeFlag_ == 0U;
-        constexpr uint32_t statsBytes = 2U * 64U * sizeof(float);
-        static_assert(fa950_plan::MakeUbPlan(192, 1, 64, 64, 1).total + statsBytes +
-                      2U * (fa950_mixed::HALF_INPUT_BYTES + fa950_mixed::OUTPUT_BANK_BYTES) <=
-                      fa950_plan::UB_CAPACITY, "cross-task statistics must fit beside FP8 dequantization");
         otmpStages_ = ubPlan.otmpStages;
         for (uint32_t i = 0; i < UB_S_BUF_STAGES; ++i) {
             ubSTensor[i] = resource.ubBuf.template GetBufferByByte<ElementS>(ubPlan.s + ubPlan.sBytes * i);
@@ -416,18 +367,13 @@ class FAIKernel950 {
             blockMmadQK.singleKvProducer = bufferedKv || splitRowKv;
         }
         blockMmadPV.externalKv = mixedKv;
-        blockMmadPV.prefetchedV = prefetchNextQ;
+        blockMmadPV.prefetchedV = prefetchNativeKv;
         blockMmadPV.pairedHeads = PairedHeads && !PairedKv;
         blockMmadPV.singleKvProducer = bufferedKv || splitRowKv;
-        const bool keepWindowPage = nativePair && maskCategory == MaskCategory::MASK_SWA &&
-            blockSize_ == 128U && kvBaseTile_ == 128U && (kL1BufNum_ == 2U || leadKeyPages) &&
-            (vL1BufNum_ == 2U || prefetchNextQ);
         if constexpr (!IsDN) {
-            blockMmadQK.banksByLogicalPage = keepWindowPage;
             blockMmadQK.useUnitFix = compactPipeline;
             blockMmadQK.leadNativeK = leadKeyPages;
         }
-        blockMmadPV.banksByLogicalPage = keepWindowPage;
         blockMmadPV.useUnitFix = compactPipeline;
         if (!ResidentPages && mixedKv) {
             for (uint32_t flag = 7; flag < 11; ++flag) {
@@ -448,16 +394,11 @@ class FAIKernel950 {
             secondPlan.gl = secondPlan.gm + 64U * sizeof(float);
             secondPlan.total = secondPlan.gl + 64U * sizeof(float);
         }
-        if (crossTask && !PairedHeads) {
-            secondPlan.gm = ubPlan.total;
-            secondPlan.gl = ubPlan.total + 64U * sizeof(float);
-            secondPlan.total = ubPlan.total + statsBytes;
-        }
         EpilogueOnlineSoftmax firstSm(resource, ubPlan, scaleValue_, softcapValue_);
         EpilogueOnlineSoftmax secondSm(resource, secondPlan, scaleValue_, softcapValue_);
         const bool packFinalOutput = (MixedKv && PairedHeads && !PairedKv &&
             maskCategory == MaskCategory::MASK_SWA && qBaseTile_ == 128U && embedV_ == 192U) ||
-            prefetchNextQ || (nativePair && std::is_same_v<ElementQ, half> &&
+            prefetchNativeKv || (nativePair && std::is_same_v<ElementQ, half> &&
                 maskCategory == MaskCategory::MASK_SWA && qBaseTile_ == 128U && embedV_ == 192U);
         EpilogueRescaleO firstO(resource, ubPlan, mixedKv && !PairedHeads, packFinalOutput);
         EpilogueRescaleO secondO(resource, secondPlan, mixedKv && !PairedHeads, packFinalOutput);
@@ -585,32 +526,20 @@ class FAIKernel950 {
             taskEnd = static_cast<uint32_t>(fdBaseTaskEnd);
             taskStep = 1U;
         }
-        struct DeferredPv {
-            uint32_t tile, columns, count, seq, qStart;
-            int64_t outputOffset;
-            uint64_t lseOffset;
-            bool secondStats;
-            uint32_t residentBank;
-        } previous{};
-        fa950_resident::PageBanks residentKv;
+        const bool flashDecode = flashDecodeFlag_ != 0U;
+        fa950_resident::PageBanks residentValues;
         uint32_t residentKeyBatch = fa950_resident::INVALID;
-        uint32_t keyEnd = 0U;
-        bool pendingPv = false;
-        bool secondStats = false;
-        uint64_t issuedL0A = 0, issuedL0B = 0;
+        uint32_t residentKeyEnd = 0U;
+#ifdef __DAV_CUBE__
+        uint32_t nativePageBatch = batch_;
+        uint32_t nativePageHead = 0U;
+        uint32_t nativeLastPage = fa950_resident::INVALID;
+#endif
         uint32_t pipelineTileBase = 0U;
         uint64_t pipelineL0AStageBase = 0U;
         uint64_t pipelineL0BStageBase = 0U;
         uint32_t splitsPerHead = 0U;
         uint32_t kvSplit = 0U;
-#ifdef __DAV_CUBE__
-        uint32_t residentBatch = UINT32_MAX;
-        uint32_t residentHead = UINT32_MAX;
-        uint32_t residentPage = UINT32_MAX;
-        uint32_t nextHead0Bank = 0U;
-        bool nextHead0Pending = false;
-        bool nextHead0QkIssued = false;
-#endif
         if constexpr (PairedKv) {
             const uint32_t headPairs = kvHeads_ / 2U;
             splitsPerHead = faiTilingData->fdActiveCoreNum / headPairs;
@@ -629,13 +558,6 @@ class FAIKernel950 {
         const bool indexedTasks = supportsTaskOrder && (flashDecodeFlag_ == FD_WHOLE_TASK_INDEXED ||
             (gridSplits != 0U && fdBaseTaskStart >= 0));
         const uint32_t workCount = gridSplits != 0U ? faiTilingData->fdPartialTaskNum : totalTaskNum_;
-#ifdef __DAV_VEC__
-        constexpr bool pairedWindow = PairedHeads && MixedKv && qFormat == Format::TND &&
-            kvcacheType == CacheMode::pagedCache && maskCategory == MaskCategory::MASK_SWA;
-        uint32_t retainedKvBatch = batch_;
-        uint32_t retainedKvHead = 0U;
-        uint32_t retainedKvTile = 0U;
-#endif
         if (gridSplits != 0U && !indexedTasks) {
             taskBegin = coreIdx;
             taskEnd = workCount;
@@ -921,48 +843,15 @@ class FAIKernel950 {
             // In each pair, operations 2*i and 2*i+1 consume the same K/V page.
             const uint32_t headCount = paired ? 2U : 1U;
             const uint32_t kvSLoopCount = headCount * pageCount;
-            // Keep the row geometry and KV view for the deferred PV. The next
-            // task uses that view to retire the previous task's output.
-            const bool bridge = crossTask && qSeqlen % qBaseTile_ == 0 && kvSeqlen >= qSeqlen;
-            const bool earlyKey = !ResidentPages && mixedPairBridge && bridge && paired && rowNum == 128U;
-            const bool leaveLastPv = bridge && taskIdx + taskStep < curTotalTaskNum &&
-                taskIdx + taskStep < taskEnd &&
-                ((!GroupedHeads && !nativeBf16) || kvHeads_ == 1U ||
-                 ((taskIdxCurBatch + taskStep) % qNTaskNum) / qNBlockNumPerGroup == kvHeadIdx);
-            const bool continuousBanks = bridge || flashDecodeFlag_ != 0U;
             if (kvSLoopCount == 0U) {
                 continue;
             }
-            fa950_resident::Window residentWindow{};
-            uint32_t firstKeyMiss = 0U;
-            if constexpr (ResidentPages) {
-                residentKv.Plan(residentWindow, kvSplitStart, kvSplitEnd, curBatch, kvHeadIdx,
-                                pendingPv ? previous.residentBank : fa950_resident::INVALID);
-                // Each worker keeps one head pair and advances by one page.
-                // The last four K pages remain in their logical modulo slots.
-                firstKeyMiss = residentKeyBatch == curBatch ? keyEnd : kvSplitStart;
-                residentKeyBatch = curBatch;
-                keyEnd = kvSplitEnd;
-            }
-#ifdef __DAV_VEC__
-            const bool advanceKv = earlyKey && pageCount >= 3U;
-            bool reuseFirstPage = false;
-            if constexpr (pairedWindow) {
-                const bool firstFull = kvSplitStart + 1U < kvSLoopNum || noSkipKvS % kvBaseTile_ == 0U;
-                reuseFirstPage = firstFull && retainedKvBatch == curBatch &&
-                    retainedKvHead == kvHeadIdx && retainedKvTile == kvSplitStart;
-                const bool lastFull = kvSplitEnd < kvSLoopNum || noSkipKvS % kvBaseTile_ == 0U;
-                // With an odd page count the last page resides in bank zero,
-                // which is also the first bank of the next task.
-                retainedKvBatch = pageCount % 2U == 1U && lastFull ? curBatch : batch_;
-                retainedKvHead = kvHeadIdx;
-                retainedKvTile = kvSplitEnd - 1U;
-            }
-#endif
 #ifdef __DAV_CUBE__
             if constexpr (GroupedHeads) {
                 blockMmadQK.pairedHeads = paired;
+                blockMmadQK.leadNativeK = leadKeyPages && paired;
                 blockMmadPV.pairedHeads = paired;
+                blockMmadPV.prefetchedV = prefetchNativeKv && paired;
             }
             uint32_t qShapeCol = strideQ;
             uint32_t kShapeCol = strideK;
@@ -975,26 +864,15 @@ class FAIKernel950 {
             GemmCoord actualBlockShapeQ{rowNum, embed_, 0};
             const bool loadPair = paired && !PairedKv && qFormat == Format::TND &&
                 kvcacheType == CacheMode::pagedCache && maskCategory == MaskCategory::MASK_SWA &&
-                qNBlockSize == 1U && qSBlockSize == 128U && qHeadStride == embed_ && strideQ <= 65535U;
-            const bool deferSecondQ = nativePair && loadPair && embed_ == 192U && embedV_ == 192U &&
-                kvBaseTile_ == 128U && windowSizeLeft_ == 511 && windowSizeRight_ == 0 && pageCount >= 2U;
-            const uint32_t firstQBank = nextHead0Bank;
-            const bool firstQkIssued = nextHead0QkIssued;
-            nextHead0QkIssued = false;
+                qNBlockSize == 1U && (qSBlockSize == 128U || (prefetchNativeKv && qSBlockSize == 64U)) &&
+                qHeadStride == embed_ && strideQ <= 65535U;
+            const bool deferSecondQ = prefetchNativeKv && loadPair;
             if constexpr (IsDN) {
                 blockMmadQK.loadQGM(gmQTensorTlaDN, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride);
-            } else if (!firstQkIssued) {
-                blockMmadQK.qBank = firstQBank;
-                if (nextHead0Pending) {
-                    // The prefetched bank is independent. Acquire the normal
-                    // credit too, since the deferred head 1 will overwrite bank 1.
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(BlockMmadQK::NEXT_Q_READY_EVENT);
-                    nextHead0Pending = false;
-                } else {
-                    blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride,
-                                        loadPair && !deferSecondQ);
-                }
+            } else {
+                blockMmadQK.qBank = 0U;
+                blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ, qSBlockSize, qNBlockSize, qHeadStride,
+                                    loadPair && !deferSecondQ);
                 if (paired && !loadPair) {
                     auto nextQ = tla::MakeTensor(gQ[gmOffsetQ + qNBlockSize * qHeadStride], gmQLayoutTla, Arch::PositionGM{});
                     blockMmadQK.qBank = 1U;
@@ -1014,19 +892,22 @@ class FAIKernel950 {
             auto gmKTensorTlaDN = tla::MakeTensor(gK[gmOffsetK], gmKLayoutTlaDN, Arch::PositionGM{});
             auto gmVLayoutTla = tla::MakeLayout<ElementV, LayoutV>(kShapeRow, vShapeCol);
             auto gmVTensorTla = tla::MakeTensor(gV[gmOffsetV], gmVLayoutTla, Arch::PositionGM{});
-            const bool reuseWindowPage = keepWindowPage && residentBatch == curBatch &&
-                residentHead == kvHeadIdx && residentPage == kvSplitStart &&
-                (kvSplitStart + 1ULL) * 128ULL <= noSkipKvS;
-            const bool carryV = prefetchNextQ && reuseWindowPage && pendingPv;
-            if (prefetchNextQ && !carryV) {
-                blockMmadPV.PrefetchNativeV(gmVTensorTla, gBlockTable[blockBOffset], kvSplitStart, embedV_);
+            const bool reuseFirstPage = leadKeyPages && paired && nativePageBatch == curBatch &&
+                nativePageHead == kvHeadIdx && nativeLastPage == kvSplitStart &&
+                (kvSplitStart + 1ULL) * kvBaseTile_ <= noSkipKvS;
+            if constexpr (!IsDN && leadKeyPages) {
+                if (reuseFirstPage) {
+                    blockMmadQK.PrefetchNativeKPage(gmKTensorTla, gBlockTable[blockBOffset],
+                        kvSplitStart, blockSize_, embed_, noSkipKvS, true);
+                }
+                nativePageBatch = curBatch;
+                nativePageHead = kvHeadIdx;
+                nativeLastPage = paired && kvSplitEnd * uint64_t{128} <= noSkipKvS ?
+                    kvSplitEnd - 1U : fa950_resident::INVALID;
             }
-            if (keepWindowPage) {
-                // Absolute logical-page parity keeps both resident banks stable
-                // when the last PV retires in the following task.
-                residentBatch = curBatch;
-                residentHead = kvHeadIdx;
-                residentPage = kvSplitEnd * 128ULL <= noSkipKvS ? kvSplitEnd - 1U : UINT32_MAX;
+            if (prefetchNativeKv && paired) {
+                blockMmadPV.PrefetchNativeV(gmVTensorTla, gBlockTable[blockBOffset],
+                    kvSplitStart, embedV_, noSkipKvS, blockSize_, reuseFirstPage);
             }
 #endif
 #ifdef __DAV_VEC__
@@ -1055,7 +936,7 @@ class FAIKernel950 {
                 halfDequant.Prefetch(params.k, params.kDescale, gBlockTable[blockBOffset],
                     kvHeadIdx, kvHeads_, params.storage.keyPageStride, params.storage.keyTokenStride,
                     params.storage.keyHeadStride, kvSplitStart, rows, 1U);
-                const uint32_t seq = continuousBanks ? pipelineTileBase : 0U;
+                const uint32_t seq = flashDecode ? pipelineTileBase : 0U;
                 const uint32_t offset = qkL1TileM_ * qkL1TileKLeft_ * 2U * qL1BufNum_
                     + (seq % kL1BufNum_) * qkL1TileKRight_ * qkL1TileN_ * 2U;
                 halfDequant.Produce(resource, rows, offset, 7U + seq % kL1BufNum_, 1U);
@@ -1077,7 +958,7 @@ class FAIKernel950 {
                         kvHeadIdx, kvHeads_, params.storage.keyPageStride, params.storage.keyTokenStride,
                         params.storage.keyHeadStride, tile, rows, 1U);
                 }
-                const uint32_t seq = continuousBanks ? pipelineTileBase : 0U;
+                const uint32_t seq = flashDecode ? pipelineTileBase : 0U;
                 const uint32_t rows = kvSplitStart == kvSLoopNum - 1 ? noSkipKvS - kvSplitStart * 128U : 128U;
                 const uint32_t offset = qkL1TileM_ * qkL1TileKLeft_ * 2U * qL1BufNum_
                     + (seq % kL1BufNum_) * qkL1TileKRight_ * qkL1TileN_ * 2U;
@@ -1085,6 +966,16 @@ class FAIKernel950 {
             }
 
 #endif
+            fa950_resident::Window residentWindow{};
+            uint32_t firstKeyMiss = 0U;
+            if constexpr (ResidentPages) {
+                residentValues.Plan(residentWindow, kvSplitStart, kvSplitEnd, curBatch, kvHeadIdx);
+                // A worker advances by one Q tile for a fixed head pair.
+                // Its last four K pages remain in their logical modulo slots.
+                firstKeyMiss = residentKeyBatch == curBatch ? residentKeyEnd : kvSplitStart;
+                residentKeyBatch = curBatch;
+                residentKeyEnd = kvSplitEnd;
+            }
             uint32_t nextKey = 0U;
             if constexpr (ResidentPages) {
                 const bool keyMiss = kvSplitStart >= firstKeyMiss;
@@ -1108,7 +999,7 @@ class FAIKernel950 {
                 }
 #endif
             }
-            for (uint32_t kvSTileRelIdx = 0; kvSTileRelIdx < kvSLoopCount + PRE_LAUNCH - static_cast<uint32_t>(leaveLastPv); ++kvSTileRelIdx) {
+            for (uint32_t kvSTileRelIdx = 0; kvSTileRelIdx < kvSLoopCount + PRE_LAUNCH; ++kvSTileRelIdx) {
                 const uint32_t nextPage = kvSTileRelIdx / 2U + 1U;
                 const bool firstHeadStep = (kvSTileRelIdx & 1U) == 0U;
                 const bool nextMiss = ResidentPages && nextPage < pageCount && residentWindow.Miss(nextPage);
@@ -1134,7 +1025,7 @@ class FAIKernel950 {
                 }
                 const uint32_t kvSTileIdx = kvSplitStart + (paired ? kvSTileRelIdx / 2U : kvSTileRelIdx);
                 const uint32_t pipelineTileSeq =
-                    continuousBanks ? pipelineTileBase + kvSTileRelIdx : kvSTileRelIdx;
+                    flashDecode ? pipelineTileBase + kvSTileRelIdx : kvSTileRelIdx;
 #ifdef __DAV_VEC__
                 if constexpr (PairedKv) {
                     const bool keyLane = AscendC::GetSubBlockIdx() == 0U;
@@ -1165,16 +1056,9 @@ class FAIKernel950 {
                         }
                     }
                 } else if constexpr (PairedHeads && MixedKv) {
-                    if constexpr (!ResidentPages) {
-                        using Part = fa950_mixed::StripePart;
-                        const bool prefixWasProduced = advanceKv && kvSTileRelIdx >= 2U &&
-                            (kvSTileRelIdx & 1U) == 0U && AscendC::GetSubBlockIdx() == 0U;
-                        if (!prefixWasProduced && kvSTileRelIdx < kvSLoopCount && (!advanceKv || kvSTileRelIdx != 1U)) {
-                            const Part part = advanceKv && kvSTileRelIdx >= 2U ? Part::Last : Part::Whole;
-                            ProducePairedKv(halfDequant, params, gBlockTable[blockBOffset], kvHeadIdx, kvSplitStart,
-                                            kvSplitEnd, kvSLoopNum, noSkipKvS, pvL1AddrStart_, kvSTileRelIdx,
-                                            reuseFirstPage, earlyKey, part);
-                        }
+                    if (!ResidentPages && kvSTileRelIdx < kvSLoopCount) {
+                        ProducePairedKv(halfDequant, params, gBlockTable[blockBOffset], kvHeadIdx, kvSplitStart,
+                                        kvSplitEnd, kvSLoopNum, noSkipKvS, pvL1AddrStart_, kvSTileRelIdx);
                     }
                 } else if (mixedKv) {
                     // Small-Q: prepare V(i) while Cube consumes V(i-2). The
@@ -1188,7 +1072,7 @@ class FAIKernel950 {
                         kvSTileRelIdx - vProductionDelay < kvSLoopCount) {
                         const uint32_t rel = kvSTileRelIdx - vProductionDelay;
                         const uint32_t tile = kvSplitStart + rel;
-                        const uint32_t seq = continuousBanks ? pipelineTileBase + rel : rel;
+                        const uint32_t seq = flashDecode ? pipelineTileBase + rel : rel;
                         const uint32_t rows = tile == kvSLoopNum - 1 ? noSkipKvS - tile * 128U : 128U;
                         const uint32_t offset = pvL1AddrStart_ + pvL1TileM_ * pvL1TileKLeft_ * 2U * pL1BufNum_
                             + (seq % vL1BufNum_) * pvL1TileKRight_ * pvL1TileN_ * 2U;
@@ -1228,7 +1112,7 @@ class FAIKernel950 {
                     }
                     const uint32_t kRel = kvSTileRelIdx + ((earlyKv || splitRowKv) ? 1U : 0U);
                     const uint32_t kTile = kvSplitStart + kRel;
-                    const uint32_t kSeq = continuousBanks ? pipelineTileBase + kRel : kRel;
+                    const uint32_t kSeq = flashDecode ? pipelineTileBase + kRel : kRel;
                     if (kRel < kvSLoopCount) {
                         const uint32_t rows = kTile == kvSLoopNum - 1 ? noSkipKvS - kTile * 128U : 128U;
                         const uint32_t offset = qkL1TileM_ * qkL1TileKLeft_ * 2U * qL1BufNum_
@@ -1271,6 +1155,14 @@ class FAIKernel950 {
                     }
                 }
 #endif
+#ifdef __DAV_VEC__
+                if constexpr (ResidentPages) {
+                    if (retireTailPredecessor && AscendC::GetSubBlockIdx() == 1U) {
+                        // The old V bank is released by PV[r - PRE_LAUNCH], whose P was queued earlier.
+                        ProduceResidentKv<true>(halfDequant, residentWindow.banks[pageCount - 1U], pvL1AddrStart_, false);
+                    }
+                }
+#endif
                 if (kvSTileRelIdx < kvSLoopCount) {
                     if (kvSTileIdx == kvSLoopNum - 1) {
                         kvSTileSizeAct = noSkipKvS - kvSTileIdx * kvBaseTile_;
@@ -1291,42 +1183,31 @@ class FAIKernel950 {
                     uint32_t qkReadyFlagId = ubSBufId;
                     Arch::CrossCoreFlag qkReadyFlag(qkReadyFlagId);
 #ifdef __DAV_CUBE__
-                    uint64_t prefixSumL0AStages =
+                    const uint64_t prefixSumL0AStages =
                         CalcCrossqkpvPrefixSumL0ABStages(kvSTileRelIdx, qkL0ATotalStages_, pvL0ATotalStages_,
                                                          kvSLoopCount, true) +
                         (flashDecodeFlag_ != 0U ? pipelineL0AStageBase : 0U);
-                    uint64_t prefixSumL0BStages =
+                    const uint64_t prefixSumL0BStages =
                         CalcCrossqkpvPrefixSumL0ABStages(kvSTileRelIdx, qkL0BTotalStages_, pvL0BTotalStages_,
                                                          kvSLoopCount, true) +
                         (flashDecodeFlag_ != 0U ? pipelineL0BStageBase : 0U);
-                    if (bridge) {
-                        prefixSumL0AStages = issuedL0A;
-                        prefixSumL0BStages = issuedL0B;
-                    }
                     if constexpr (IsDN) {
                         blockMmadQK(gmKTensorTlaDN, ubSTensorTlaDN, gBlockTable[blockBOffset], actualBlockShapeQK,
                                     blockSize_, kvSTileIdx, kvSTileRelIdx, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0, 0,
                                     0, qSBlockSize, qNBlockSize, qkReadyFlag, prefixSumL0AStages, prefixSumL0BStages);
-                    } else if (!firstQkIssued || kvSTileRelIdx != 0U) {
-                        blockMmadQK.qBank = paired && (kvSTileRelIdx & 1U) ? 1U : firstQBank;
+                    } else {
+                        blockMmadQK.qBank = paired ? kvSTileRelIdx % 2U : 0U;
                         if (deferSecondQ && kvSTileRelIdx == 1U) {
                             AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(leadKeyPages ? EVENT_ID0 : EVENT_ID5);
                         }
-                        blockMmadQK.reuseResidentPage = reuseWindowPage && kvSTileRelIdx == 0U;
                         blockMmadQK.kPagePrefetched =
-                            leadKeyPages && kvSTileRelIdx >= 2U && (kvSTileRelIdx & 1U) == 0U;
-                        if constexpr (mixedPairBridge) {
-                            // K/V producers keep their banks local to each task.
-                            blockMmadQK.pairedKvBankOffset = continuousBanks ? pipelineTileBase / 2U % 2U : 0U;
-                        }
-                        const bool splitKey = earlyKey && kvSTileIdx != kvSplitStart &&
-                            kvSTileSizeAct == 128U && firstHeadStep;
-                        blockMmadQK.template operator()<mixedPairBridge, ResidentPages>(
+                            leadKeyPages && paired && (kvSTileRelIdx & 1U) == 0U &&
+                            (kvSTileRelIdx >= 2U || reuseFirstPage);
+                        blockMmadQK.template operator()<ResidentPages>(
                                     gmKTensorTla, ubSTensorTla, gBlockTable[blockBOffset], actualBlockShapeQK,
                                     blockSize_, kvSTileIdx, pipelineTileSeq, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0,
                                     0, 0, qSBlockSize, qNBlockSize, qkReadyFlag, prefixSumL0AStages,
-                                    prefixSumL0BStages, splitKey,
-                                    ResidentPages ? kvSTileIdx % RESIDENT_KEY_BANKS : 0U,
+                                    prefixSumL0BStages, ResidentPages ? kvSTileIdx % RESIDENT_KEY_BANKS : 0U,
                                     ResidentPages && kvSTileIdx >= firstKeyMiss);
                         if (deferSecondQ && kvSTileRelIdx == 0U) {
                             // Queue head 1 after the first K DMA, while the
@@ -1338,14 +1219,10 @@ class FAIKernel950 {
                                                 leadKeyPages ? EVENT_ID0 : EVENT_ID5);
                         }
                     }
-                    if (prefetchNextQ && firstHeadStep && kvSTileIdx + 1U < kvSplitEnd) {
+                    if (prefetchNativeKv && paired && (kvSTileRelIdx & 1U) == 0U && kvSTileIdx + 1U < kvSplitEnd) {
                         // V(i+1) is one paired page ahead. The oldest occupant
                         // of its bank retired in the preceding iteration.
-                        blockMmadPV.PrefetchNativeV(gmVTensorTla, gBlockTable[blockBOffset], kvSTileIdx + 1U, embedV_);
-                    }
-                    if (bridge) {
-                        issuedL0A += qkL0ATotalStages_;
-                        issuedL0B += qkL0BTotalStages_;
+                        blockMmadPV.PrefetchNativeV(gmVTensorTla, gBlockTable[blockBOffset], kvSTileIdx + 1U, embedV_, noSkipKvS, blockSize_);
                     }
                     if (kvSTileRelIdx == kvSLoopCount - 1U) {
                         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
@@ -1361,7 +1238,7 @@ class FAIKernel950 {
                     // three-slot ring of online statistics for rescale.
                     const uint32_t dmSlot = compactPipeline ?
                         pipelineTileSeq % MAX_CROSS_CORE_BUF_STAGES : l1PBufId;
-                    auto& epilogueOnlineSoftmax = ((paired && kvSTileRelIdx % 2U) || (bridge && secondStats)) ? secondSm : firstSm;
+                    auto& epilogueOnlineSoftmax = paired && kvSTileRelIdx % 2U ? secondSm : firstSm;
                     if constexpr (SingleQueryWindow) {
                         // The first and last KV pages have already been clipped to the single query window.
                         epilogueOnlineSoftmax(l1PTensorTla, actualBlockShapeQK, kvSTileRelIdx == 0U, ubSBufId,
@@ -1429,34 +1306,15 @@ class FAIKernel950 {
                         ProduceResidentKv(halfDequant, nextKey % RESIDENT_KEY_BANKS, pvL1AddrStart_, true);
                     } else if (!keyLane && nextMiss && !lateNext && !firstHeadStep) {
                         ProduceResidentKv(halfDequant, residentWindow.banks[nextPage], pvL1AddrStart_, false);
-                    } else if (!keyLane && retireTailPredecessor) {
-                        ProduceResidentKv(halfDequant, residentWindow.banks[pageCount - 1U], pvL1AddrStart_, false);
-                    }
-                }
-                if constexpr (!ResidentPages && !PairedKv && PairedHeads && MixedKv) {
-                    if (advanceKv && kvSTileRelIdx + 1U < kvSLoopCount) {
-                        using Part = fa950_mixed::StripePart;
-                        const uint32_t nextStep = kvSTileRelIdx + 1U;
-                        // The key lane has time before the older PV to finish
-                        // both stripes that publish the next page's K64 prefix.
-                        const bool firstKeyHalf = (nextStep & 1U) == 0U && AscendC::GetSubBlockIdx() == 0U;
-                        ProducePairedKv(halfDequant, params, gBlockTable[blockBOffset], kvHeadIdx, kvSplitStart,
-                                        kvSplitEnd, kvSLoopNum, noSkipKvS, pvL1AddrStart_, nextStep,
-                                        reuseFirstPage, earlyKey, firstKeyHalf ? Part::Whole : Part::First);
                     }
                 }
 #endif
-                const bool retiringPrevious = pendingPv && kvSTileRelIdx == 0U;
-                if (retiringPrevious || kvSTileRelIdx >= PRE_LAUNCH) {
-                    uint32_t kvSTileRelIdxNow = retiringPrevious ? previous.count - 1U : kvSTileRelIdx - PRE_LAUNCH;
-                    uint32_t kvSTileIdxNow = kvSplitStart + (paired ? kvSTileRelIdxNow / 2U : kvSTileRelIdxNow);
-                    uint32_t pipelineTileSeqNow =
-                        continuousBanks ? pipelineTileBase + kvSTileRelIdxNow : kvSTileRelIdxNow;
-                    if (retiringPrevious) {
-                        kvSTileIdxNow = previous.tile;
-                        pipelineTileSeqNow = previous.seq;
-                        kvSTileSizeAct = previous.columns;
-                    } else if (kvSTileIdxNow == kvSLoopNum - 1) {
+                if (kvSTileRelIdx >= PRE_LAUNCH) {
+                    const uint32_t kvSTileRelIdxNow = kvSTileRelIdx - PRE_LAUNCH;
+                    const uint32_t kvSTileIdxNow = kvSplitStart + (paired ? kvSTileRelIdxNow / 2U : kvSTileRelIdxNow);
+                    const uint32_t pipelineTileSeqNow =
+                        flashDecode ? pipelineTileBase + kvSTileRelIdxNow : kvSTileRelIdxNow;
+                    if (kvSTileIdxNow == kvSLoopNum - 1) {
                         kvSTileSizeAct = noSkipKvS - kvSTileIdxNow * kvBaseTile_;
                     } else {
                         kvSTileSizeAct = kvBaseTile_;
@@ -1476,53 +1334,21 @@ class FAIKernel950 {
                     uint32_t softmaxReadyFlagId = l1PBufId + UB_S_OTMP_BUF_STAGES;
                     Arch::CrossCoreFlag softmaxReadyFlag(softmaxReadyFlagId);
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);
-                    uint64_t prefixSumL0AStages =
+                    const uint64_t prefixSumL0AStages =
                         CalcCrossqkpvPrefixSumL0ABStages(kvSTileRelIdxNow, qkL0ATotalStages_, pvL0ATotalStages_,
                                                          kvSLoopCount, false) +
                         (flashDecodeFlag_ != 0U ? pipelineL0AStageBase : 0U);
-                    uint64_t prefixSumL0BStages =
+                    const uint64_t prefixSumL0BStages =
                         CalcCrossqkpvPrefixSumL0ABStages(kvSTileRelIdxNow, qkL0BTotalStages_, pvL0BTotalStages_,
                                                          kvSLoopCount, false) +
                         (flashDecodeFlag_ != 0U ? pipelineL0BStageBase : 0U);
-                    if (bridge) {
-                        prefixSumL0AStages = issuedL0A;
-                        prefixSumL0BStages = issuedL0B;
-                        issuedL0A += pvL0ATotalStages_;
-                        issuedL0B += pvL0BTotalStages_;
-                    }
-                    blockMmadPV.reuseResidentPage = (prefetchNextQ ? carryV : reuseWindowPage) &&
-                        !retiringPrevious && kvSTileRelIdxNow == 0U;
-                    blockMmadPV.holdPrefetchedV = carryV && retiringPrevious;
-                    if constexpr (mixedPairBridge) {
-                        const uint32_t taskTileBase = pipelineTileSeqNow - kvSTileRelIdxNow;
-                        blockMmadPV.pairedKvBankOffset = taskTileBase / 2U % 2U;
-                    }
-                    const bool splitTerminalLanes = mixedPairBridge && earlyKey && kvSTileSizeAct == 128U &&
-                        (retiringPrevious || kvSTileRelIdxNow + headCount >= kvSLoopCount);
                     const uint32_t page = kvSTileIdxNow - kvSplitStart;
-                    const uint32_t residentBank = ResidentPages ?
-                        (retiringPrevious ? previous.residentBank : residentWindow.banks[page]) : 0U;
-                    blockMmadPV.template operator()<mixedPairBridge, ResidentPages>(
+                    blockMmadPV.template operator()<ResidentPages>(
                         gmVTensorTla, ubOTmpTensorTla, gBlockTable[blockBOffset], actualBlockShapePV,
                         blockSize_, kvSTileIdxNow, pipelineTileSeqNow, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0,
-                        0, 0, softmaxReadyFlag, pvReadyFlag, prefixSumL0AStages, prefixSumL0BStages, splitTerminalLanes,
-                        residentBank, ResidentPages && !retiringPrevious && residentWindow.Miss(page));
-                    if constexpr (!IsDN && nativePair && !LseMode) {
-                        if (prefetchNextQ && leaveLastPv && kvSTileRelIdx + 2U == kvSLoopCount) {
-                            // V DMA has been issued. The next QK and PV reuse
-                            // their paired pages, leaving room for the next head 0.
-                            const uint32_t nextInBatch = taskIdx + taskStep - preTotalTaskNum;
-                            const int64_t nextOffset = qBOffset +
-                                static_cast<int64_t>(nextInBatch / qNTaskNum) * qBaseTile_ * strideQ +
-                                static_cast<int64_t>(nextInBatch % qNTaskNum) * qHeadStride;
-                            auto nextQ = tla::MakeTensor(gQ[nextOffset], gmQLayoutTla, Arch::PositionGM{});
-                            nextHead0Bank = firstQBank ^ 2U;
-                            blockMmadQK.qBank = nextHead0Bank;
-                            blockMmadQK.loadQGM(nextQ, actualBlockShapeQ, qSBlockSize, qNBlockSize,
-                                                qHeadStride, false, BlockMmadQK::QLoadMode::PrefetchHead0);
-                            nextHead0Pending = true;
-                        }
-                    }
+                        0, 0, softmaxReadyFlag, pvReadyFlag, prefixSumL0AStages, prefixSumL0BStages,
+                        ResidentPages ? residentWindow.banks[page] : 0U,
+                        ResidentPages && residentWindow.Miss(page));
 #endif
 #ifdef __DAV_VEC__
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);
@@ -1540,22 +1366,23 @@ class FAIKernel950 {
                         swaQSTileStart = static_cast<uint32_t>(qSTileStart);
                     }
                     const uint32_t outMember = paired ? kvSTileRelIdxNow % 2U : 0U;
-                    const bool useSecond = retiringPrevious ? previous.secondStats : (bridge && secondStats);
-                    auto& epilogueRescaleO = (outMember || useSecond) ? secondO : firstO;
-                    if (retiringPrevious) {
-                        swaQSTileStart = previous.qStart;
-                    }
-                    const int64_t outputBase = retiringPrevious ? previous.outputOffset : gmOffsetO;
-                    const uint64_t lseBase = retiringPrevious ? previous.lseOffset : lseOffset;
-                    auto gmOTensorTla = tla::MakeTensor(gO[outputBase + outMember * qNBlockSize * oHeadStride], gmOLayoutTla, Arch::PositionGM{});
+                    auto& epilogueRescaleO = outMember != 0U ? secondO : firstO;
+                    auto gmOTensorTla = tla::MakeTensor(gO[gmOffsetO + outMember * qNBlockSize * oHeadStride], gmOLayoutTla, Arch::PositionGM{});
                     epilogueRescaleO.template operator()<LseMode>(
-                        gmOTensorTla, gLse[lseBase + outMember * qNBlockSize * lseHeadStride], actualBlockShapePV, curTileMod, pipelineTileSeqNow,
-                        (kvSTileRelIdxNow < headCount), (retiringPrevious || kvSTileRelIdxNow + headCount >= kvSLoopCount), pvReadyFlag, IsDN,
+                        gmOTensorTla, gLse[lseOffset + outMember * qNBlockSize * lseHeadStride], actualBlockShapePV, curTileMod, pipelineTileSeqNow,
+                        (kvSTileRelIdxNow < headCount), (kvSTileRelIdxNow + headCount >= kvSLoopCount), pvReadyFlag, IsDN,
                         fmRowsPerHead, qSBlockSize, qNBlockSize, lseHeadStride, static_cast<uint32_t>(strideO),
                         static_cast<uint32_t>(oHeadStride), swaDelStartRow, swaDelEndRow, swaQSeqlen, swaQSTileStart,
                         gPartialO, gPartialLse, writePartial && !IsDN, partialId + outMember * splitsPerHead, fdRowCapacity_, fdLseSubStride_);
 #endif
                 }
+#ifdef __DAV_VEC__
+                if constexpr (ResidentPages) {
+                    if (lateNext && !firstHeadStep && AscendC::GetSubBlockIdx() == 1U) {
+                        halfDequant.PrepareFirstStripe();
+                    }
+                }
+#endif
 #ifdef __DAV_CUBE__
                 if constexpr (ResidentPages) {
                     if (nextMiss && !lateNext && !firstHeadStep) {
@@ -1567,12 +1394,13 @@ class FAIKernel950 {
                         AscendC::CrossCoreSetFlag<4, PIPE_MTE1>(9U + residentWindow.banks[pageCount - 1U] + 16U);
                     }
                 }
-                if constexpr (!IsDN && nativePair && !LseMode && kvcacheShape == PageShape::BnBsND) {
-                    if (leadKeyPages && (kvSTileRelIdx == 0U ||
+                if constexpr (!IsDN && nativePair && kvcacheShape == PageShape::BnBsND) {
+                    if (leadKeyPages && paired && ((kvSTileRelIdx == 0U && pageCount >= 2U) ||
                         ((kvSTileRelIdx & 1U) != 0U && kvSTileRelIdx + 3U < kvSLoopCount))) {
                         const uint32_t page = kvSplitStart +
                             (kvSTileRelIdx == 0U ? 1U : kvSTileRelIdx / 2U + 2U);
-                        blockMmadQK.PrefetchNativeKPage(gmKTensorTla, gBlockTable[blockBOffset], page);
+                        blockMmadQK.PrefetchNativeKPage(gmKTensorTla, gBlockTable[blockBOffset],
+                            page, blockSize_, embed_, noSkipKvS);
                     }
                 }
 #endif
@@ -1580,60 +1408,11 @@ class FAIKernel950 {
                     nextKey += static_cast<uint32_t>(fetchKey);
                 }
             }
-#ifdef __DAV_CUBE__
-            if constexpr (!IsDN && nativePair && !LseMode && kvcacheShape == PageShape::BnBsND) {
-                if (leadKeyPages && leaveLastPv && deferSecondQ && nextHead0Pending && pageCount == 5U &&
-                    taskStep == 4U * qNTaskNum && kvSplitEnd * kvBaseTile_ == noSkipKvS) {
-                    // The next task advances four Q tiles, so its first K page
-                    // is the current task's last page. Issue after the same PV
-                    // as before, while the next task's scalar setup is pending.
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(BlockMmadQK::NEXT_Q_READY_EVENT);
-                    blockMmadQK.qBank = nextHead0Bank;
-                    blockMmadQK.reuseResidentPage = true;
-                    blockMmadQK.kPagePrefetched = false;
-                    auto scoreLayout = tla::MakeLayout<ElementS, LayoutS>(128U, 128U);
-                    auto score = tla::MakeTensor(ubSTensor[0], scoreLayout, Arch::PositionUB{});
-                    Arch::CrossCoreFlag scoreReady(0U);
-                    blockMmadQK.template operator()<false>(
-                        gmKTensorTla, score, gBlockTable[blockBOffset], GemmCoord{128U, 128U, 192U},
-                        blockSize_, kvSplitEnd - 1U, pipelineTileBase + kvSLoopCount, 0, kvHeads_,
-                        kvNumTokens, kvBaseTile_, 0, 0, 0, 128U, 1U, scoreReady, issuedL0A, issuedL0B, false);
-                    const int64_t nextHead1Offset = gmOffsetQ + 4LL * qBaseTile_ * strideQ + qHeadStride;
-                    auto nextHead1 = tla::MakeTensor(gQ[nextHead1Offset], gmQLayoutTla, Arch::PositionGM{});
-                    blockMmadQK.qBank = 1U;
-                    blockMmadQK.loadQGM(nextHead1, actualBlockShapeQ, 128U, 1U, qHeadStride,
-                                        false, BlockMmadQK::QLoadMode::DeferredHead1, EVENT_ID0);
-                    nextHead0Pending = false;
-                    nextHead0QkIssued = true;
-                }
+            if (flashDecode) {
+                pipelineTileBase += kvSLoopCount;
+                pipelineL0AStageBase += static_cast<uint64_t>(kvSLoopCount) * (qkL0ATotalStages_ + pvL0ATotalStages_);
+                pipelineL0BStageBase += static_cast<uint64_t>(kvSLoopCount) * (qkL0BTotalStages_ + pvL0BTotalStages_);
             }
-#endif
-            pendingPv = leaveLastPv;
-            if (leaveLastPv) {
-                previous.tile = kvSplitEnd - 1U;
-                previous.columns = previous.tile == kvSLoopNum - 1U ? noSkipKvS - previous.tile * kvBaseTile_ : kvBaseTile_;
-                previous.count = kvSLoopCount;
-                previous.seq = pipelineTileBase + kvSLoopCount - 1U;
-                previous.qStart = static_cast<uint32_t>(qSTileStart);
-                previous.outputOffset = gmOffsetO;
-                previous.lseOffset = lseOffset;
-                previous.secondStats = secondStats;
-                if constexpr (ResidentPages) {
-                    previous.residentBank = residentWindow.banks[pageCount - 1U];
-                }
-                // In the paired case the deferred PV belongs to head 1.
-                // The next task's first QK/softmax uses head 0's own state.
-                if (!paired) {
-                    secondStats = !secondStats;
-                }
-            } else {
-                secondStats = false;
-                issuedL0A = issuedL0B = 0U;
-            }
-            pipelineTileBase += kvSLoopCount;
-            pipelineL0AStageBase += static_cast<uint64_t>(kvSLoopCount) * (qkL0ATotalStages_ + pvL0ATotalStages_);
-            pipelineL0BStageBase += static_cast<uint64_t>(kvSLoopCount) * (qkL0BTotalStages_ + pvL0BTotalStages_);
         }
 #ifdef __DAV_VEC__
         if (mixedKv) {
@@ -1980,14 +1759,17 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
         tiling, scaleValue, softcapValue, numBlocks, maxNumBlocksPerBatch, kvSeqlenAllocated, storage, kDescale, vDescale);
 }
 
-template <bool GroupedHeads>
+template <bool GroupedHeads, MaskCategory Mask>
 __aicore__ inline bool CanUseNativePairedPrefill(GM_ADDR tiling, GM_ADDR actualQseqlen,
                                                 GM_ADDR actualKvseqlen, uint64_t totalQTokens)
 {
     const auto* plan = reinterpret_cast<__gm__ FAInferTilingData*>(tiling);
     const auto* cu = reinterpret_cast<__gm__ int32_t*>(actualQseqlen);
     const auto* kv = reinterpret_cast<__gm__ int32_t*>(actualKvseqlen);
-    if (plan->qBaseTile != 128U || plan->kvBaseTile != 128U || plan->flashDecodeFlag != 0U) {
+    const uint32_t qTile = plan->qBaseTile;
+    const bool canPair64 = Mask == MaskCategory::MASK_SWA && qTile == 64U &&
+        (plan->numHeads / plan->kvHeads) % 2U == 0U;
+    if ((qTile != 128U && !canPair64) || plan->kvBaseTile != 128U || plan->flashDecodeFlag != 0U) {
         return false;
     }
     uint32_t tasks = plan->totalTaskNum / 2U;
@@ -2000,11 +1782,11 @@ __aicore__ inline bool CanUseNativePairedPrefill(GM_ADDR tiling, GM_ADDR actualQ
     if (tasks < AscendC::GetBlockNum()) {
         return false;
     }
-    // Native pairing requires whole 128-row Q tiles with right-aligned KV.
+    // Native pairing requires full Q tiles with right-aligned KV.
     for (uint32_t i = 0; i < plan->batch; ++i) {
         const int32_t end = cu[i + 1U];
         const int32_t rows = end - cu[i];
-        if (rows < 0 || rows % 128 != 0 || kv[i] < rows) {
+        if (rows < 0 || rows % qTile != 0 || kv[i] < rows) {
             return false;
         }
         if (static_cast<uint64_t>(end) == totalQTokens) {
@@ -2023,7 +1805,7 @@ CATLASS_GLOBAL void FAInferPairedPrefill(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADD
                             uint32_t maxNumBlocksPerBatch, int64_t kvSeqlenAllocated, FwdStorageParams storage, GM_ADDR kDescale, GM_ADDR vDescale)
 {
     if constexpr (PairedHeads && !MixedKv) {
-        if (!CanUseNativePairedPrefill<GroupedHeads>(tiling, actualQseqlen, actualKvseqlen, storage.totalQTokens)) {
+        if (!CanUseNativePairedPrefill<GroupedHeads, maskCategory>(tiling, actualQseqlen, actualKvseqlen, storage.totalQTokens)) {
             RunFAInfer<false, InDtype, SMDtype, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory,
                        cacheLayout, LseMode, HasSoftcap>(
                 q, k, v, mask, blockTables, o, lse, actualQseqlen, actualKvseqlen, seqUsedQ, seqUsedKv,
