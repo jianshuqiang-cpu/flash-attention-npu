@@ -1155,6 +1155,14 @@ class FAIKernel950 {
                     }
                 }
 #endif
+#ifdef __DAV_VEC__
+                if constexpr (ResidentPages) {
+                    if (retireTailPredecessor && AscendC::GetSubBlockIdx() == 1U) {
+                        // The old V bank is released by PV[r - PRE_LAUNCH], whose P was queued earlier.
+                        ProduceResidentKv<true>(halfDequant, residentWindow.banks[pageCount - 1U], pvL1AddrStart_, false);
+                    }
+                }
+#endif
                 if (kvSTileRelIdx < kvSLoopCount) {
                     if (kvSTileIdx == kvSLoopNum - 1) {
                         kvSTileSizeAct = noSkipKvS - kvSTileIdx * kvBaseTile_;
@@ -1298,8 +1306,6 @@ class FAIKernel950 {
                         ProduceResidentKv(halfDequant, nextKey % RESIDENT_KEY_BANKS, pvL1AddrStart_, true);
                     } else if (!keyLane && nextMiss && !lateNext && !firstHeadStep) {
                         ProduceResidentKv(halfDequant, residentWindow.banks[nextPage], pvL1AddrStart_, false);
-                    } else if (!keyLane && retireTailPredecessor) {
-                        ProduceResidentKv<true>(halfDequant, residentWindow.banks[pageCount - 1U], pvL1AddrStart_, false);
                     }
                 }
 #endif
