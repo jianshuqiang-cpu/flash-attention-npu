@@ -132,14 +132,15 @@ class FAIKernel950 {
             keyLane ? params.storage.keyHeadStride : params.storage.valueHeadStride, page, 128U, keyLane ? 1U : 0U);
     }
 
+    template<bool FirstStripePrepared = false>
     __aicore__ inline void ProduceResidentKv(fa950_mixed::KvDequantBuffered& dequant, uint32_t bank,
         uint32_t pvL1AddrStart, bool keyLane)
     {
         constexpr uint32_t pageBytes = 128U * 192U * sizeof(bfloat16_t);
         const uint32_t base = keyLane ? qL1BufNum_ * pageBytes :
             pvL1AddrStart + pL1BufNum_ * 128U * 128U * sizeof(ElementP);
-        dequant.Produce(resource, 128U, base + bank * pageBytes, (keyLane ? 7U : 9U) + bank,
-                        keyLane ? 1U : 0U);
+        dequant.Produce<FirstStripePrepared>(resource, 128U, base + bank * pageBytes,
+                                           (keyLane ? 7U : 9U) + bank, keyLane ? 1U : 0U);
     }
 
     __aicore__ inline void ProducePairedKv(fa950_mixed::KvDequantBuffered& halfDequant, const FAIKernelParams& params,
@@ -1298,7 +1299,7 @@ class FAIKernel950 {
                     } else if (!keyLane && nextMiss && !lateNext && !firstHeadStep) {
                         ProduceResidentKv(halfDequant, residentWindow.banks[nextPage], pvL1AddrStart_, false);
                     } else if (!keyLane && retireTailPredecessor) {
-                        ProduceResidentKv(halfDequant, residentWindow.banks[pageCount - 1U], pvL1AddrStart_, false);
+                        ProduceResidentKv<true>(halfDequant, residentWindow.banks[pageCount - 1U], pvL1AddrStart_, false);
                     }
                 }
 #endif
@@ -1369,6 +1370,13 @@ class FAIKernel950 {
                         gPartialO, gPartialLse, writePartial && !IsDN, partialId + outMember * splitsPerHead, fdRowCapacity_, fdLseSubStride_);
 #endif
                 }
+#ifdef __DAV_VEC__
+                if constexpr (ResidentPages) {
+                    if (lateNext && !firstHeadStep && AscendC::GetSubBlockIdx() == 1U) {
+                        halfDequant.PrepareFirstStripe();
+                    }
+                }
+#endif
 #ifdef __DAV_CUBE__
                 if constexpr (ResidentPages) {
                     if (nextMiss && !lateNext && !firstHeadStep) {
